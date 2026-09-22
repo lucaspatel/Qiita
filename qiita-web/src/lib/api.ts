@@ -210,6 +210,73 @@ export type ApiToken = {
   created_at: string;
 };
 
+// A work ticket's scope target — the resource the action is about. Discriminated
+// on `kind`; render generically off the idx fields.
+export type ScopeTarget =
+  | { kind: 'study_prep'; study_idx: number; prep_idx: number }
+  | { kind: 'reference'; reference_idx: number }
+  | { kind: 'prep_sample'; prep_sample_idx: number }
+  | { kind: 'sequenced_pool'; sequenced_pool_idx: number; sequencing_run_idx: number }
+  | { kind: 'block'; block_idx: number };
+
+export type WorkTicketState =
+  | 'pending'
+  | 'queued'
+  | 'processing'
+  | 'completed'
+  | 'no_data'
+  | 'failed'
+  | 'cancelled';
+
+export type WorkTicket = {
+  work_ticket_idx: number;
+  action_id: string;
+  action_version: string;
+  originator_principal_idx: number;
+  scope_target: ScopeTarget;
+  shard_id: number | null;
+  mask_idx: number | null;
+  action_context: Record<string, unknown>;
+  state: WorkTicketState;
+  retry_count: number;
+  max_retries: number;
+  failure_type: 'retriable' | 'permanent' | null;
+  failure_stage: 'submission' | 'step_run' | 'finalize' | null;
+  failure_step_name: string | null;
+  failure_reason: string | null;
+  transient_reason: string | null;
+  transient_since: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+/** A ticket plus a snapshot of its current step's compute placement (list view). */
+export type WorkTicketSummary = WorkTicket & {
+  current_step_index: number | null;
+  current_step_name: string | null;
+  compute_target: 'slurm' | 'local' | 'control_plane' | null;
+  slurm_job_id: number | null;
+  step_state: 'submitting' | 'submitted' | 'running' | 'completed' | 'failed' | null;
+  read_outcome: Record<string, unknown> | null;
+};
+
+export type WorkTicketListResponse = {
+  tickets: WorkTicketSummary[];
+  count: number;
+  truncated: boolean;
+};
+
+export type WorkTicketStepLogs = {
+  work_ticket_idx: number;
+  step_index: number;
+  attempt: number;
+  step_name: string;
+  stdout: string;
+  stderr: string;
+  stdout_truncated: boolean;
+  stderr_truncated: boolean;
+};
+
 export const api = {
   whoami: () => get<Whoami>('/auth/whoami'),
   getProfile: () => get<UserProfile>('/user/me'),
@@ -233,5 +300,23 @@ export const api = {
   biosampleIdxs: (studyIdx: number) =>
     get<IdxList>(`/study/${studyIdx}/biosample/list-idxs`),
   /** One biosample incl. its global_metadata values. Readable at viewer tier. */
-  biosample: (idx: number) => get<Biosample>(`/biosample/${idx}`)
+  biosample: (idx: number) => get<Biosample>(`/biosample/${idx}`),
+  /** Your work tickets (own by default; wet_lab_admin+ sees all with all=true). */
+  tickets: (q: { state?: string; active?: boolean; all?: boolean; limit?: number } = {}) => {
+    const p = new URLSearchParams();
+    if (q.state) p.set('state', q.state);
+    if (q.active) p.set('active', 'true');
+    if (q.all) p.set('all', 'true');
+    if (q.limit) p.set('limit', String(q.limit));
+    const qs = p.toString();
+    return get<WorkTicketListResponse>(`/work-ticket${qs ? `?${qs}` : ''}`);
+  },
+  ticket: (idx: number) => get<WorkTicket>(`/work-ticket/${idx}`),
+  ticketLogs: (idx: number, step: number, opts: { attempt?: number; tailLines?: number } = {}) => {
+    const p = new URLSearchParams();
+    if (opts.attempt != null) p.set('attempt', String(opts.attempt));
+    if (opts.tailLines != null) p.set('tail_lines', String(opts.tailLines));
+    const qs = p.toString();
+    return get<WorkTicketStepLogs>(`/work-ticket/${idx}/step/${step}/logs${qs ? `?${qs}` : ''}`);
+  }
 };
