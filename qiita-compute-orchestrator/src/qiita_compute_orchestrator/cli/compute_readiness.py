@@ -517,7 +517,9 @@ try:
     ).fetchall()
     have = [r[0] for r in rows]
     missing = [f for f in want if f not in have]
-    assert not missing, "missing miint amplicon functions: " + ", ".join(missing)
+    if missing:
+        print("missing miint amplicon functions: " + ", ".join(missing))
+        sys.exit(1)
 except Exception as exc:
     msg = (type(exc).__name__ + ": " + str(exc)).replace(chr(10), " ").replace(chr(13), " ")
     print(msg[:500])

@@ -8,9 +8,9 @@ sequence_idx range per sample, write the sorted read.parquet). The I1 index keys
 record, so R1 and R2 land under the same prep_sample; R2 is persisted as
 sequence2/qual2 in `read` (deblur is R1-only, matching the GG2 V4 catalog).
 
-The per-sample mint + sorted write is the shared `read_storage` core `ingest_reads`
-uses; golay only differs in re-numbering each sample's slice of the pooled demux
-intermediate (see the `write_sorted_sample_reads` call below).
+The per-sample mint + sorted write is the shared `read_staging` core `ingest_reads`
+and `ingest_ena_reads` use; golay only differs in re-numbering each sample's slice of
+the pooled demux intermediate (see the `write_sorted_reads` call below).
 """
 
 from __future__ import annotations
@@ -34,8 +34,8 @@ from ..miint import (
     open_miint_conn,
     resolve_duckdb_memory_gb,
 )
+from ..read_staging import hardlink, write_sorted_reads
 from ..sequence_range_retry import mint_or_reuse_sequence_range
-from ._read_storage import hardlink, write_sorted_sample_reads
 
 YAML_STEP_NAME = "golay_demux"
 
@@ -280,7 +280,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     # applying the mint offset (ingest_reads' source is already
                     # per-sample and passes sequence_index verbatim).
                     await asyncio.to_thread(
-                        write_sorted_sample_reads,
+                        write_sorted_reads,
                         demuxed,
                         prep_sample_idx=prep_sample_idx,
                         sequence_idx_start=start,
