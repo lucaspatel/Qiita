@@ -10,6 +10,7 @@ cluster runtime LOADs a pre-staged build rather than installing per job.
 from __future__ import annotations
 
 import fnmatch
+import gzip
 import os
 import tempfile
 
@@ -19,6 +20,7 @@ from qiita_common.duckdb_miint import (
     MIINT_EXTENSION_DIRECTORY_VAR,
     MIINT_MIRROR_URL,
     MIINT_REQUIRED_JOB_VARS,
+    is_empty_sequence_file,
     miint_connect_config,
     miint_install_sql,
     miint_job_env,
@@ -34,7 +36,7 @@ def test_install_sql_defaults_to_plain_install_from_mirror(monkeypatch):
     its cache once; only deploy-time staging passes force=True."""
     monkeypatch.delenv("MIINT_EXTENSION_REPO", raising=False)
     sql = miint_install_sql()
-    assert sql == f"INSTALL miint FROM '{MIINT_MIRROR_URL}';"
+    assert sql == f"INSTALL miint FROM '{MIINT_MIRROR_URL}'; INSTALL httpfs;"
     assert "FORCE" not in sql
     assert "community" not in sql
 
@@ -43,19 +45,34 @@ def test_install_sql_force_for_deploy_staging(monkeypatch):
     """force=True (deploy-time staging only) refreshes the staged build to the
     mirror's current version."""
     monkeypatch.delenv("MIINT_EXTENSION_REPO", raising=False)
-    assert miint_install_sql(force=True) == f"FORCE INSTALL miint FROM '{MIINT_MIRROR_URL}';"
+    # httpfs stays a plain INSTALL under force -- DuckDB's own signed extension.
+    assert (
+        miint_install_sql(force=True)
+        == f"FORCE INSTALL miint FROM '{MIINT_MIRROR_URL}'; INSTALL httpfs;"
+    )
 
 
 def test_install_sql_honors_repo_override(monkeypatch):
     """MIINT_EXTENSION_REPO remains an override for local/dev builds."""
     monkeypatch.setenv("MIINT_EXTENSION_REPO", "/local/repo")
-    assert miint_install_sql() == "INSTALL miint FROM '/local/repo';"
-    assert miint_install_sql(force=True) == "FORCE INSTALL miint FROM '/local/repo';"
+    assert miint_install_sql() == "INSTALL miint FROM '/local/repo'; INSTALL httpfs;"
+    assert (
+        miint_install_sql(force=True) == "FORCE INSTALL miint FROM '/local/repo'; INSTALL httpfs;"
+    )
 
 
 def test_load_sql_is_load_only():
-    """Cluster runtime LOADs the pre-staged extension — no install verb."""
-    assert miint_load_sql() == "LOAD miint;"
+    """Cluster runtime LOADs the pre-staged extensions — no install verb."""
+    sql = miint_load_sql()
+    assert sql == "LOAD miint; LOAD httpfs;"
+    assert "INSTALL" not in sql
+
+
+def test_load_sql_includes_httpfs():
+    """httpfs rides with miint rather than being LOADed per caller: miint reaches
+    the network through DuckDB's filesystem layer, so every miint connection that
+    touches a URL needs it."""
+    assert "LOAD httpfs;" in miint_load_sql()
 
 
 def test_connect_config_allows_unsigned_by_default(monkeypatch):
@@ -222,3 +239,33 @@ def test_setup_test_env_directories_match_the_documented_clearing_glob(monkeypat
     for worker in (None, "gw0", "gw11"):
         chosen = _resolve_test_ext_dir(monkeypatch, tmp_path, worker)
         assert fnmatch.fnmatch(os.path.basename(chosen), "qiita-*-duckdb-ext")
+
+
+@pytest.mark.parametrize(
+    ("name", "payload", "empty"),
+    [
+        ("empty.fa", b"", True),
+        ("full.fa", b">x\nACGT\n", False),
+        ("empty.fa.gz", None, True),
+        ("full.fa.gz", b">x\nACGT\n", False),
+    ],
+)
+def test_is_empty_sequence_file(tmp_path, name, payload, empty):
+    """The four cases the callers depend on, uncompressed and gzipped.
+
+    `.gz` is the pair that matters: an empty gzip member still occupies its framing
+    bytes on disk, so `st_size == 0` answers this question wrong in the direction
+    that costs — `read_fastx` raises on the file and one such path aborts a whole
+    multi-file scan.
+    """
+    path = tmp_path / name
+    if name.endswith(".gz"):
+        with gzip.open(path, "wb") as fh:
+            fh.write(payload or b"")
+    else:
+        path.write_bytes(payload or b"")
+
+    if name.endswith(".gz"):
+        assert path.stat().st_size > 0, "an empty gzip member is still bytes on disk"
+
+    assert is_empty_sequence_file(path) is empty

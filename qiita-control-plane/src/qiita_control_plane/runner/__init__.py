@@ -9,10 +9,9 @@ Lives in the control plane: direct DB access for work_ticket / action /
 reference rows is legitimate here. The orchestrator is reduced to its
 SLURM-driver role behind `POST /step/*`.
 
-Workspace contract: each entry runs against a per-attempt subdir
-`<work_ticket_workspace_root>/<work_ticket_idx>/<entry-name>/attempt-<N>/`
-minted by `_run_entry_with_retry`. The nesting gives two properties at
-once — retries (and re-runs) land in fresh dirs (the verifier's "every file
+Workspace contract: each entry runs against a per-attempt subdir (layout:
+`qiita_control_plane.workspace`) minted by `_run_entry_with_retry`. The nesting
+gives two properties at once — retries (and re-runs) land in fresh dirs (the verifier's "every file
 in $output_path must be in manifest" gate stays clean), and prior attempts
 persist on disk for postmortem. An entry RE-RUN whose progress row was
 deliberately dropped (a `/run` redrive, or `update-lane` invalidating a
@@ -38,6 +37,7 @@ from typing import Any
 
 import asyncpg
 from qiita_common.actions import (
+    ALIGNMENT_IDX_BINDING,
     ActionCeiling,
     ActionDefinition,
     FlatBaselineResources,
@@ -80,6 +80,19 @@ from ..actions.reference import (
 from ..auth.tickets import sign_action, sign_ticket
 from ..repositories.block import fetch_block_members
 from ..repositories.mask_definition import mint_mask_definition
+from ._alignment import (
+    ALIGN_MASK_IDX_BINDING,
+    ASSEMBLY_PROCESSING_IDX_BINDING,
+    MIN_IDENTITY_BINDING,
+    MIN_QUERY_COVERAGE_BINDING,
+    PRESET_BINDING,
+    _build_denovo_alignment_params,
+    _create_alignment_gate_pending,
+    _persist_alignment_idx,
+    _require_assembly_subject,
+    _resolve_denovo_alignment_idx,
+    _workflow_writes_alignment_gate,
+)
 from ._base import (
     _INFRA_RETRY_BACKOFF_CAP_SECONDS,
     _INFRA_UNREACHABLE_KINDS,
@@ -148,7 +161,6 @@ from ._feature_table import (
 from ._mask import (
     _QC_RESOLVED_FILTER_TAIL,
     _QC_RESOLVED_MIN_LENGTH,
-    ALIGNMENT_IDX_BINDING,
     MASK_IDX_BINDING,
     AdapterSetHashes,
     _adapter_set_hash_legacy,
@@ -167,6 +179,7 @@ from ._processing import (
 from ._read_ingest import (
     _REFERENCE_SEQUENCES_TABLE,
     BARCODE_MAP_BINDING,
+    ENA_RUN_MAP_BINDING,
     READS_STAGING_ROOT_BINDING,
     ROUTER_PENDING_BINDING,
     SAMPLE_MAP_BINDING,
@@ -182,12 +195,15 @@ from ._read_ingest import (
     _resolve_sample_map,
     _resolve_staged_masked_reads,
     _resolve_staged_reads,
+    _stage_ena_run_roster,
+    _stage_ena_run_roster_binding,
     _stage_shard_mapping,
     _stage_shard_roster,
     _stream_masked_reads_to_fastq,
     _workflow_declares_input,
     _workflow_needs_staged_masked_reads,
     _workflow_needs_staged_reads,
+    _write_ena_run_map_parquet,
     _write_sample_map_parquet,
     _write_shard_mapping_parquet,
 )
@@ -382,6 +398,17 @@ __all__: list[str] = [
     "_write_reference_fasta",
     "_write_sample_map_parquet",
     "ALIGNMENT_IDX_BINDING",
+    "ALIGN_MASK_IDX_BINDING",
+    "ASSEMBLY_PROCESSING_IDX_BINDING",
+    "MIN_IDENTITY_BINDING",
+    "MIN_QUERY_COVERAGE_BINDING",
+    "PRESET_BINDING",
+    "_build_denovo_alignment_params",
+    "_create_alignment_gate_pending",
+    "_resolve_denovo_alignment_idx",
+    "_persist_alignment_idx",
+    "_require_assembly_subject",
+    "_workflow_writes_alignment_gate",
     "ROUTER_INDEX_PATH_BINDING",
     "ROUTER_PENDING_BINDING",
     "SHARD_DIRECTORY_BINDING",
@@ -398,6 +425,10 @@ __all__: list[str] = [
     "_stage_shard_mapping",
     "_stage_shard_roster",
     "_workflow_needs_sharded_align_indexes",
+    "ENA_RUN_MAP_BINDING",
+    "_stage_ena_run_roster",
+    "_stage_ena_run_roster_binding",
+    "_write_ena_run_map_parquet",
     "_write_shard_mapping_parquet",
     "asyncio",
     "asyncpg",

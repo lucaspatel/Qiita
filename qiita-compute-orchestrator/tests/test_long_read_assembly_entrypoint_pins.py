@@ -1,12 +1,12 @@
-"""Static pins on the `long-read-assembly` container entrypoints and their images.
+"""Pins on the `long-read-assembly` container entrypoints and their images.
 
 Most of the file is about `binning.sh` and the coverage BAM (below), but it also
 pins `bin_refine.sh`'s `--write_bins` flag, `checkm.sh`'s TMPDIR shortening for the
 AF_UNIX socket, the genomes_dir basenames the entrypoints write and read against
 their Python constants, and the version constraints in `binning.def` /
-`bin_refine.def` that each entrypoint's behaviour depends on. All of it is the same
-kind of assertion: read the shipped file, check the command it pins is still there
-and still shaped correctly.
+`bin_refine.def` that each entrypoint's behaviour depends on. All of it but the tests
+that run lines of `binning.sh` under bash is the same kind of assertion: read the shipped
+file, check the command it pins is still there and still shaped correctly.
 
 The coverage BAM: how `binning.sh` puts it where metaWRAP will read it.
 
@@ -37,14 +37,29 @@ assertions: they show the commands are present and shaped correctly, not that th
 succeed. They need no binary and run everywhere, including CI and a stock dev box.
 Correct-operation evidence is elsewhere: the behavioural test above, the consumer
 measurements in `docs/duckdb-miint.md`, and the deploy verify step.
+
+The exceptions are the tests that run `binning.sh`'s lines under bash, where no binary
+has to be behind them. Its `-m` derivation is shell arithmetic and a guard, run at fixed
+allocations, at each workflow version's binning baseline, and after sourcing `_lib.sh`
+where its fallback is what is being tested. Its handling of metaWRAP's exit runs from
+the stdout copy to the end, with a stand-in `micromamba` that prints saved stdout lines
+and exits with a chosen code.
 """
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
+from qiita_common.assembly_constants import (
+    CONTIG_ATTRIBUTE_COLUMNS,
+    CONTIG_ATTRIBUTES_FILE,
+)
+from qiita_common.log_tail import contains_oom_signature
 
 from qiita_compute_orchestrator.jobs._assembly import LCG_FILE, NOLCG_FILE
 
@@ -57,12 +72,24 @@ _BINNING_VERIFY = _WORKFLOW_DIR / "binning-verify.sh"
 _BIN_REFINE_SH = _WORKFLOW_DIR / "bin_refine.sh"
 _BIN_REFINE_DEF = _WORKFLOW_DIR / "bin_refine.def"
 _CHECKM_SH = _WORKFLOW_DIR / "checkm.sh"
+_ASSEMBLE_DEF = _WORKFLOW_DIR / "assemble.def"
+_LIB_SH = _REPO_ROOT / "workflows" / "_shared" / "_lib.sh"
+
+# What each assembler's `%test` must grep its `--version` output for. myloasm
+# reports its conda version verbatim; hifiasm_meta reports two internal versions
+# that its conda string (`hamtv0.3.5`) does not contain, so neither can be derived
+# from the pin and both are written out here.
+_ASSERTED_VERSIONS = {
+    "hifiasm_meta": ("0.13-r308", "0.3-r079"),
+    "myloasm": ("0.6.0",),
+}
 
 
 @pytest.mark.parametrize(
     "path",
     [
         _ASSEMBLE_SH,
+        _ASSEMBLE_DEF,
         _BINNING_SH,
         _BINNING_DEF,
         _BINNING_VERIFY,
@@ -75,7 +102,7 @@ def test_source_file_is_present_and_parses(path: Path) -> None:
     """Anti-vacuity guard, matching the sibling static pins.
 
     Every assertion below reads one of these files through `_code_lines` — all
-    seven, which is why all seven are listed here rather than the three `binning`
+    eight, which is why all eight are listed here rather than the three `binning`
     ones. A moved file or a `_REPO_ROOT` that stopped resolving would make the
     absence-shaped pins pass for the wrong reason, so fail loudly here first.
     """
@@ -146,11 +173,12 @@ def _strip_comment(line: str) -> str:
 @pytest.mark.parametrize(
     ("path", "dir_var", "expected"),
     [
-        (_ASSEMBLE_SH, "OUT", {LCG_FILE, NOLCG_FILE}),
+        (_ASSEMBLE_SH, "OUT", {LCG_FILE, NOLCG_FILE, CONTIG_ATTRIBUTES_FILE}),
         (_BINNING_SH, "GENOMES_DIR", {NOLCG_FILE}),
         (_BIN_REFINE_SH, "GENOMES_DIR", {NOLCG_FILE}),
+        (_CHECKM_SH, "GENOMES_DIR", {LCG_FILE, NOLCG_FILE}),
     ],
-    ids=["assemble", "binning", "bin_refine"],
+    ids=["assemble", "binning", "bin_refine", "checkm"],
 )
 def test_genomes_dir_basenames_match_the_python_constants(
     path: Path, dir_var: str, expected: set[str]
@@ -158,17 +186,21 @@ def test_genomes_dir_basenames_match_the_python_constants(
     """The genomes_dir basenames are spelled the same in the shell and in Python.
 
     `assemble.sh` writes both files into its output genomes_dir; `binning.sh` and
-    `bin_refine.sh` read noLCG back out of the one they are handed. The native jobs
-    reach the same files through `_assembly.LCG_FILE` / `NOLCG_FILE`, and nothing
-    joins the two spellings at runtime. `assembly_hash._file_meta` looks genomes_dir
-    up by exact name, not by glob, so renaming one side alone drops the circular and
-    unbinned contigs from the run with no error; a sample with no refined bin either
-    becomes the terminal StepNoData "no contigs to hash", discarded with no retry.
+    `bin_refine.sh` read noLCG back out of the one they are handed, and `checkm.sh`
+    reads both — circular.fa for the LCG run, noLCG.fa for the residue run whose
+    splitter subtracts the binned contigs from it. The native jobs reach the same
+    files through
+    `_assembly.LCG_FILE` / `NOLCG_FILE`, and nothing joins the two spellings at
+    runtime. `assembly_hash._file_meta` looks genomes_dir up by exact name, not by
+    glob, so renaming one side alone drops the circular and unbinned contigs from the
+    run with no error; a sample with no refined bin either becomes the terminal
+    StepNoData "no contigs to hash", discarded with no retry.
 
     Set equality, not membership: a new file under genomes_dir has to be added here
     and given a constant, rather than reaching the native jobs unnamed. `dir_var` is
-    per script because `${OUT}` is genomes_dir only in `assemble.sh` -- in the other
-    two it is the bins output.
+    per script because genomes_dir is `${OUT}` only in `assemble.sh`, which WRITES
+    it; the other three are handed it as `${GENOMES_DIR}` and use `${OUT}` for the
+    directory each writes instead.
     """
     code = "\n".join(_code_lines(path))
     found = set(re.findall(rf"\$\{{{dir_var}\}}/([^\s\"']+)", code))
@@ -178,6 +210,224 @@ def test_genomes_dir_basenames_match_the_python_constants(
         "here because nothing checks them at runtime -- a rename on one side leaves "
         "assembly_hash scanning for a file the entrypoint no longer writes."
     )
+
+
+def test_assemble_runs_the_assembler_into_its_own_output() -> None:
+    """Both arms point the assembler's `-o` at ${ASM_DIR}, under $QIITA_OUTPUT_PATH.
+
+    That is the whole mechanism: the assembler's tree is retained because it is
+    written where the step's output already lives, not copied there afterwards.
+    An `-o` pointed anywhere else -- a mktemp dir, $TMPDIR, the workspace --
+    discards everything the arm does not read back, and does it silently, since
+    the two published FASTAs are unaffected.
+    """
+    lines = _code_lines(_ASSEMBLE_SH)
+    code = "\n".join(lines)
+    assert 'ASM_DIR="${QIITA_OUTPUT_PATH}/assembler"' in code, (
+        "ASM_DIR is not defined as ${QIITA_OUTPUT_PATH}/assembler. It is not a "
+        "declared output, so nothing at run time checks where it points -- a path "
+        "outside the output root is neither listed in the manifest nor verified, "
+        "and the assembler's tree would be discarded exactly as it was before."
+    )
+    dasho = re.findall(r'-o "([^"]+)"', code)
+    assert dasho, "assemble.sh passes no -o at all -- neither arm names an output dir"
+    assert all(t.startswith("${ASM_DIR}") for t in dasho), (
+        f"assemble.sh runs an assembler with -o {dasho} -- every arm must write into "
+        "${ASM_DIR} so its tree lands under $QIITA_OUTPUT_PATH"
+    )
+    assert len(dasho) == 2, f"expected one -o per assembler arm, found {len(dasho)}: {dasho}"
+
+
+def test_assemble_deletes_nothing_on_exit() -> None:
+    """No `trap ... EXIT` and no mktemp in assemble.sh.
+
+    The three sibling entrypoints each stage working files through a `mktemp -d`
+    they delete on exit. This one must not: everything the assembler writes is an
+    output of the step, and the arms read their one file back out of that same
+    tree. A trap reintroduced here removes it after the manifest is written, so
+    the verifier's `files` list would name paths that no longer exist -- gate 2,
+    a permanent CONTRACT_VIOLATION -- rather than failing quietly.
+    """
+    code = "\n".join(_code_lines(_ASSEMBLE_SH))
+    assert "mktemp" not in code, (
+        "assemble.sh calls mktemp; the assembler's tree is a step output and "
+        "belongs under $QIITA_OUTPUT_PATH"
+    )
+    assert not re.search(r"\btrap\b", code), (
+        "assemble.sh installs a trap; an EXIT handler here deletes files the "
+        "manifest already declared"
+    )
+
+
+def test_assemble_restores_write_before_clearing_its_output_dirs() -> None:
+    """Both output dirs are chmod'd writable, then removed, then re-created.
+
+    `qiita_finish` leaves directories 0550 and files 0440. A directory without
+    its write bit does not give up its entries, so `rm -rf` over such a tree
+    exits 1 -- and under `set -e` that aborts the step rather than clearing it.
+    The chmod is what makes the clear work, so it is pinned with it, in order.
+
+    Both dirs, not just the assembler tree: the awk redirect into circular.fa
+    cannot truncate a 0440 file either. The CP gives an ordinary retry a fresh
+    attempt dir; a SLURM-side requeue re-enters this one.
+    """
+    code = _code_lines(_ASSEMBLE_SH)
+    chmod = next((i for i, ln in enumerate(code) if ln.startswith("chmod -R u+w")), None)
+    clear = next((i for i, ln in enumerate(code) if ln.startswith("rm -rf")), None)
+    mkdir = next((i for i, ln in enumerate(code) if ln.startswith("mkdir -p")), None)
+    assert chmod is not None, (
+        "assemble.sh does not restore write before clearing; `rm -rf` over a tree "
+        "qiita_finish left at 0550/0440 exits 1"
+    )
+    assert clear is not None, "nothing in assemble.sh clears its output dirs"
+    assert mkdir is not None, "assemble.sh never creates its output dirs"
+    assert chmod < clear < mkdir, (
+        f"assemble.sh orders chmod/rm/mkdir at {chmod}/{clear}/{mkdir}; the chmod "
+        "must precede the rm (or the rm fails) and both must precede the mkdir "
+        "(or the clear undoes it)"
+    )
+    loop = next((i for i, ln in enumerate(code) if ln.startswith("for d in ")), None)
+    assert loop is not None, "the clear is not a loop over the output dirs"
+    assert "${OUT}" in code[loop] and "${ASM_DIR}" in code[loop], (
+        f"the clear covers {code[loop]!r}; both ${{OUT}} and ${{ASM_DIR}} carry "
+        "0440 files from a previous attempt"
+    )
+    done = next((i for i, ln in enumerate(code) if ln == "done" and i > loop), None)
+    assert done is not None, "the clear loop is never closed"
+    # Both must act on the loop VARIABLE and sit inside the loop. `chmod -R u+w
+    # "${OUT}"` in the body would pass an order-only check while leaving
+    # ${ASM_DIR} at 0550, so its `rm -rf` exits 1 and aborts the step -- the exact
+    # failure this pin is for, on the one directory the order says nothing about.
+    assert loop < chmod < done and loop < clear < done, (
+        f"chmod at {chmod} and rm at {clear} are not both inside the clear loop ({loop}..{done})"
+    )
+    assert '"${d}"' in code[chmod] and '"${d}"' in code[clear], (
+        f"the loop body chmods {code[chmod]!r} and removes {code[clear]!r}; both "
+        'must act on "${d}" or an iteration operates on the wrong directory'
+    )
+
+
+def test_both_arms_emit_the_contig_attribute_sidecar() -> None:
+    """Each assembler arm writes the sidecar, with the same columns.
+
+    Two producers, two consumers: `assembly_load` and the control plane's
+    membership write both read this file by column NAME, so the arms must agree
+    with each other and with `CONTIG_ATTRIBUTE_COLUMNS`. They agree on nothing
+    else -- one is an awk over a GFA, the other a DuckDB COPY -- so nothing but
+    this checks it.
+    """
+    code = "\n".join(_code_lines(_ASSEMBLE_SH))
+    assert code.count(CONTIG_ATTRIBUTES_FILE) == 2, (
+        f"expected both arms to name {CONTIG_ATTRIBUTES_FILE}; found "
+        f"{code.count(CONTIG_ATTRIBUTES_FILE)} mention(s)"
+    )
+    # The hifiasm arm's header row, written literally in the awk BEGIN block.
+    header = ", ".join(f'"{c}"' for c in CONTIG_ATTRIBUTE_COLUMNS)
+    assert header in code, (
+        f"the hifiasm_meta arm's sidecar header is not {header} -- the two arms "
+        "and the Python constant must spell the columns identically"
+    )
+    # The hifiasm arm's DATA row, which must carry the same five fields in the
+    # same order as the header above -- a reordered `print` would leave the header
+    # correct and every value under the wrong column.
+    assert 'print $2, $2, call, dp, "" > attrs' in code, (
+        "the hifiasm_meta arm's sidecar data row no longer writes "
+        f"{list(CONTIG_ATTRIBUTE_COLUMNS)} in header order"
+    )
+    # The myloasm arm's projection, in myloasm_split.py's COPY.
+    split = "\n".join(_code_lines(_WORKFLOW_DIR / "myloasm_split.py"))
+    assert "SELECT contig_id, header AS raw_name, circularity, depth, mult" in split, (
+        "myloasm_split.py's attribute projection no longer matches "
+        f"{list(CONTIG_ATTRIBUTE_COLUMNS)}"
+    )
+
+
+def test_hifiasm_arm_fails_on_an_unrecognised_segment_name() -> None:
+    """A GFA segment name matching neither shape stops the step.
+
+    The call is stored per contig, so a name matching neither shape would write a
+    circularity into the lake for a contig nothing classified -- and hifiasm_meta
+    is pinned, so a name outside the documented shape means the grammar moved
+    rather than that the assembler produced something unusual.
+    """
+    code = "\n".join(_code_lines(_ASSEMBLE_SH))
+    assert "LIN_RE='tg[0-9]+l$'" in code, (
+        "the hifiasm_meta arm no longer recognises the LINEAR name shape, so every "
+        "linear contig would be counted as unrecognised"
+    )
+    # One grammar for the attribute pass and both FASTA writers: the circular
+    # pattern is defined once and every user reads that variable, so the router
+    # and the stored call cannot disagree about which names are circular.
+    assert "CIRC_RE='tg[0-9]+c$'" in code, (
+        "the circular name shape is no longer defined once in assemble.sh"
+    )
+    assert "tg[0-9]+c$/" not in code, (
+        "a literal circular pattern is back alongside ${CIRC_RE}; the attribute "
+        "pass and the FASTA writers can now drift apart"
+    )
+    assert re.search(r"exit 65", code), (
+        "nothing in assemble.sh exits non-zero for an unrecognised segment name; "
+        "a fall-through stores a circularity nobody determined"
+    )
+
+
+def test_hifiasm_arm_reads_depth_by_tag_not_by_position() -> None:
+    """`dp:f` is found by scanning the optional fields, not by column index.
+
+    GFA does not fix the order of a segment's optional tags. Reading $5 would
+    silently store `LN:i`'s or `ts:B:I`'s value as depth the day the order
+    changes, which no downstream check could catch -- a depth is a plausible
+    number whatever it came from.
+    """
+    code = "\n".join(_code_lines(_ASSEMBLE_SH))
+    assert "for (i = 4; i <= NF; i++)" in code and "$i ~ /^dp:f:/" in code, (
+        "the hifiasm_meta arm no longer searches fields 4+ for the dp:f tag"
+    )
+
+
+def test_assemble_def_pins_and_asserts_both_assemblers() -> None:
+    """Both assemblers are `=`-pinned in the def AND version-asserted in %test.
+
+    A pin binds the solver only. Nothing about it is observable in the built
+    image, and a rebuild of the same conda version against different upstream
+    sources satisfies the pin while moving the tool -- so the pin without the
+    assertion is the gap that lets a drifted image ship green. This is the
+    assemble image's counterpart to the binning-verify.sh check below.
+    """
+    lines = _code_lines(_ASSEMBLE_DEF)
+    creates = [ln for ln in lines if "micromamba create" in ln]
+    pinned = {}
+    for line in creates:
+        pinned.update(dict(re.findall(r"\b([A-Za-z0-9_.-]+)=([A-Za-z0-9][^\s\"\']*)", line)))
+    assert set(pinned) == {"hifiasm_meta", "myloasm"}, (
+        f"expected both assemblers `=`-pinned on their create lines; got {pinned}"
+    )
+    assert pinned == {"hifiasm_meta": "hamtv0.3.5", "myloasm": "0.6.0"}, (
+        f"the assembler pins moved; got {pinned}. Update _ASSERTED_VERSIONS below "
+        "in the same change, or the %test greps go on checking the old build"
+    )
+    for package, expected in _ASSERTED_VERSIONS.items():
+        # The invocation alone is not the assertion: `<tool> --version` on its own
+        # line satisfies a search for it while checking nothing. Require the output
+        # to reach a grep, so the %test line has to compare against something.
+        asserted = [
+            ln for ln in lines if re.search(rf"{re.escape(package)} --version", ln) and "grep" in ln
+        ]
+        assert asserted, (
+            f"{package} is pinned but its --version output is never compared in "
+            "%test, so a drifted solve would build green"
+        )
+        # And each grep must name the version it is checking for. Spelled out
+        # rather than derived from the conda pin: hifiasm_meta's conda string
+        # (`hamtv0.3.5`) appears in none of them, because the binary reports two
+        # internal versions instead -- so a derived check would have to accept any
+        # version-shaped token, and would pass with the pin bumped and the greps
+        # left behind.
+        for token in expected:
+            assert any(token in ln for ln in asserted), (
+                f"{package}'s %test never greps for {token!r}; the pin and the "
+                "build-time assertion have drifted apart"
+            )
 
 
 def test_binning_stages_the_coverage_bam_unrewritten() -> None:
@@ -327,6 +577,195 @@ def test_metawrap_gets_the_reordered_assembly_not_raw_nolcg() -> None:
         f"`metawrap binning` is passed the raw ${{NOLCG}} on its `-a`: {call!r}. "
         "That is the numeric-order assembly the reorder exists to replace."
     )
+
+
+def test_metawrap_memory_cap_derives_from_the_allocation() -> None:
+    """metaWRAP's `-m` comes from MEM_MB, never a numeric literal.
+
+    binning.sh's comment on the `metawrap binning` call carries why.
+    """
+    lines = _code_lines(_BINNING_SH)
+    binning_call = [ln for ln in lines if "metawrap binning" in ln]
+    assert len(binning_call) == 1, f"expected one `metawrap binning`, got {binning_call!r}"
+    call = binning_call[0]
+    assert re.search(r'-m\s+"\$\{METAWRAP_MEM_GB\}"', call), (
+        f"`metawrap binning` no longer takes -m from ${{METAWRAP_MEM_GB}}: {call!r}."
+    )
+    assert re.search(r"-m\s+\d", call) is None, (
+        f"`metawrap binning` passes a numeric -m: {call!r}. A literal does not follow "
+        "the allocation when it is overridden or escalated."
+    )
+    derivation = [ln for ln in lines if ln.startswith("METAWRAP_MEM_GB=")]
+    assert len(derivation) == 1, f"expected one METAWRAP_MEM_GB assignment, got {derivation!r}"
+    assert "MEM_MB" in derivation[0], (
+        f"METAWRAP_MEM_GB is not computed from MEM_MB: {derivation[0]!r}."
+    )
+
+
+def _run_metawrap_mem_derivation(
+    prelude: str, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run binning.sh's own `-m` derivation block under bash, after `prelude` sets MEM_MB."""
+    lines = _code_lines(_BINNING_SH)
+    starts = [i for i, ln in enumerate(lines) if ln.startswith("METAWRAP_HEADROOM_GB=")]
+    assert len(starts) == 1, f"expected one METAWRAP_HEADROOM_GB assignment, got {len(starts)}"
+    ends = [i for i in range(starts[0], len(lines)) if lines[i].strip() == "fi"]
+    assert ends, "no `fi` closes the METAWRAP_MEM_GB guard"
+    script = "\n".join(
+        [
+            "set -euo pipefail",
+            prelude,
+            *lines[starts[0] : ends[0] + 1],
+            'echo "${METAWRAP_MEM_GB}"',
+        ]
+    )
+    return subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, check=False, env=env
+    )
+
+
+@pytest.mark.parametrize(("mem_mb", "expected_m"), [(102400, "90"), (81920, "70"), (14336, "4")])
+def test_metawrap_memory_cap_arithmetic(mem_mb: int, expected_m: str) -> None:
+    """The `-m` binning.sh passes for an allocation, from running its derivation."""
+    result = _run_metawrap_mem_derivation(f"MEM_MB={mem_mb}")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == expected_m
+
+
+def test_metawrap_memory_cap_fits_every_binning_baseline() -> None:
+    """Every workflow version whose binning step runs binning.sh gives metaWRAP a `-m` of
+    at least 1 at its baseline, forwarded as `slurm/payload.py` forwards it (mem_gb * 1024
+    MB), rather than the guard's exit 78 on every ticket."""
+    baselines = []
+    for path in sorted(_WORKFLOW_DIR.glob("*.yaml")):
+        for step in yaml.safe_load(path.read_text()).get("steps", []):
+            is_binning = step.get("step") == "binning"
+            runs_binning_sh = step.get("entrypoint") == "/opt/qiita/binning.sh"
+            if not (is_binning or runs_binning_sh):
+                continue
+            assert is_binning and runs_binning_sh, (
+                path.name,
+                step.get("step"),
+                step.get("entrypoint"),
+            )
+            resources = step["baseline_resources"]
+            profiles = (resources.get("profiles") or {}).values()
+            for mem_gb in [resources.get("mem_gb"), *(p.get("mem_gb") for p in profiles)]:
+                if mem_gb is not None:
+                    baselines.append((path.name, mem_gb))
+    assert baselines, f"no binning.sh step with a mem_gb under {_WORKFLOW_DIR}"
+    for yaml_name, mem_gb in baselines:
+        result = _run_metawrap_mem_derivation(f"MEM_MB={mem_gb * 1024}")
+        assert result.returncode == 0, (yaml_name, mem_gb, result.stderr)
+        assert int(result.stdout.strip()) >= 1, (yaml_name, mem_gb, result.stdout)
+
+
+def test_metawrap_memory_cap_refuses_the_lib_sh_fallback(tmp_path: Path) -> None:
+    """With no allocation forwarded, MEM_MB is whatever `_lib.sh` falls back to, and the
+    guard refuses it: exit 78 naming QIITA_MEM_MB, not a `-m` under 1."""
+    (tmp_path / "params.json").write_text("{}")
+    env = {k: v for k, v in os.environ.items() if k not in {"QIITA_MEM_MB", "SLURM_MEM_PER_NODE"}}
+    env |= {"QIITA_INPUT_PATH": str(tmp_path), "QIITA_OUTPUT_PATH": str(tmp_path)}
+    result = _run_metawrap_mem_derivation(f'source "{_LIB_SH}"', env=env)
+    assert result.returncode == 78, (result.returncode, result.stdout, result.stderr)
+    assert "QIITA_MEM_MB" in result.stderr
+
+
+# Lines from binning runs' stdout, verbatim. The first three are from a run in which
+# MetaBAT2 formed no bins and MaxBin2 declined the assembly; the MetaBAT2 error line is
+# from a run that failed on a different binner, and the bins line from a run that
+# binned normally.
+_METABAT2_NO_BINS = "0 bins (0 bases in total) formed."
+_MAXBIN2_VERDICT = (
+    "Marker gene search reveals that the dataset cannot be binned "
+    "(the medium of marker gene number <= 1). Program stop."
+)
+_METAWRAP_MAXBIN2_ERROR = (
+    "*****                              Something went wrong with running MaxBin2. Exiting."
+    "                             *****"
+)
+_METAWRAP_METABAT2_ERROR = (
+    "*****                              Something went wrong with running MetaBAT2. Exiting"
+    "                             *****"
+)
+_METABAT2_BINS = "4 bins (5313148 bases in total) formed."
+_METABAT2_NONE_MAXBIN2_DECLINED = "\n".join(
+    [_METABAT2_NO_BINS, _MAXBIN2_VERDICT, _METAWRAP_MAXBIN2_ERROR]
+)
+
+
+def _run_metawrap_exit_handling(
+    tmp_path: Path, stdout: str, exit_code: int
+) -> subprocess.CompletedProcess[str]:
+    """Run binning.sh from its metaWRAP stdout copy to the end under bash, with a stand-in
+    `micromamba` that prints `stdout` and exits `exit_code`, and a `qiita_finish` that
+    echoes its arguments."""
+    lines = _code_lines(_BINNING_SH)
+    starts = [i for i, ln in enumerate(lines) if ln.startswith("METAWRAP_STDOUT=")]
+    assert len(starts) == 1, f"expected one METAWRAP_STDOUT assignment, got {len(starts)}"
+    fixture = tmp_path / "fixture.stdout"
+    fixture.write_text(stdout + "\n")
+    script = "\n".join(
+        [
+            "set -euo pipefail",
+            f'WORK="{tmp_path}"',
+            "OUT=bins THREADS=1 METAWRAP_MEM_GB=1 ORDERED_NOLCG=nolcg.fa READS_FQ=reads.fastq",
+            f'micromamba() {{ cat "{fixture}"; return {exit_code}; }}',
+            'qiita_finish() { echo "qiita_finish $*"; }',
+            *lines[starts[0] :],
+        ]
+    )
+    return subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+
+
+# The start of the line binning.sh prints on stderr when it passes a metaWRAP failure on.
+_METAWRAP_FAILED = "binning: metaWRAP failed"
+
+
+def test_binning_finishes_when_metabat2_formed_no_bins_and_maxbin2_declined(
+    tmp_path: Path,
+) -> None:
+    """When MetaBAT2 formed no bins and MaxBin2 declined the assembly, metaWRAP's failure
+    finishes the step with bins_dir, and its stdout still reaches the log."""
+    result = _run_metawrap_exit_handling(tmp_path, _METABAT2_NONE_MAXBIN2_DECLINED, 1)
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    assert "qiita_finish bins_dir=bins" in result.stdout
+    assert _MAXBIN2_VERDICT in result.stdout
+    assert _METAWRAP_FAILED not in result.stderr
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        pytest.param(_METAWRAP_METABAT2_ERROR, id="another binner failed"),
+        pytest.param(
+            _METABAT2_NONE_MAXBIN2_DECLINED.replace(_METABAT2_NO_BINS, _METABAT2_BINS),
+            id="metabat2 formed bins",
+        ),
+        pytest.param(
+            _METABAT2_NONE_MAXBIN2_DECLINED.replace(_METAWRAP_MAXBIN2_ERROR, ""),
+            id="no metawrap maxbin2 error",
+        ),
+        pytest.param(
+            _METABAT2_NONE_MAXBIN2_DECLINED.replace(_MAXBIN2_VERDICT, ""), id="no maxbin2 verdict"
+        ),
+        pytest.param("", id="no output"),
+    ],
+)
+def test_binning_passes_any_other_metawrap_failure_through(tmp_path: Path, stdout: str) -> None:
+    """When metaWRAP's stdout lacks one or more of the three lines, the step exits with
+    metaWRAP's code and names metaWRAP on stderr, in words that match no OOM signature."""
+    result = _run_metawrap_exit_handling(tmp_path, stdout, 3)
+    assert result.returncode == 3, (result.returncode, result.stdout, result.stderr)
+    assert "qiita_finish" not in result.stdout
+    assert f"{_METAWRAP_FAILED} (exit 3)" in result.stderr
+    assert not contains_oom_signature(result.stderr), result.stderr
+
+
+def test_binning_finishes_after_a_clean_metawrap_run(tmp_path: Path) -> None:
+    result = _run_metawrap_exit_handling(tmp_path, _METABAT2_BINS, 0)
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    assert result.stdout.splitlines()[-1] == "qiita_finish bins_dir=bins"
 
 
 def test_binning_fails_loud_on_contig_set_drift() -> None:
@@ -500,4 +939,31 @@ def test_image_pins_are_asserted_at_build_time() -> None:
             f"asserts that version, so a solve that drifted would build and ship "
             f"green. Add it to the PINNED map there (keyed by the binary the "
             f"package provides -- metabat2's is jgi_summarize_bam_contig_depths)."
+        )
+
+
+def test_bin_refine_initializes_its_binner_arrays_by_assignment() -> None:
+    """A bare `declare -a` leaves the array UNSET, which `set -u` refuses.
+
+    `bin_refine.sh` collects one contig2bin table per binner and then reads
+    `${#das_bins[@]}` to decide whether any binner contributed. Declared without an
+    assignment, that array is unset rather than empty, so the read aborts the step
+    on the exact input the check exists to pass cleanly. That entrypoint's comment
+    at the declaration carries the bash versions it was measured on and why the
+    failure cannot be reproduced by running the script on a mac.
+
+    Asserted on the spelling for that same reason. What has to be an assignment is
+    the first NON-COMMENT line naming each array — `_code_lines` drops the comment
+    above the declaration, which names them both — rather than a `declare` line
+    specifically, so dropping `declare` for a bare `das_bins=()` stays green while
+    deleting the initialization outright does not (the first hit becomes the `+=`).
+    """
+    code = _code_lines(_BIN_REFINE_SH)
+
+    for name in ("das_bins", "das_labels"):
+        first = next((line for line in code if name in line), None)
+        assert first is not None, f"bin_refine.sh no longer mentions {name}"
+        assert re.search(rf"\b{name}=\(", first), (
+            f"{name} is introduced without an assignment: {first!r}. "
+            f"`${{#{name}[@]}}` then trips set -u instead of reading 0."
         )

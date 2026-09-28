@@ -26,12 +26,19 @@ import asyncio
 
 import duckdb
 import pytest
+from helpers import write_chunked_blob_upload
 from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
-from qiita_common.models import TERMINAL_WORK_TICKET_STATES, WorkTicketState
+from qiita_common.models import (
+    REDRIVABLE_WORK_TICKET_STATES,
+    TERMINAL_WORK_TICKET_STATES,
+    WorkTicketState,
+)
+from qiita_common.work_ticket_constants import POOL_REMOVAL_RECOVERY
 
 import qiita_compute_orchestrator.jobs.bam_to_parquet as bam_module
 from qiita_compute_orchestrator import sequence_range_retry
 from qiita_compute_orchestrator.jobs.bam_to_parquet import YAML_STEP_NAME, Inputs, execute
+from qiita_compute_orchestrator.miint import open_miint_conn
 from qiita_compute_orchestrator.sequence_range import (
     MintedSequenceRange,
     SequenceRangeAlreadyExists,
@@ -122,6 +129,55 @@ def test_execute_writes_read_parquet(fake_mint, tmp_path):
         (42, 1000, "r1", "ACGT", [40, 40, 40, 40], None, None),
         (42, 1001, "r2", "TTTT", [30, 30, 30, 30], None, None),
     ]
+
+
+def test_execute_reads_an_uploaded_sam(fake_mint, tmp_path):
+    """The user route: `bam_path` is bound to a chunked-BLOB upload rather than
+    to an alignment file, because the runner resolved a `bam_upload_idx` handle.
+    The step stitches it back — as `.sam` here, since the payload is not
+    compressed — and produces the rows the host-path route does."""
+    sam = tmp_path / "in.sam"
+    _write_sam(sam, [_sam_record("r1", "ACGT", "IIII"), _sam_record("r2", "TTTT", "????")])
+    upload = write_chunked_blob_upload(tmp_path / "upload.parquet", sam.read_bytes())
+
+    outputs = _run(
+        Inputs(bam_path=upload, prep_sample_idx=42, work_ticket_idx=1),
+        tmp_path / "ws",
+    )
+
+    assert fake_mint == [(42, 2)]
+    assert _read_parquet(tmp_path / "ws" / "read") == [
+        (42, 1000, "r1", "ACGT", [40, 40, 40, 40], None, None),
+        (42, 1001, "r2", "TTTT", [30, 30, 30, 30], None, None),
+    ]
+    # Which suffix the stitch picks is pinned in tests/jobs/test_blob_input.py;
+    # here the point is that neither spelling survives into the outputs.
+    assert not list((tmp_path / "ws").glob("reads.*"))
+    assert outputs["read_staging_dir"] == tmp_path / "ws"
+
+
+def test_execute_reads_an_uploaded_bam(fake_mint, tmp_path):
+    """A real BAM through the same route. The payload is BGZF, so the stitched
+    file is named `.bam` — hand the binary container to the reader under a
+    `.sam` name and it parses nothing."""
+    sam = tmp_path / "in.sam"
+    _write_sam(sam, [_sam_record("r1", "ACGT", "IIII"), _sam_record("r2", "TTTT", "????")])
+    bam = tmp_path / "in.bam"
+    with open_miint_conn() as conn:
+        # UBAM, not BAM: this loader takes unaligned basecaller uBAMs, and
+        # `FORMAT BAM` requires REFERENCE_LENGTHS, which an unaligned file has
+        # no references to supply.
+        conn.execute(f"COPY (SELECT * FROM read_sequences_sam('{sam}')) TO '{bam}' (FORMAT UBAM)")
+    upload = write_chunked_blob_upload(tmp_path / "upload.parquet", bam.read_bytes())
+
+    _run(Inputs(bam_path=upload, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
+
+    assert fake_mint == [(42, 2)]
+    assert [r[2] for r in _read_parquet(tmp_path / "ws" / "read")] == ["r1", "r2"]
+    # The stitched upload is an input the step materialized, not an output: the
+    # launcher's manifest walker rglobs this workspace, so leaving it here would
+    # publish the submitter's whole BAM as a job result.
+    assert not (tmp_path / "ws" / "reads.bam").exists()
 
 
 def test_header_only_sam_raises_stepnodata(fake_mint, tmp_path):
@@ -251,7 +307,7 @@ def test_execute_range_left_with_a_different_count_is_bad_input(monkeypatch, tmp
 
     assert ei.value.kind is FailureKind.BAD_INPUT
     assert ei.value.step_name == YAML_STEP_NAME
-    assert "must match the prior mint count exactly" in ei.value.reason
+    assert "has to cover exactly as many reads as before" in ei.value.reason
 
 
 def test_duckdb_memory_limit_tracks_the_slurm_cgroup(fake_mint, monkeypatch, tmp_path):
@@ -304,6 +360,7 @@ def test_execute_refuses_a_range_minted_by_a_different_ticket(monkeypatch, tmp_p
             sequence_idx_start=1000,
             sequence_idx_stop=1001,
             minted_by_work_ticket_idx=999,  # a different ticket loaded these reads
+            minted_by_work_ticket_state=WorkTicketState.COMPLETED.value,
         )
 
     monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _conflict)
@@ -317,9 +374,118 @@ def test_execute_refuses_a_range_minted_by_a_different_ticket(monkeypatch, tmp_p
 
     assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
     assert ei.value.step_name == YAML_STEP_NAME
-    assert "work_ticket 999" in ei.value.reason
+    assert "ticket 999" in ei.value.reason
     assert "already loaded" in ei.value.reason
     # Nothing was written: the refusal happens before the durable rewrite.
+    assert not (tmp_path / "ws" / "read").exists()
+
+
+@pytest.mark.parametrize("minter_state", [WorkTicketState.NO_DATA.value, None])
+def test_execute_does_not_claim_the_reads_loaded_unless_the_other_minter_completed(
+    monkeypatch, tmp_path, minter_state
+):
+    # Only a COMPLETED minter is known to have stored the reads. A no_data minter, or
+    # one whose ticket row is gone, gets the pool removal without "already loaded".
+    async def _conflict(*, http, prep_sample_idx, count, work_ticket_idx):
+        raise SequenceRangeAlreadyExists(prep_sample_idx, count)
+
+    async def _someone_elses(*, http, prep_sample_idx):
+        return MintedSequenceRange(
+            prep_sample_idx=prep_sample_idx,
+            sequence_idx_start=1000,
+            sequence_idx_stop=1001,
+            minted_by_work_ticket_idx=999,
+            minted_by_work_ticket_state=minter_state,
+        )
+
+    monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _conflict)
+    monkeypatch.setattr(sequence_range_retry, "get_sequence_range", _someone_elses)
+
+    sam = tmp_path / "in.sam"
+    _write_sam(sam, [_sam_record("r1", "ACGT", "IIII"), _sam_record("r2", "TTTT", "????")])
+
+    with pytest.raises(BackendFailure) as ei:
+        _run(Inputs(bam_path=sam, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
+
+    assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
+    assert "ticket 999" in ei.value.reason
+    assert "were already loaded" not in ei.value.reason
+    if minter_state is None:
+        assert "ticket 999, whose record is gone" in ei.value.reason
+    else:
+        assert f"ticket 999, which ended as {minter_state}" in ei.value.reason
+    assert "may already have been loaded" in ei.value.reason
+    assert POOL_REMOVAL_RECOVERY in ei.value.reason
+    assert "ticket run" not in ei.value.reason
+    assert not (tmp_path / "ws" / "read").exists()
+
+
+@pytest.mark.parametrize("minter_state", [WorkTicketState.FAILED, WorkTicketState.CANCELLED])
+def test_execute_points_at_a_redrive_when_the_other_minter_did_not_finish(
+    monkeypatch, tmp_path, minter_state
+):
+    """A range minted by another ticket that FAILED or was CANCELLED is still refused,
+    and the reason names that ticket's redrive first: an interrupted load is finished
+    by re-driving it. The minter may or may not have stored the reads, so the reason
+    must not say they were loaded."""
+
+    async def _conflict(*, http, prep_sample_idx, count, work_ticket_idx):
+        raise SequenceRangeAlreadyExists(prep_sample_idx, count)
+
+    async def _unfinished(*, http, prep_sample_idx):
+        return MintedSequenceRange(
+            prep_sample_idx=prep_sample_idx,
+            sequence_idx_start=1000,
+            sequence_idx_stop=1001,
+            minted_by_work_ticket_idx=999,
+            minted_by_work_ticket_state=minter_state.value,
+        )
+
+    monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _conflict)
+    monkeypatch.setattr(sequence_range_retry, "get_sequence_range", _unfinished)
+
+    sam = tmp_path / "in.sam"
+    _write_sam(sam, [_sam_record("r1", "ACGT", "IIII"), _sam_record("r2", "TTTT", "????")])
+
+    with pytest.raises(BackendFailure) as ei:
+        _run(Inputs(bam_path=sam, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
+
+    assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
+    assert "`qiita ticket run 999`" in ei.value.reason
+    assert "were already loaded" not in ei.value.reason
+    assert ei.value.reason.index("qiita ticket run") < ei.value.reason.index(POOL_REMOVAL_RECOVERY)
+    assert not (tmp_path / "ws" / "read").exists()
+
+
+def test_execute_points_at_the_other_minter_while_it_is_still_running(monkeypatch, tmp_path):
+    """A range minted by another ticket that is still in flight is refused without
+    claiming the reads are loaded (they may not be yet) or offering the pool delete."""
+
+    async def _conflict(*, http, prep_sample_idx, count, work_ticket_idx):
+        raise SequenceRangeAlreadyExists(prep_sample_idx, count)
+
+    async def _running(*, http, prep_sample_idx):
+        return MintedSequenceRange(
+            prep_sample_idx=prep_sample_idx,
+            sequence_idx_start=1000,
+            sequence_idx_stop=1001,
+            minted_by_work_ticket_idx=999,
+            minted_by_work_ticket_state=WorkTicketState.PROCESSING.value,
+        )
+
+    monkeypatch.setattr(sequence_range_retry, "mint_sequence_range", _conflict)
+    monkeypatch.setattr(sequence_range_retry, "get_sequence_range", _running)
+
+    sam = tmp_path / "in.sam"
+    _write_sam(sam, [_sam_record("r1", "ACGT", "IIII"), _sam_record("r2", "TTTT", "????")])
+
+    with pytest.raises(BackendFailure) as ei:
+        _run(Inputs(bam_path=sam, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
+
+    assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
+    assert "`qiita ticket status 999`" in ei.value.reason
+    assert "already loaded" not in ei.value.reason
+    assert "delete-sequenced-pool" not in ei.value.reason
     assert not (tmp_path / "ws" / "read").exists()
 
 
@@ -349,7 +515,7 @@ def test_execute_refuses_a_range_with_unknown_provenance(monkeypatch, tmp_path):
         _run(Inputs(bam_path=sam, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
 
     assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
-    assert "unknown work_ticket" in ei.value.reason
+    assert "cannot identify" in ei.value.reason
     assert not (tmp_path / "ws" / "read").exists()
 
 
@@ -361,12 +527,10 @@ def test_execute_refuses_a_range_whose_ticket_is_no_longer_in_flight(
     re-written once that ticket has left flight.
 
     The gate is an ALLOWLIST — reuse is legitimate only while the minting ticket is
-    still in flight — not a denylist of `completed`. That matters because the failure
-    mode is silent: reusing a range whose reads are already registered duplicates them
-    in DuckLake, which has no uniqueness. A denylist would let a work_ticket_state
-    added later fall through to the reuse path by default — fail-open — and this
-    parametrisation is what pins it: it walks EVERY terminal state, so a new one is
-    covered the day it is added.
+    still in flight — not a denylist of `completed`. A denylist would let a
+    work_ticket_state added later fall through to the reuse path by default —
+    fail-open — and this parametrisation is what pins it: it walks EVERY terminal
+    state, so a new one is covered the day it is added.
 
     Reachable if a stale attempt outlives the attempt that finished the ticket (an
     orphaned SLURM job never reaped): it reaches the mint, 409s, reads back a range
@@ -396,19 +560,22 @@ def test_execute_refuses_a_range_whose_ticket_is_no_longer_in_flight(
         _run(Inputs(bam_path=sam, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
 
     assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
-    assert "no longer in flight" in ei.value.reason
+    assert "no longer running" in ei.value.reason
     assert terminal_state in ei.value.reason
     assert not (tmp_path / "ws" / "read").exists()
 
-    # The refusal must name a recovery the CP will actually ACCEPT. `/run` takes a
-    # ticket in PENDING or FAILED only, so `failed` gets the redrive and every other
-    # terminal state gets delete-then-resubmit; pointing `completed` or `no_data` at
-    # `ticket run` would send the operator to a 409.
-    if terminal_state == WorkTicketState.FAILED.value:
+    # The refusal must name a recovery the CP will actually ACCEPT. `/run` redrives a
+    # FAILED or CANCELLED ticket, so those two get the redrive and every other terminal
+    # state gets delete-then-resubmit; pointing `completed` or `no_data` at `ticket run`
+    # would send the operator to a 409.
+    if terminal_state in REDRIVABLE_WORK_TICKET_STATES:
         assert f"qiita ticket run {1}" in ei.value.reason
-        assert "DELETE the prep_sample" not in ei.value.reason
+        assert "delete-sequenced-pool" not in ei.value.reason
     else:
-        assert "DELETE the prep_sample" in ei.value.reason
+        # The recovery has to be a gesture that exists: there is no prep_sample
+        # DELETE route, so the pool is what gets removed, and the COMPLETED
+        # ticket blocks that too unless it is forced.
+        assert POOL_REMOVAL_RECOVERY in ei.value.reason
         assert "ticket run" not in ei.value.reason
 
 
@@ -493,8 +660,9 @@ def test_execute_refuses_when_the_minter_state_is_unknown(monkeypatch, tmp_path)
         _run(Inputs(bam_path=sam, prep_sample_idx=42, work_ticket_idx=1), tmp_path / "ws")
 
     assert ei.value.kind is FailureKind.UNKNOWN_PERMANENT
-    assert "no longer in flight" in ei.value.reason
-    # No ticket row to redrive — `/run` would 404. Delete-first is the only recovery.
-    assert "DELETE the prep_sample" in ei.value.reason
+    assert "no longer running" in ei.value.reason
+    # No ticket row to redrive — `/run` would 404. Removing the pool is the only
+    # recovery, and it needs its own --force past the terminal ticket.
+    assert POOL_REMOVAL_RECOVERY in ei.value.reason
     assert "ticket run" not in ei.value.reason
     assert not (tmp_path / "ws" / "read").exists()

@@ -4,9 +4,12 @@ Two consumers run this same analytic and must not disagree about it: the
 compute-orchestrator native job `estimate_feature_table` (server-side, reached
 through a work ticket) and the client-side feature-table recipe (a user's machine,
 composing the analytic-export routes). They differ in everything *around* the
-analytic — where the inputs come from, how the result is written — and in nothing
-about the analytic itself, so the SQL lives here and the streaming and I/O stay with
-each caller.
+analytic — where the inputs come from, how the result is written — so the SQL lives
+here and the streaming and I/O stay with each caller.
+
+They disagree about the analytic in exactly one place: `denovo_map_statements` gates
+the de novo arm on CheckM scores, and a client-built combined table calls
+`denovo_map_table_sql` ungated, because the client recipe does not read `bin_quality`.
 
 **Plain SQL text, so nothing here needs a connection of its own.** Callers execute
 these statements on a connection that has miint loaded. (Same shape as `chunking.py`'s
@@ -29,7 +32,8 @@ The modules, in the order a recipe reaches them:
 | Module | What it owns |
 |---|---|
 | `relations` | the relation names, what each one is (TABLE vs VIEW), and its release |
-| `stage` | the three input streams → named relations |
+| `stage` | the reference arm's input streams → named relations |
+| `reconcile` | the de novo arm's own relations, and precedence between the two arms |
 | `coverage` | the scope, the survivor set, and what the roll-up leaves behind |
 | `gate` | the alignment gate — CIGAR or circular-pooled — and its clearance |
 | `ogu` | `woltka_ogu`'s input and output — today's one table flavour |
@@ -45,24 +49,35 @@ from .coverage import (
     RollupCoverage,
     coverage_alignments_view_sql,
     coverage_filter_applies,
+    denovo_coverage_alignments_view_sql,
     rollup_coverage_diagnostics_sql,
     rollup_coverage_warning,
+    survivor_parameters,
     survivor_table_name,
     survivor_table_sql,
 )
 from .gate import (
     CIRCULAR_MIN_COVERAGE,
     CIRCULAR_MIN_IDENTITY,
+    MAX_SECONDARY,
     PAIRED_PLACEMENT_PARTITION,
+    POOLABLE_ROW,
+    SCORABLE_SECONDARY_ROW,
+    UNSCORABLE_ROW,
     AlignmentGate,
     GateClearance,
     check_gate_diagnostics,
     circular_alignments_view_sql,
+    circular_cleared_join,
+    circular_predicate_sql,
     feature_topology_view_sql,
     gate_alignment_columns,
     gate_diagnostics_sql,
     gate_parameters,
+    gated_alignment_parameters,
     gated_alignment_table_sql,
+    secondary_parameters,
+    secondary_predicate_sql,
     streamed_alignment_table_sql,
 )
 from .label import (
@@ -86,11 +101,29 @@ from .ogu import (
     ogu_output_table_sql,
     woltka_ogu_select_sql,
 )
+from .reconcile import (
+    DEFAULT_MAX_CONTAMINATION,
+    DEFAULT_MIN_COMPLETENESS,
+    denovo_alignment_statements,
+    denovo_contig_lengths_insert_sql,
+    denovo_contig_lengths_table_sql,
+    denovo_genome_lengths_insert_sql,
+    denovo_genome_quality_table_sql,
+    denovo_map_join,
+    denovo_map_statements,
+    denovo_map_table_sql,
+    denovo_ogu_input_select_sql,
+)
 from .relations import (
     ALIGNMENT_TABLE,
     BLOCKED_FEATURE_TABLE,
     CIRCULAR_ALIGNMENTS_VIEW,
     COVERAGE_ALIGNMENTS_VIEW,
+    DENOVO_ALIGNMENT_TABLE,
+    DENOVO_CONTIG_LENGTHS_TABLE,
+    DENOVO_COVERAGE_ALIGNMENTS_VIEW,
+    DENOVO_GENOME_QUALITY_TABLE,
+    DENOVO_MAP_TABLE,
     FEATURE_LENGTHS_TABLE,
     FEATURE_TOPOLOGY_VIEW,
     GENOME_LABEL_TABLE,
@@ -108,6 +141,7 @@ from .relations import (
     TAXONOMY_TABLE,
     TREE_TABLE,
     drop_circular_inputs_statements,
+    drop_denovo_alignment_table_sql,
     drop_ogu_input_table_sql,
     drop_phylogeny_statements,
     drop_streamed_alignment_table_sql,
@@ -155,6 +189,14 @@ __all__ = [
     "CIRCULAR_MIN_COVERAGE",
     "CIRCULAR_MIN_IDENTITY",
     "COVERAGE_ALIGNMENTS_VIEW",
+    "DEFAULT_MAX_CONTAMINATION",
+    "DEFAULT_MIN_COMPLETENESS",
+    "DENOVO_ALIGNMENT_TABLE",
+    "DENOVO_CONTIG_LENGTHS_TABLE",
+    "DENOVO_COVERAGE_ALIGNMENTS_VIEW",
+    "DENOVO_GENOME_QUALITY_TABLE",
+    "denovo_map_join",
+    "DENOVO_MAP_TABLE",
     "CoverageScope",
     "FEATURE_LENGTHS_TABLE",
     "FEATURE_TOPOLOGY_VIEW",
@@ -171,6 +213,10 @@ __all__ = [
     "OUTPUT_COLUMNS",
     "OUTPUT_SCHEMA",
     "PAIRED_PLACEMENT_PARTITION",
+    "MAX_SECONDARY",
+    "POOLABLE_ROW",
+    "SCORABLE_SECONDARY_ROW",
+    "UNSCORABLE_ROW",
     "PHYLOGENY_COLUMNS",
     "PHYLOGENY_TABLE",
     "RollupCoverage",
@@ -194,9 +240,23 @@ __all__ = [
     "check_taxonomy_diagnostics",
     "check_tree_diagnostics",
     "circular_alignments_view_sql",
+    "circular_cleared_join",
+    "circular_predicate_sql",
+    "secondary_parameters",
+    "secondary_predicate_sql",
     "coverage_alignments_view_sql",
     "coverage_filter_applies",
+    "denovo_alignment_statements",
+    "denovo_contig_lengths_insert_sql",
+    "denovo_contig_lengths_table_sql",
+    "denovo_coverage_alignments_view_sql",
+    "denovo_genome_lengths_insert_sql",
+    "denovo_genome_quality_table_sql",
+    "denovo_map_statements",
+    "denovo_map_table_sql",
+    "denovo_ogu_input_select_sql",
     "drop_circular_inputs_statements",
+    "drop_denovo_alignment_table_sql",
     "drop_ogu_input_table_sql",
     "drop_phylogeny_statements",
     "drop_streamed_alignment_table_sql",
@@ -205,6 +265,7 @@ __all__ = [
     "feature_topology_view_sql",
     "gate_alignment_columns",
     "gate_diagnostics_sql",
+    "gated_alignment_parameters",
     "gate_parameters",
     "gated_alignment_table_sql",
     "genome_label_table_sql",
@@ -225,6 +286,7 @@ __all__ = [
     "shear_input_statements",
     "sheared_tree_table_sql",
     "streamed_alignment_table_sql",
+    "survivor_parameters",
     "survivor_table_name",
     "survivor_table_sql",
     "taxonomy_copy_sql",

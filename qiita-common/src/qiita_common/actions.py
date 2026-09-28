@@ -54,12 +54,36 @@ from qiita_common.models import (
 # belongs at the layers that actually import / dispatch.
 NATIVE_MODULE_PREFIX = "qiita_compute_orchestrator.jobs."
 
+# Filename a step writes inside its output directory, naming each declared output
+# (the producer's final act before chmod; its presence is the completion marker).
+# The orchestrator's launcher writes it and its verifier reads it; the control
+# plane reads it where it finds a step's files outside the runner (the admin
+# backfills). `workflows/_shared/manifest_writer.py` runs in containers without
+# qiita_common and keeps its own copy.
+STEP_MANIFEST_FILENAME = "manifest.json"
+
+# The two directories inside a step attempt's workspace that both components
+# name: the orchestrator creates them at submit and the control plane rebuilds
+# the paths on resume and reads the logs.
+STEP_OUTPUT_SUBDIR = "output"
+STEP_LOGS_SUBDIR = "logs"
+
 # The runner binding name the minted processing_idx travels under. A step names it
 # as the value side of a `params:` pair (`processing_idx: processing_idx` ->
 # <job>.Inputs.processing_idx), which both signals the runner to mint the run
 # identity before the step loop and carries the value into the step. Read through
 # `action_threads_processing_idx` below, the one predicate that tests for it.
 PROCESSING_IDX_BINDING = "processing_idx"
+
+# The runner binding name an alignment run's alignment_idx travels under. A step names
+# it on BOTH sides of a `params:` pair (the key is the action_context key the runner
+# binds from, the value is the job's Inputs field), which carries the value into the
+# step so every row it emits is keyed by it. Where the value COMES from differs by scope, which
+# is why this is not a mint signal the way PROCESSING_IDX_BINDING is: a block ticket
+# carries it on `work_ticket.alignment_idx` from plan time, and a prep_sample one has
+# it minted by the runner off the terminal `finalize-alignment-sample` action. Read
+# through `_alignment_gate_threads_its_identity` below, and by the runner.
+ALIGNMENT_IDX_BINDING = "alignment_idx"
 
 
 # action_context property keys that name a fastq file path. The
@@ -71,8 +95,27 @@ PROCESSING_IDX_BINDING = "processing_idx"
 # the strings — a key renamed in the YAML then lights up its importers
 # rather than silently drifting. The gate enforces that each such path's
 # basename is prefixed by the prep_sample's sequenced_pool_item_id (see
-# docs/runbooks/user-cli-quickstart.md).
+# `_check_fastq_filename_prefix` in the control plane's routes/work_ticket.py).
 FASTQ_PATH_CONTEXT_KEYS: tuple[str, str] = ("fastq_path", "reverse_fastq_path")
+
+
+# Suffix that marks an `action_context` key as an upload handle rather than a
+# literal value, and the suffix it resolves to. The runner rewrites every
+# `{prefix}_upload_idx` into a `{prefix}_path` binding pointing at the staged
+# file before any step runs (`runner._resolve_upload_handles`), which is how a
+# workflow step reads an uploaded file and a host-path file through the same
+# input name. Defined here so the runner, the work_ticket submit gate, and the
+# CLI that mints the handles share one spelling.
+UPLOAD_IDX_SUFFIX = "_upload_idx"
+PATH_SUFFIX = "_path"
+
+
+# Key-name suffixes that mark an `action_context` value, or a `context_schema`
+# property, as a host path. Two sites read this from opposite ends: the submit
+# gate checks a value under such a key whatever the schema declares, and the
+# workflow-YAML loader guard makes a property with such a name declare
+# `pattern: "^/"`. One definition, so the two cannot cover different sets.
+HOST_PATH_KEY_SUFFIXES: tuple[str, ...] = (PATH_SUFFIX, "_dir", "_folder")
 
 
 # The per-sample read-mask action's bare id (its YAML lives at
@@ -147,6 +190,12 @@ ALIGN_ACTION_ID = "align"
 # they did not create" keys on it.
 LONG_READ_ASSEMBLY_ACTION_ID = "long-read-assembly"
 
+# The de novo alignment action's bare id (workflows/align-denovo/<version>.yaml).
+# The second action that CONSUMES a read mask rather than minting one — it aligns the
+# `read_masked` pass-set named by its action_context `align_mask_idx` — so the same
+# readers that key on the constant above key on this one.
+ALIGN_DENOVO_ACTION_ID = "align-denovo"
+
 
 class Audience(BaseModel):
     """Who may invoke this action — answers "may invoke", not "may execute".
@@ -167,10 +216,11 @@ class FlatBaselineResources(BaseModel):
     """Flat resource declaration — cpu/mem_gb/walltime/gpu, all required.
 
     Used as the value type in `BaselineResources.profiles` (one profile per
-    instrument family, picked at dispatch by the runner's A4 resolution
-    branch) and as the shape `ActionCeiling` carries (the ceiling is always
-    a single upper bound, regardless of which baseline-resource population
-    the step uses).
+    value of the key an upstream step's output carries — an instrument family
+    for bcl-convert, an assembler for long-read-assembly — resolved at dispatch
+    by `runner._dispatch`) and as the shape `ActionCeiling` carries (the ceiling
+    is always a single upper bound, regardless of which baseline-resource
+    population the step uses).
     """
 
     cpu: Annotated[int, Field(gt=0)]
@@ -423,6 +473,15 @@ WorkflowEntry = Annotated[
 ]
 
 
+def context_schema_default(context_schema: dict[str, Any], key: str) -> Any:
+    """The declared default for one `context_schema` knob, or None if it declares none.
+
+    The submit path and the identity hash must read the same literal: a knob the
+    submitter left unset is hashed at its declared default, and the job is bound the
+    same value."""
+    return context_schema.get("properties", {}).get(key, {}).get("default")
+
+
 def action_threads_processing_idx(steps: Iterable[WorkflowEntry]) -> bool:
     """True iff some entry threads PROCESSING_IDX_BINDING through its `params:`.
 
@@ -602,14 +661,40 @@ class ActionDefinition(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _alignment_gate_threads_its_identity(self) -> ActionDefinition:
+        # The qiita.alignment_sample gate row is keyed on (alignment_idx,
+        # prep_sample), and the same alignment_idx must be stamped onto every row the
+        # workflow registers — otherwise the gate says a sample is aligned under an
+        # identity whose rows carry a different one. The runner mints it off the
+        # terminal gate action itself, so what needs asserting here is the other half:
+        # that some step is handed it. Same shape, and the same reason, as
+        # `_assembly_gate_declares_a_processing_identity` above.
+        declares_gate = any(
+            isinstance(e, WorkflowAction) and e.name == LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE
+            for e in self.steps
+        )
+        threads_identity = any(
+            isinstance(e, WorkflowStep) and ALIGNMENT_IDX_BINDING in e.params.values()
+            for e in self.steps
+        )
+        if declares_gate and not threads_identity:
+            raise ValueError(
+                f"an action declaring the {LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE} "
+                f"entry must thread {ALIGNMENT_IDX_BINDING!r} through some step's "
+                "`params:` — the gate row and the rows it gates must carry the same "
+                "alignment identity"
+            )
+        return self
+
     def _labelled_baselines(self) -> list[tuple[str, FlatBaselineResources]]:
         """Every step's baseline flattened to (label, resources) pairs.
 
         A flat population contributes one pair under the step's own name; a
         lookup population contributes one per profile, labelled
         ``name[profile]``, because a lookup step can be correctly sized on one
-        instrument profile and mis-sized on another — collapsing them would hide
-        exactly the case that matters. `action:` entries declare no resources and
+        profile and mis-sized on another — collapsing them would hide exactly the
+        case that matters. `action:` entries declare no resources and
         contribute nothing.
         """
         pairs: list[tuple[str, FlatBaselineResources]] = []

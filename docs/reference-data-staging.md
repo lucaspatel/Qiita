@@ -67,7 +67,7 @@ jplace format (Matsen et al. 2012). Placement edges reference the backbone phylo
 ### genome_mapping
 Tab-separated, three columns: `feature_id<TAB>genome_source<TAB>genome_source_id`. Maps sequence identifiers to external genome accessions. `genome_source` is one of: `genbank`, `refseq`, `collaborator`, `qiita`. `genome_source_id` is the external accession.
 
-What this file establishes is read back out by `GET /reference/{reference_idx}/genome-map`, which returns the whole reference's `feature_idx → (genome_idx, source, source_id)` lookup. It is a control-plane read rather than a Flight ticket because none of those columns exist in DuckLake; see [`architecture.md`](architecture.md) under "Two maps that are REST reads, not Flight tickets".
+What this file establishes is read back out by `GET /reference/{reference_idx}/genome-map`, which returns the whole reference's `feature_idx → (genome_idx, source, source_id)` lookup, and by its uncapped Parquet sibling `GET /reference/{reference_idx}/genome-map/parquet`. Both are control-plane reads rather than Flight tickets because none of those columns exist in DuckLake; see [`architecture/flight.md`](architecture/flight.md) under "One map and three mints that are REST, not Flight tickets".
 
 ## Host references and the rype index
 
@@ -79,7 +79,7 @@ Host references are ingested by the **`host-reference-add`** workflow (`workflow
 
 ### `.ryxdi` index layout and location
 
-The index is a miint rype `.ryxdi` — a **directory** (manifest + Parquet shards), not a single file — written by `build_rype_index` to a persistent path on the shared filesystem (NOT the ephemeral work-ticket workspace):
+The index is a miint rype `.ryxdi` — a **directory** (manifest + Parquet shards), not a single file — written by `build_rype_index` to a persistent path on the shared filesystem (NOT the per-attempt scratch workspace):
 
 ```
 {PATH_DERIVED}/references/{reference_idx}/rype/index.ryxdi/

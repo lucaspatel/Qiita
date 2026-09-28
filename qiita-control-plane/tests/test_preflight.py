@@ -25,6 +25,7 @@ import sqlite3
 
 import pytest
 
+from qiita_control_plane.cli.user.pacbio import _read_pacbio_preflight_rows
 from qiita_control_plane.preflight import (
     SHEET_TYPE_PACBIO_ABSQUANT,
     is_pacbio_sheet_type,
@@ -63,8 +64,6 @@ def test_cli_and_route_readers_agree_on_case5(build_case5_preflight):
     `get_pacbio_sample_info`; this asserts they agree field-for-field on the case-5
     fixture — including the KEY, which the rekey turned from the barcode into
     pacbio_sample_idx."""
-    from qiita_control_plane.cli.user.pacbio import _read_pacbio_preflight_rows
-
     db = build_case5_preflight()
     rows = _read_pacbio_preflight_rows(db, argparse.ArgumentParser())
     protocol = pacbio_protocol_from_blob(db.read_bytes())
@@ -97,9 +96,10 @@ def test_pacbio_protocol_raises_on_an_unreadable_blob():
     """An unreadable blob PROPAGATES: the roster route degrades it to "unknown" and
     warns; the CLI fails fast. Neither is served by swallowing it here.
 
-    load_db_bytes sniffs the header, so a non-SQLite blob raises ValueError; a
-    header-bearing but truncated one raises sqlite3.DatabaseError. Both propagate."""
-    with pytest.raises((sqlite3.DatabaseError, ValueError)):
+    Input lacking the SQLite file header is rejected as `ValueError` before any
+    deserialize; a blob that carries the header but is truncated raises
+    `sqlite3.DatabaseError`. Both callers catch the pair."""
+    with pytest.raises(ValueError):
         pacbio_protocol_from_blob(b"this is not a sqlite file")
 
 
@@ -131,7 +131,7 @@ def test_an_unreadable_blob_raises_rather_than_looking_non_pacbio(build_case5_pr
     So: a CORRUPT blob raises, while a well-formed NON-PacBio blob still returns {}.
     Those two must never collapse into the same answer."""
     corrupt = build_case5_preflight().read_bytes()[:512] + b"\x00" * 64
-    with pytest.raises((sqlite3.DatabaseError, ValueError)):
+    with pytest.raises(sqlite3.DatabaseError):
         pacbio_protocol_from_blob(corrupt)
 
     # ...and the benign case is unchanged: a real, readable, non-PacBio sheet is {}.

@@ -14,10 +14,13 @@ from ..repositories.mask_definition import (
     ADAPTER_HASH_SCHEME_SEQUENCE_HASH,
     ADAPTER_SET_HASH_KEY,
     RESOLVED_QC_KEY,
+    RESOLVED_SYNDNA_KEY,
+    SYNDNA_REFERENCE_IDX_KEY,
     MaskDefinitionDeprecated,
     mint_mask_definition,
 )
 from ..repositories.reference_membership import reference_sequence_set_hash
+from ._db import persist_ticket_idx
 from ._reference import QC_ADAPTER_BINDING, _resolve_qc_adapters
 from ._upload import _submission_bad_input
 
@@ -39,11 +42,6 @@ from ._upload import _submission_bad_input
 # signals the runner to mint the mask before the step loop and carries the value
 # into the step.
 MASK_IDX_BINDING = "mask_idx"
-
-# The align run's alignment_idx (mask-style identity), read off an align block
-# ticket's `work_ticket.alignment_idx` and threaded into the align_sharded step's
-# `params:` so every emitted row is keyed by it. None for non-align tickets.
-ALIGNMENT_IDX_BINDING = "alignment_idx"
 
 # Binding for the CP-resolved lima argument string. The `lima_export` step lists
 # it in its `params:` and writes it into `lima_config.json`, which the container
@@ -290,7 +288,7 @@ def _resolved_syndna(action_context: Mapping[str, Any]) -> dict[str, Any] | None
     if not action_context.get("syndna_enabled"):
         return None
     return {
-        "reference_idx": action_context.get("syndna_reference_idx"),
+        SYNDNA_REFERENCE_IDX_KEY: action_context.get("syndna_reference_idx"),
         "aligner": _SYNDNA_ALIGNER,
         "preset": _SYNDNA_MM2_PRESET,
         "identity_method": _SYNDNA_IDENTITY_METHOD,
@@ -379,7 +377,7 @@ def _build_mask_params(
             ADAPTER_SET_HASH_KEY: adapter_set_hash,
         },
         "resolved_lima": resolved_lima,
-        "resolved_syndna": resolved_syndna,
+        RESOLVED_SYNDNA_KEY: resolved_syndna,
     }
 
 
@@ -497,12 +495,9 @@ async def _persist_mask_idx(pool: asyncpg.Pool, work_ticket_idx: int, mask_idx: 
     """Write the minted `mask_idx` onto the ticket row (durable ticket→mask
     traceability + a cheap shared-mask guard). Idempotent: a re-mint on resume
     re-resolves to the same mask_idx via the config-hash upsert, so re-running
-    this writes the same value. Like every runner DB write it fails loud — a PG
-    outage raises and unwinds the run via run_workflow's catch-all."""
-    await pool.execute(
-        "UPDATE qiita.work_ticket SET mask_idx = $1 WHERE work_ticket_idx = $2",
-        mask_idx,
-        work_ticket_idx,
+    this writes the same value."""
+    await persist_ticket_idx(
+        pool, column="mask_idx", work_ticket_idx=work_ticket_idx, value=mask_idx
     )
 
 

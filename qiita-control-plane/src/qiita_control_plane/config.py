@@ -9,6 +9,7 @@ from pathlib import Path
 from qiita_common.config import require_env
 
 from .fanout_dispatch import DEFAULT_FANOUT_MAX_INFLIGHT
+from .workspace import WORK_TICKET_SUBDIR
 
 # Local@domain.tld shape check for CONTACT_EMAIL. Deliberately loose —
 # the real test is whether mail reaches the address. See from_env().
@@ -49,7 +50,9 @@ _DEFAULT_CP_TO_CO_TOKEN_PATH = Path("/etc/qiita/cp-to-co.token")
 # so a 1000-shard build can't open ~1000 concurrent data-plane streams (the WOL3
 # incident). The default (mirrors the operator throttle that recovered reference
 # 16) lives in fanout_dispatch as the single source of truth; tune per deploy via
-# FANOUT_MAX_INFLIGHT once the data plane's headroom is known.
+# FANOUT_MAX_INFLIGHT once the data plane's headroom is known. A cohort gains
+# nothing above `dispatch._DISPATCH_CONCURRENCY` (8): its children dispatch
+# through the same shared process-wide slots, so they queue instead.
 _DEFAULT_FANOUT_MAX_INFLIGHT = DEFAULT_FANOUT_MAX_INFLIGHT
 
 
@@ -72,6 +75,38 @@ _DEFAULT_NOTIFY_MAX_ATTEMPTS = 5
 # would pull every owed ticket into memory and pin the lock across all of them.
 # The cap bounds both; the ORDER BY makes the remainder resumable next pass.
 _DEFAULT_NOTIFY_MAX_ROWS_PER_SWEEP = 5000
+
+
+def _parse_ingest_roots(raw: str) -> tuple[Path, ...]:
+    """Parse PATH_INGEST_ROOTS — a colon-separated list of absolute
+    directories — into a deduplicated, sorted tuple.
+
+    Each entry is normalized lexically (`os.path.normpath`) so a trailing
+    slash or an interior `.` does not produce a root that a later
+    `is_relative_to` containment test would miss. Symlinks are NOT resolved:
+    the roots name the mount as the operator wrote it, and the containment
+    check resolves the submitted path the same way (see
+    `ingest_path.resolve_ingest_path`).
+
+    Raises RuntimeError naming the offending entry on an empty list, a
+    relative entry, or `/` itself — `/` as a root admits every absolute
+    path, which is the state the variable exists to end.
+    """
+    entries = [part for part in raw.split(":") if part]
+    if not entries:
+        raise RuntimeError(f"PATH_INGEST_ROOTS must name at least one directory, got {raw!r}")
+    roots: set[Path] = set()
+    for entry in entries:
+        root = Path(os.path.normpath(entry))
+        if not root.is_absolute():
+            raise RuntimeError(f"PATH_INGEST_ROOTS entries must be absolute, got {entry!r}")
+        if root == Path("/"):
+            raise RuntimeError(
+                "PATH_INGEST_ROOTS may not contain '/' — every absolute path would"
+                " be admitted, which is what the variable bounds"
+            )
+        roots.add(root)
+    return tuple(sorted(roots))
 
 
 def _parse_positive_int_env(var: str, default: int) -> int:
@@ -191,6 +226,14 @@ class Settings:
     # required-but-Optional shape as path_scratch_ticket for the same
     # reasons; dispatch._run_and_log raises if None reaches use-time.
     path_scratch_staging: Path | None = None
+    # Roots a work_ticket's action_context may name a host path under
+    # (PATH_INGEST_ROOTS, colon-separated absolute dirs). Every host-path
+    # key in a submitted action_context must resolve under one of these;
+    # `ingest_path.resolve_ingest_path` is the gate. Empty tuple in the
+    # dataclass so tests construct Settings without it; from_env() requires
+    # PATH_INGEST_ROOTS so a production boot without it fails fast rather
+    # than admitting an arbitrary absolute path.
+    path_ingest_roots: tuple[Path, ...] = ()
     # Contact email rendered on the public landing page (`GET /`) as the
     # destination for both the "request access" and "need help" mailto
     # links. Required at boot so the landing page never ships with a
@@ -294,8 +337,12 @@ class Settings:
         scratch = Path(scratch_raw)
         if not scratch.is_absolute():
             raise RuntimeError(f"PATH_SCRATCH must be an absolute path, got {scratch_raw!r}")
-        ws_root = scratch / "ticket"
+        ws_root = scratch / WORK_TICKET_SUBDIR
         upload_root = scratch / "staging"
+
+        # Colon-separated roots a submitter may name a host path under.
+        # Required, for the reason `_parse_ingest_roots` gives when refusing '/'.
+        ingest_roots = _parse_ingest_roots(require_env("PATH_INGEST_ROOTS"))
 
         contact_email = require_env("CONTACT_EMAIL")
         # Minimal shape check — exactly one `@`, non-empty local part,
@@ -366,6 +413,7 @@ class Settings:
             ),
             path_scratch_ticket=ws_root,
             path_scratch_staging=upload_root,
+            path_ingest_roots=ingest_roots,
             contact_email=contact_email,
             build_sha=os.environ.get("BUILD_SHA") or None,
             build_version=os.environ.get("BUILD_VERSION") or None,

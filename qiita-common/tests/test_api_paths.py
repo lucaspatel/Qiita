@@ -21,8 +21,8 @@ def test_compute_upload_staging_path_matches_rust_layout():
     ``qiita-data-plane/src/flight_service.rs``. If you change one,
     change the other in the same commit; both sides will move together
     or not at all."""
-    assert compute_upload_staging_path(Path("/scratch/ephemeral/staging"), 42) == Path(
-        "/scratch/ephemeral/staging/uploads/42/upload.parquet"
+    assert compute_upload_staging_path(Path("/scratch/staging"), 42) == Path(
+        "/scratch/staging/uploads/42/upload.parquet"
     )
 
 
@@ -67,6 +67,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_REFERENCE_EXCLUSION_BY_IDX",
     ),
     (
+        "URL_REFERENCE_PHYLOGENY_MINT_EDGE_ID",
+        "PATH_REFERENCE_PREFIX",
+        "PATH_REFERENCE_PHYLOGENY_MINT_EDGE_ID",
+    ),
+    (
         "URL_REFERENCE_GENOME_MEMBER",
         "PATH_REFERENCE_PREFIX",
         "PATH_REFERENCE_GENOME_MEMBER",
@@ -75,6 +80,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "URL_REFERENCE_GENOME_MAP",
         "PATH_REFERENCE_PREFIX",
         "PATH_REFERENCE_GENOME_MAP",
+    ),
+    (
+        "URL_REFERENCE_GENOME_MAP_PARQUET",
+        "PATH_REFERENCE_PREFIX",
+        "PATH_REFERENCE_GENOME_MAP_PARQUET",
     ),
     # /host-filter-profile
     (
@@ -115,6 +125,12 @@ _TRIPLES: list[tuple[str, str, str]] = [
     # /upload
     ("URL_UPLOAD_BY_IDX", "PATH_UPLOAD_PREFIX", "PATH_UPLOAD_BY_IDX"),
     ("URL_UPLOAD_DONE", "PATH_UPLOAD_PREFIX", "PATH_UPLOAD_DONE"),
+    # /ena-import-batch
+    (
+        "URL_ENA_IMPORT_BATCH_BY_IDX",
+        "PATH_ENA_IMPORT_BATCH_PREFIX",
+        "PATH_ENA_IMPORT_BATCH_BY_IDX",
+    ),
     # /sequence-range
     (
         "URL_SEQUENCE_RANGE_BY_PREP_SAMPLE",
@@ -175,6 +191,18 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "URL_STUDY_LOOKUP_BY_ACCESSION",
         "PATH_STUDY_PREFIX",
         "PATH_STUDY_LOOKUP_BY_ACCESSION",
+    ),
+    ("URL_STUDY_ACCESS", "PATH_STUDY_PREFIX", "PATH_STUDY_ACCESS"),
+    (
+        "URL_STUDY_ACCESS_BY_PRINCIPAL",
+        "PATH_STUDY_PREFIX",
+        "PATH_STUDY_ACCESS_BY_PRINCIPAL",
+    ),
+    # /run-folder
+    (
+        "URL_RUN_FOLDER_INSPECT",
+        "PATH_RUN_FOLDER_PREFIX",
+        "PATH_RUN_FOLDER_INSPECT",
     ),
     # /sequencing-run
     (
@@ -269,6 +297,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_STUDY_PREFIX",
         "PATH_BIOSAMPLE_STUDY_FIELD_BY_STUDY",
     ),
+    (
+        "URL_BIOSAMPLE_STUDY_FIELD_BY_IDX",
+        "PATH_STUDY_PREFIX",
+        "PATH_BIOSAMPLE_STUDY_FIELD_BY_IDX",
+    ),
     ("URL_BIOSAMPLE_BY_IDX", "PATH_BIOSAMPLE_PREFIX", "PATH_BIOSAMPLE_BY_IDX"),
     (
         "URL_BIOSAMPLE_LOOKUP_BY_ACCESSION",
@@ -355,12 +388,43 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_STUDY_PREFIX",
         "PATH_PREP_SAMPLE_STUDY_FIELD_BY_STUDY",
     ),
+    (
+        "URL_PREP_SAMPLE_STUDY_FIELD_BY_IDX",
+        "PATH_STUDY_PREFIX",
+        "PATH_PREP_SAMPLE_STUDY_FIELD_BY_IDX",
+    ),
+    # /biosample-global-field, /prep-sample-global-field
+    (
+        "URL_BIOSAMPLE_GLOBAL_FIELD_LIST",
+        "PATH_BIOSAMPLE_GLOBAL_FIELD_PREFIX",
+        "PATH_BIOSAMPLE_GLOBAL_FIELD_ROOT",
+    ),
+    (
+        "URL_PREP_SAMPLE_GLOBAL_FIELD_LIST",
+        "PATH_PREP_SAMPLE_GLOBAL_FIELD_PREFIX",
+        "PATH_PREP_SAMPLE_GLOBAL_FIELD_ROOT",
+    ),
     # /read-masked
     ("URL_READ_MASKED_DOGET", "PATH_READ_MASKED_PREFIX", "PATH_READ_MASKED_DOGET"),
     # /read (Flight DoGet ticket for a block's reads)
     ("URL_READ_DOGET", "PATH_READ_PREFIX", "PATH_READ_DOGET"),
-    # /assembly (Flight DoGet ticket for one assembly run's contigs)
+    # /assembly (Flight DoGet ticket for one assembly run's contigs, and that
+    # run's contig -> genome map)
     ("URL_ASSEMBLY_DOGET", "PATH_ASSEMBLY_PREFIX", "PATH_ASSEMBLY_DOGET"),
+    ("URL_ASSEMBLY_RUN_DOGET", "PATH_ASSEMBLY_PREFIX", "PATH_ASSEMBLY_RUN_DOGET"),
+    ("URL_ASSEMBLY_GENOME_MAP", "PATH_ASSEMBLY_PREFIX", "PATH_ASSEMBLY_GENOME_MAP"),
+    (
+        "URL_ASSEMBLY_GENOME_MAP_PARQUET",
+        "PATH_ASSEMBLY_PREFIX",
+        "PATH_ASSEMBLY_GENOME_MAP_PARQUET",
+    ),
+    ("URL_ASSEMBLY_MEMBERSHIP", "PATH_ASSEMBLY_PREFIX", "PATH_ASSEMBLY_MEMBERSHIP"),
+    (
+        "URL_ASSEMBLY_MEMBERSHIP_PARQUET",
+        "PATH_ASSEMBLY_PREFIX",
+        "PATH_ASSEMBLY_MEMBERSHIP_PARQUET",
+    ),
+    ("URL_ASSEMBLY_PREP_SAMPLE", "PATH_ASSEMBLY_PREFIX", "PATH_ASSEMBLY_PREP_SAMPLE"),
     # /mask-definition
     (
         "URL_MASK_DEFINITION_BY_IDX",
@@ -381,6 +445,32 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "URL_MASK_DEFINITION_SAMPLE_STATUS",
         "PATH_MASK_DEFINITION_PREFIX",
         "PATH_MASK_DEFINITION_SAMPLE_STATUS",
+    ),
+    (
+        "URL_MASK_DEFINITION_SYNDNA_READ_COUNT",
+        "PATH_MASK_DEFINITION_PREFIX",
+        "PATH_MASK_DEFINITION_SYNDNA_READ_COUNT",
+    ),
+    # /processing (assembly run identity + its lifecycle)
+    (
+        "URL_PROCESSING_BY_IDX",
+        "PATH_PROCESSING_PREFIX",
+        "PATH_PROCESSING_BY_IDX",
+    ),
+    (
+        "URL_PROCESSING_PREP_SAMPLE",
+        "PATH_PROCESSING_PREFIX",
+        "PATH_PROCESSING_PREP_SAMPLE",
+    ),
+    (
+        "URL_PROCESSING_STATUS",
+        "PATH_PROCESSING_PREFIX",
+        "PATH_PROCESSING_STATUS",
+    ),
+    (
+        "URL_PROCESSING_SAMPLE_STATUS",
+        "PATH_PROCESSING_PREFIX",
+        "PATH_PROCESSING_SAMPLE_STATUS",
     ),
     # /alignment-definition
     (

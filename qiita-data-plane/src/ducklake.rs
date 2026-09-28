@@ -216,7 +216,7 @@ pub fn ensure_reference_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 
 /// Create the read + read_mask tables and the read_masked macro in DuckLake.
 ///
-/// These hold per-sample sequencing reads and the downstream masks that record,
+/// These hold per-prep_sample sequencing reads and the downstream masks that record,
 /// per read, whether it survives QC/host filtering and how it should be trimmed.
 /// The full reads are stored ONCE and never physically filtered; masks are
 /// downstream state keyed by the CP-minted `mask_idx` (filtering-config identity).
@@ -232,17 +232,18 @@ pub fn ensure_reference_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 /// read_mask, applies the recorded trims, and excludes every non-`pass` row
 /// (host/human hits + QC failures) via an unconditional `reason = 'pass'`. Human
 /// reads are therefore unreachable by construction, not by a scope check. What
-/// its required (mask, samples) parameters foreclose is on the macro itself,
+/// its required (mask, prep_samples) parameters foreclose is on the macro itself,
 /// below.
 pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
-        "-- Full reads, written ONCE per sequenced sample. Independent of any mask.
+        "-- Full reads, written ONCE per `sequenced_sample`, the 1:1
+        -- processing_kind = 'sequenced' subtype of prep_sample. Independent of
+        -- any mask.
         -- Keyed by prep_sample_idx + the globally-unique sequence_idx (the read
         -- join key). qual1/qual2 are PHRED scores as UTINYINT arrays; NULL for
         -- FASTA (qual1) or single-end (sequence2/qual2). The producer writes the
         -- Parquet sorted by (prep_sample_idx, sequence_idx) — the view's join
-        -- key — for row-group pruning; not the canonical six-column result sort
-        -- order (those identifier columns don't exist on reads).
+        -- key — for row-group pruning.
         CREATE TABLE IF NOT EXISTS qiita_lake.read (
             prep_sample_idx BIGINT NOT NULL,
             sequence_idx BIGINT NOT NULL,
@@ -277,7 +278,7 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
         --
         -- A MACRO, not a view, and the parameters are the point. DuckDB derives a
         -- transitive predicate across a join equality for `col = const` but NOT for
-        -- `col IN (list)`, so a view can only ever receive a multi-sample scope on
+        -- `col IN (list)`, so a view can only ever receive a multi-prep_sample scope on
         -- ONE side of this join: the `read` scan got no filter at all, DuckLake
         -- pruned nothing, and every file in the lake was read. Taking the scope as
         -- a parameter puts it on BOTH inputs explicitly instead of hoping the
@@ -297,9 +298,9 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
         -- to a range and DOES mirror — any reproducer must use a SPARSE list.
         --
         -- Measured on DuckDB 1.5.4 against a local DuckLake of 1,000,000 `read`
-        -- rows over 200 samples, one file per sample (the layout fastq_to_parquet
+        -- rows over 200 prep_samples, one file per prep_sample (the layout fastq_to_parquet
         -- writes), 10% of rows non-'pass'. Query is a realistic block — one partial
-        -- head sample, 18 complete, one partial tail — selecting 84,600 rows.
+        -- head prep_sample, 18 complete, one partial tail — selecting 84,600 rows.
         -- Figures are rows the scans actually produced (EXPLAIN ANALYZE):
         --
         --     view    948,999 read +  84,600 read_mask = 1,033,599
@@ -307,24 +308,24 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
         --     floor    84,600 read +  84,600 read_mask =   169,200
         --
         -- The macro's `read` figure is 84,600/0.9 to the row, i.e. its entire
-        -- residual is the non-'pass' rate and the two partial end samples cost
+        -- residual is the non-'pass' rate and the two partial end prep_samples cost
         -- nothing. In production this shape fully scanned a ~20.7-billion-row
-        -- `read`; a single-sample equality scoped the same query to 5,356 rows in
+        -- `read`; a single-prep_sample equality scoped the same query to 5,356 rows in
         -- 0.147 s — which is why this went unnoticed. A one-element IN is rewritten
-        -- to `=`, so single-sample blocks (every long-read tile) were always fine.
+        -- to `=`, so single-prep_sample blocks (every long-read tile) were always fine.
         --
         -- Two rejected alternatives, both measured, so they are not re-proposed:
         -- passing the block's sequence_idx range as further parameters is identical
-        -- to the row (once the sample scope prunes to the right per-sample files the
-        -- block's global range spans them anyway), and pushing per-member
-        -- (sample, range) pairs down as an EXISTS is far WORSE than the view —
+        -- to the row (once the prep_sample scope prunes to the right per-prep_sample
+        -- files the block's global range spans them anyway), and pushing per-member
+        -- (prep_sample, range) pairs down as an EXISTS is far WORSE than the view —
         -- 1,900,000 rows, because it defeats file pruning entirely. Hence ONE macro,
         -- with `read_masked_block` reusing it and leaving its member terms an outer
         -- filter.
         --
         -- Required parameters also make an unscoped fleet-wide masked read
         -- UNREPRESENTABLE rather than merely refused — there is no argument list
-        -- that means `every sample`, so the macro has no whole-table form to
+        -- that means `every prep_sample`, so the macro has no whole-table form to
         -- construct. THIS IS THE ONE SITE THAT ENFORCES THAT, and every other
         -- comment on the subject points here. The control plane's mandatory-filter
         -- invariant (routes/read_masked.py) stays as defence in depth but is no
@@ -398,7 +399,7 @@ pub fn ensure_read_tables(conn: &Connection) -> Result<(), Box<dyn std::error::E
 /// consumer.
 ///
 /// One row per emitted alignment: the `align_sharded` native job aligns a block
-/// of a sample's HOST-DEPLETED reads against a sharded reference and register-files
+/// of a prep_sample's HOST-DEPLETED reads against a sharded reference and register-files
 /// lands its `alignment.parquet` here. The table is keyed by the CP-minted
 /// `alignment_idx` (the align config's params-hash identity: reference, aligner,
 /// mask, and shard-set), NOT by the deferred processing_idx / processed_prep_sample
@@ -506,10 +507,17 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
         -- read's fragments are filtered out before they are persisted; the pooled
         -- QUALIFY in its phase 2 runs on the paired-end arm alone.
         --
-        -- Nothing writes the table yet. `register_files` loads it from a staging
-        -- `alignment_origin_spanning.parquet` — the control plane derives the
-        -- table name from the file stem — and no job under
-        -- `qiita_compute_orchestrator.jobs` emits that file.
+        -- The producer is `qiita_compute_orchestrator.jobs.align_denovo`, which
+        -- aligns a prep_sample's masked reads against its OWN assembled contigs (where a
+        -- circular contig is a real, assembler-called thing rather than a claim about
+        -- a reference). `register_files` loads its staging
+        -- `alignment_origin_spanning.parquet` — the control plane derives the table
+        -- name from the file stem. That job records a group only where the
+        -- coordinates show a single origin crossing: one fragment reaching the contig
+        -- end and one starting at its beginning, and no fragment spanning it end to
+        -- end. A read the gate cleared but that split across two loci, or that lapped
+        -- the contig, keeps its `alignment` rows and gets no row here — for those the
+        -- pair below is not a covering interval.
         --
         -- CONTRACT for such a producer's rows: one row per (read, feature), and a
         -- consumer applying a query-coverage predicate to `alignment` MUST LEFT
@@ -521,6 +529,14 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
         -- subjects, scored separately; the same reason
         -- `qiita_common.feature_table.PAIRED_PLACEMENT_PARTITION` carries it.
         -- Dropping it pools a fragment onto another feature's score.
+        --
+        -- That key does NOT separate a secondary from the read's primary placement
+        -- on the same feature, and the producer now collects secondaries. A
+        -- consumer joining on it would judge such a secondary on the primary's
+        -- `pooled_coverage`, which was never computed over it — the macro excludes
+        -- secondary records. Exclude them (`alignment_is_secondary(flags)`) before
+        -- the join: they are alternative placements of the whole read, scored on
+        -- their own CIGAR, and no row here describes one.
         --
         -- Superseded by delete-then-register, like `alignment` itself, not by
         -- `flight_service::REPLACE_KEY_TABLES`: a replace-by-key delete reads the
@@ -549,7 +565,7 @@ pub fn ensure_alignment_tables(conn: &Connection) -> Result<(), Box<dyn std::err
             -- needs the subject's length, which is not duplicated here: join
             -- `sequence_length_bp` on feature_idx in whichever table holds this
             -- producer's subjects — `reference_sequences` when they are reference
-            -- features, `assembled_sequence` when they are a sample's own contigs.
+            -- features, `assembled_sequence` when they are a prep_sample's own contigs.
             feature_start   BIGINT,
             feature_stop    BIGINT,
             -- Strand of the read relative to the contig — miint's
@@ -642,8 +658,9 @@ pub fn ensure_exclusion_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 /// `assembly_membership` records which features a prep_sample's assembly contains
 /// and in which bin — the DuckLake copy of `qiita.assembly_membership`, for bulk
 /// joins against the sequences.
-/// `bin_quality` is per-MAG CheckM, joined to its contigs via assembly_membership
-/// on (prep_sample_idx, kind, bin_id).
+/// `bin_quality` is per-subject CheckM — one row per refined bin, per circular
+/// contig, and per unbinned contig above the residue length cut. The DDL below
+/// carries its join key and column provenance.
 ///
 /// Same DuckLake constraint story as the read/reference tables: no PK/UNIQUE/FK
 /// (the CP mints feature_idx/dedups on sequence_hash, the orchestrator verifies
@@ -653,13 +670,13 @@ pub fn ensure_exclusion_tables(conn: &Connection) -> Result<(), Box<dyn std::err
 /// `bin_quality` on `(prep_sample_idx, processing_idx)`. The keys and what
 /// admits each table are in `flight_service::REPLACE_KEY_TABLES`.
 ///
-/// `assembled_sequence` / `assembled_sequence_chunks` are Flight-readable (they
-/// are in `flight_service::ALLOWED_TABLES`, scoped to one `(prep_sample_idx,
-/// processing_idx)` run). `assembly_membership` and `bin_quality` are not
-/// readable: they are register_files write targets, SQL-queryable in the catalog,
-/// off the external read-back path. `assembly_membership` is additionally what
-/// resolves that run scope — read by `flight_service::build_assembly_run_query`
-/// as a semi join, never streamed.
+/// `assembled_sequence` / `assembled_sequence_chunks` are Flight-readable, and so
+/// is `bin_quality` — all three are in `flight_service::ALLOWED_TABLES`, scoped to
+/// one `(prep_sample_idx, processing_idx)` run. `assembly_membership` is not: it is
+/// a register_files write target, SQL-queryable in the catalog, off the external
+/// read-back path, and additionally what resolves the two sequence surfaces' run
+/// scope — read by `flight_service::build_assembly_run_query` as a semi join,
+/// never streamed.
 pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
         "-- One row per UNIQUE contig (content-hash deduped), keyed by the minted
@@ -683,18 +700,34 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
 
         -- Which features a (prep_sample, processing) assembly run contains, and in
         -- which bin. processing_idx disambiguates runs (bin_id reused across
-        -- samples AND runs); the `kind` value set is enumerated in
+        -- prep_samples AND runs); the `kind` value set is enumerated in
         -- qiita_common.assembly_constants. The DuckLake copy of
         -- qiita.assembly_membership for bulk joins with the sequences.
+        --
+        -- The four trailing columns are the assembler's own per-contig report,
+        -- nullable and NULL for every row written before they existed. Their
+        -- meaning is stated once, as COMMENT ON COLUMN on the Postgres twin
+        -- qiita.assembly_membership; do not restate it here. The assembler
+        -- itself is NOT among them -- it is captured in qiita.processing via
+        -- processing_idx, as bin_quality's comment below says of the same field.
         CREATE TABLE IF NOT EXISTS qiita_lake.assembly_membership (
             prep_sample_idx BIGINT NOT NULL,
             processing_idx BIGINT NOT NULL,
             kind VARCHAR NOT NULL,
             bin_id VARCHAR NOT NULL,
-            feature_idx BIGINT NOT NULL
+            feature_idx BIGINT NOT NULL,
+            raw_name VARCHAR,
+            circularity VARCHAR,
+            depth DOUBLE,
+            mult DOUBLE
         );
 
-        -- Per-MAG CheckM quality. Joins to its contigs via assembly_membership on
+        -- Per-subject CheckM quality: one row per refined bin (kind MAG), per
+        -- circular contig (kind LCG), and per unbinned contig above the length cut
+        -- (kind UNBINNED), from the three runs checkm.sh scores separately. The
+        -- UNBINNED rows are a SUBSET of the UNBINNED memberships — a contig under
+        -- the cut has a membership row and no row here, so the two join LEFT.
+        -- Joins to its contigs via assembly_membership on
         -- (prep_sample_idx, processing_idx, kind, bin_id). completeness /
         -- contamination / strain_heterogeneity + marker_lineage from `checkm
         -- lineage_wf --tab_table`; genome_size / n_contigs from `checkm qa -o 2`;
@@ -714,6 +747,24 @@ pub fn ensure_assembly_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
             das_tool_score DOUBLE,
             source_binner VARCHAR
         );",
+    )?;
+    // `CREATE TABLE IF NOT EXISTS` leaves a lake that already holds
+    // assembly_membership at its earlier five columns untouched, and
+    // `ducklake_add_data_files` refuses a Parquet carrying a column the target
+    // lacks ("Column ... exists in file ... but was not found in table"), so
+    // without this every assembly registration into an existing lake fails.
+    // Evolving here rather than in a one-shot operator step keeps the boot path
+    // the only place the lake schema is defined. The column list is stated twice
+    // inside this function -- once in the CREATE for a fresh lake, once here for
+    // an existing one -- and a column added to only one of them leaves a deployed
+    // lake narrow, which surfaces at the next registration rather than at boot.
+    // ensure_assembly_tables_is_idempotent asserts the full nine-column shape, so
+    // it fails on the CREATE half; the widening test covers the ALTER half.
+    conn.execute_batch(
+        "ALTER TABLE qiita_lake.assembly_membership ADD COLUMN IF NOT EXISTS raw_name VARCHAR;
+         ALTER TABLE qiita_lake.assembly_membership ADD COLUMN IF NOT EXISTS circularity VARCHAR;
+         ALTER TABLE qiita_lake.assembly_membership ADD COLUMN IF NOT EXISTS depth DOUBLE;
+         ALTER TABLE qiita_lake.assembly_membership ADD COLUMN IF NOT EXISTS mult DOUBLE;",
     )?;
     // Pin DuckLake's own rewrites of the chunk table to the row-group the chunk
     // writer uses (see CHUNK_ROW_GROUP_SIZE).
@@ -1520,6 +1571,72 @@ mod tests {
             let n: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
             assert_eq!(n, 1, "{table} table should exist exactly once");
         }
+
+        // The shape assembly_load's COPY must match for ducklake_add_data_files
+        // to register without a cast, in that COPY's column order.
+        let cols = table_schema(&conn, "assembly_membership");
+        let expected: &[(&str, &str, &str)] = &[
+            ("prep_sample_idx", "BIGINT", "NO"),
+            ("processing_idx", "BIGINT", "NO"),
+            ("kind", "VARCHAR", "NO"),
+            ("bin_id", "VARCHAR", "NO"),
+            ("feature_idx", "BIGINT", "NO"),
+            ("raw_name", "VARCHAR", "YES"),
+            ("circularity", "VARCHAR", "YES"),
+            ("depth", "DOUBLE", "YES"),
+            ("mult", "DOUBLE", "YES"),
+        ];
+        let got: Vec<(&str, &str, &str)> = cols
+            .iter()
+            .map(|(n, t, null)| (n.as_str(), t.as_str(), null.as_str()))
+            .collect();
+        assert_eq!(got, expected, "assembly_membership schema/order drift");
+    }
+
+    /// A lake created before the attribute columns existed gains them on the next
+    /// boot: `CREATE TABLE IF NOT EXISTS` alone would leave it at five columns and
+    /// `ducklake_add_data_files` would then reject every membership Parquet.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn ensure_assembly_tables_widens_a_preexisting_membership_table() {
+        let conn = setup_conn();
+        conn.execute_batch("DROP TABLE IF EXISTS qiita_lake.assembly_membership;")
+            .unwrap();
+        // The pre-attribute shape, as a lake deployed before this change holds it.
+        conn.execute_batch(
+            "CREATE TABLE qiita_lake.assembly_membership (
+                prep_sample_idx BIGINT NOT NULL,
+                processing_idx BIGINT NOT NULL,
+                kind VARCHAR NOT NULL,
+                bin_id VARCHAR NOT NULL,
+                feature_idx BIGINT NOT NULL
+            );",
+        )
+        .unwrap();
+        assert_eq!(table_schema(&conn, "assembly_membership").len(), 5);
+
+        ensure_assembly_tables(&conn).expect("ensure_assembly_tables over a narrow table");
+
+        let names: Vec<String> = table_schema(&conn, "assembly_membership")
+            .into_iter()
+            .map(|(n, _, _)| n)
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "prep_sample_idx",
+                "processing_idx",
+                "kind",
+                "bin_id",
+                "feature_idx",
+                "raw_name",
+                "circularity",
+                "depth",
+                "mult",
+            ],
+            "the four attribute columns must be appended to an existing table"
+        );
     }
 
     /// read_masked applies the recorded trims (substr on the sequence, list

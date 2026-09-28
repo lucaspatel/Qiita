@@ -9,6 +9,7 @@ from typing import Any
 
 import asyncpg
 from qiita_common.actions import (
+    ALIGNMENT_IDX_BINDING,
     PROCESSING_IDX_BINDING,
     WorkflowAction,
     WorkflowStep,
@@ -26,6 +27,7 @@ from qiita_common.models import (
     StepProgressState,
     StepStatus,
     StepStatusWire,
+    WorkTicketFailureStage,
 )
 
 from .. import step_progress
@@ -35,6 +37,7 @@ from ..actions.library import (
     MINT_FEATURES_OUTPUT_BASENAME,
 )
 from ..fanout_dispatch import DEFAULT_FANOUT_MAX_INFLIGHT
+from ..repositories.assembly import AssemblySampleInvalidated
 from ..repositories.reference_membership import count_reference_shards
 from ..shard_orchestration import (
     BUILD_SHARD_INDEX_ACTION_ID,
@@ -43,8 +46,9 @@ from ..shard_orchestration import (
     expected_shard_index_types,
     plan_and_submit_shards,
 )
+from ..workspace import step_attempt_dir, step_logs_dir, step_output_dir
 from ._dispatch import _best_effort_record_failed, _result_with_infra_retry
-from ._mask import ALIGNMENT_IDX_BINDING, MASK_IDX_BINDING
+from ._mask import MASK_IDX_BINDING
 from ._read_ingest import (
     ROUTER_PENDING_BINDING,
     SHARD_MAPPING_BINDING,
@@ -168,7 +172,7 @@ async def _reconstruct_completed_outputs(
     recovery is a SLURM-backend concern (local steps are synchronous and don't
     survive a restart mid-flight), so this returns its outputs empty — a
     downstream consumer that needs a missing binding fails loudly via KeyError."""
-    attempt_workspace = workspace / entry.name / f"attempt-{completed.attempt}"
+    attempt_workspace = step_attempt_dir(workspace, entry.name, completed.attempt)
     if isinstance(entry, WorkflowAction):
         if entry.name == LibraryPrimitive.PLAN_SHARDS:
             return await _reconstruct_plan_shards_outputs(pool, scope_target, attempt_workspace)
@@ -180,8 +184,8 @@ async def _reconstruct_completed_outputs(
         step_name=entry.name,
         slurm_job_id=completed.slurm_job_id,
         job_name=completed.job_name,
-        output_path=str(attempt_workspace / "output"),
-        logs_path=str(attempt_workspace / "logs"),
+        output_path=str(step_output_dir(attempt_workspace)),
+        logs_path=str(step_logs_dir(attempt_workspace)),
     )
     status = StepStatusWire(status=StepStatus.COMPLETED, raw_state="RECOVERED")
     raw_outputs = await _result_with_infra_retry(
@@ -325,6 +329,40 @@ async def _dispatch_action(
     return outputs
 
 
+async def _ticket_alignment_idx(
+    pool: asyncpg.Pool, work_ticket_idx: int, *, entry: str, scope_target: dict[str, Any]
+) -> int:
+    """The alignment identity this ticket is scoped to, refusing a non-prep_sample
+    scope and refusing NULL.
+
+    The scope check lives here rather than at each arm because both arms scope on the
+    same thing and must refuse identically; the block-scoped path never reaches here.
+
+    Both per-sample alignment arms read the COLUMN rather than `action_context` (which
+    is whatever the submitter sent) and both must refuse the same way, because they
+    scope on the same thing: the delete clears an identity's rows, the register writes
+    under the identity a step's `params:` stamped, and the gate records that the two
+    agree. NULL means neither writer ran — the runner's de novo resolver
+    (`_alignment._persist_alignment_idx`) or `align_planner` — or a
+    `DELETE /alignment-definition/{idx}` detached it mid-flight (ON DELETE SET NULL).
+    """
+    if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
+        raise RuntimeError(
+            f"{entry} requires a prep_sample-scoped ticket; got {scope_target['kind']!r}"
+        )
+    alignment_idx = await pool.fetchval(
+        "SELECT alignment_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    if alignment_idx is None:
+        raise RuntimeError(
+            f"{entry} requires work_ticket {work_ticket_idx} to carry an alignment_idx; "
+            "the column is NULL (nothing set it, or the alignment definition was "
+            "deleted mid-flight)"
+        )
+    return alignment_idx
+
+
 async def _run_action_primitive(
     pool: asyncpg.Pool,
     entry: WorkflowAction,
@@ -360,6 +398,7 @@ async def _run_action_primitive(
             manifest_path,
             workspace,
             genome_map_path=Path(genome_map) if genome_map else None,
+            scope=f"work_ticket {work_ticket_idx}",
         )
         # YAML declares one output (typically "feature_map"); bind it.
         return {entry.outputs[0]: feature_map_path}
@@ -405,14 +444,15 @@ async def _run_action_primitive(
         # assembly-run contigs to qiita.assembly_membership, tagged by
         # (kind, bin_id). Inputs are resolved by their fixed binding names — not
         # positionally — so a YAML reorder can't silently swap them. bin_map +
-        # manifest come from assembly_hash; feature_map from mint-features.
+        # manifest come from assembly_hash; feature_map from mint-features;
+        # genomes_dir from the assemble step, for its per-contig attribute sidecar.
         # prep_sample_idx from the scope target; processing_idx from `bound` (the
         # runner minted it before the step loop because assembly_load threads it
         # via params — mirrors how the reference dispatch reads reference_idx).
-        if set(entry.inputs) != {"bin_map", "manifest", "feature_map"}:
+        if set(entry.inputs) != {"bin_map", "manifest", "feature_map", "genomes_dir"}:
             raise RuntimeError(
                 "write-assembly-membership expects inputs "
-                f"[bin_map, manifest, feature_map]; got {entry.inputs!r}"
+                f"[bin_map, manifest, feature_map, genomes_dir]; got {entry.inputs!r}"
             )
         await LIBRARY[LibraryPrimitive.WRITE_ASSEMBLY_MEMBERSHIP](
             pool,
@@ -421,6 +461,7 @@ async def _run_action_primitive(
             Path(bound["bin_map"]),
             Path(bound["manifest"]),
             Path(bound["feature_map"]),
+            Path(bound["genomes_dir"]),
         )
         return {}
 
@@ -595,6 +636,27 @@ async def _run_action_primitive(
         )
         return {}
 
+    if entry.name == LibraryPrimitive.PERSIST_SYNDNA_READ_COUNT:
+        # Per-insert SynDNA read counts from the `syndna` step's alignment output.
+        # mask_idx from the ticket (runner-bound for the prep_sample branch), the
+        # sample from the scope target.
+        if entry.inputs != ["alignment"]:
+            raise RuntimeError(
+                f"persist-syndna-read-count expects inputs [alignment]; got {entry.inputs!r}"
+            )
+        if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
+            raise RuntimeError(
+                "persist-syndna-read-count requires a prep_sample-scoped ticket; "
+                f"got {scope_target['kind']!r}"
+            )
+        await LIBRARY[LibraryPrimitive.PERSIST_SYNDNA_READ_COUNT](
+            pool,
+            mask_idx=bound[MASK_IDX_BINDING],
+            prep_sample_idx=scope_target["prep_sample_idx"],
+            alignment_path=Path(bound["alignment"]),
+        )
+        return {}
+
     if entry.name == LibraryPrimitive.FINALIZE_MASK_SAMPLE:
         # Terminal step of the per-sample read-mask workflow: record this sample's
         # masking as completed in the mask_sample gate (the per-sample twin of
@@ -637,9 +699,48 @@ async def _run_action_primitive(
         # write-assembly-membership above reads it: the pre-loop mint has already
         # overwritten any submitter-supplied `processing_idx` by the time any entry
         # runs, and the gate keys on the value that stamped the rows it gates.
-        await LIBRARY[LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE](
+        try:
+            await LIBRARY[LibraryPrimitive.FINALIZE_ASSEMBLY_SAMPLE](
+                pool,
+                processing_idx=bound[PROCESSING_IDX_BINDING],
+                prep_sample_idx=scope_target["prep_sample_idx"],
+            )
+        except AssemblySampleInvalidated as exc:
+            # A person withdrew this (run, sample) while the run was in flight, and
+            # the gate write refuses rather than re-completing it. Typed here
+            # because the alternative is `run_workflow`'s catch-all, which records
+            # UNKNOWN_PERMANENT — a classification that tells the operator to look
+            # for a bug when what happened is a decision someone made. Permanent:
+            # a redrive re-resolves the same identity and refuses identically until
+            # the pair is restored.
+            raise BackendFailure(
+                kind=FailureKind.BAD_INPUT,
+                stage=WorkTicketFailureStage.STEP_RUN,
+                step_name=entry.name,
+                reason=str(exc),
+            ) from exc
+        return {}
+
+    if entry.name == LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE:
+        # Terminal step of a prep_sample-scoped alignment workflow (align-denovo):
+        # flip this sample's alignment_sample gate to 'completed'. No file inputs:
+        # prep_sample_idx from the scope target, alignment_idx from the identity the
+        # runner minted before the loop.
+        #
+        # `alignment_idx` comes from the TICKET column, not from `bound`, for the
+        # reason delete-alignment-sample below reads it there: the delete and the
+        # register scope on the same identity, and the gate must record the one they
+        # used. The pre-loop resolver writes the column and binds the same value, so
+        # through `run_workflow` the two agree by construction.
+        alignment_idx = await _ticket_alignment_idx(
             pool,
-            processing_idx=bound[PROCESSING_IDX_BINDING],
+            work_ticket_idx,
+            entry=LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE,
+            scope_target=scope_target,
+        )
+        await LIBRARY[LibraryPrimitive.FINALIZE_ALIGNMENT_SAMPLE](
+            pool,
+            alignment_idx=alignment_idx,
             prep_sample_idx=scope_target["prep_sample_idx"],
         )
         return {}
@@ -735,11 +836,6 @@ async def _run_action_primitive(
         # Idempotent sample replace (align): runs BEFORE register-files. What the
         # delete selects is on the data plane's `delete_alignment_sample`.
         #
-        # `alignment_idx` is read from the ticket column, not from `action_context`
-        # (`bound`), which is whatever the submitter sent. NULL means no planner set
-        # the column, or a `DELETE /alignment-definition/{idx}` detached it
-        # mid-flight (ON DELETE SET NULL).
-        #
         # The context value is cross-checked against the column rather than ignored,
         # because the delete and the WRITE scope on different things: a step's
         # `params:` binds `alignment_idx` from `action_context` (align's
@@ -748,26 +844,16 @@ async def _run_action_primitive(
         # register that follows writes under the other, so a re-run appends — the
         # double-count this primitive exists to prevent.
         #
-        # No ticket satisfies both the prep_sample scope check below and a non-NULL
-        # column today: `align_planner.plan_and_submit_alignments` is the column's
-        # only writer and it inserts block-scoped tickets. Wiring this primitive into
-        # a prep_sample workflow means writing the column from that workflow's runner
-        # path first, as `_persist_mask_idx` does for `mask_idx`.
-        if scope_target["kind"] != ScopeTargetKind.PREP_SAMPLE.value:
-            raise RuntimeError(
-                f"delete-alignment-sample requires a prep_sample-scoped ticket; got "
-                f"{scope_target['kind']!r}"
-            )
-        alignment_idx = await pool.fetchval(
-            "SELECT alignment_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+        # The prep_sample writer is the runner's de novo resolver
+        # (`_alignment._persist_alignment_idx`), which writes the column before the
+        # step loop; `align_planner.plan_and_submit_alignments` is the block-scoped
+        # one. So a NULL here means neither ran for this ticket.
+        alignment_idx = await _ticket_alignment_idx(
+            pool,
             work_ticket_idx,
+            entry=LibraryPrimitive.DELETE_ALIGNMENT_SAMPLE,
+            scope_target=scope_target,
         )
-        if alignment_idx is None:
-            raise RuntimeError(
-                f"delete-alignment-sample requires work_ticket {work_ticket_idx} to carry "
-                f"an alignment_idx; the column is NULL (no planner set it, or the "
-                f"alignment definition was deleted mid-flight)"
-            )
         context_alignment_idx = bound.get(ALIGNMENT_IDX_BINDING)
         if context_alignment_idx is not None and context_alignment_idx != alignment_idx:
             raise RuntimeError(

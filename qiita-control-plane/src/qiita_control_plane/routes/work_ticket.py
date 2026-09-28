@@ -46,12 +46,17 @@ from __future__ import annotations
 
 import json
 import logging
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from qiita_common.actions import FASTQ_PATH_CONTEXT_KEYS, Audience
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, status
+from qiita_common.actions import (
+    FASTQ_PATH_CONTEXT_KEYS,
+    PATH_SUFFIX,
+    UPLOAD_IDX_SUFFIX,
+    Audience,
+)
 from qiita_common.api_paths import (
     PATH_WORK_TICKET_BY_IDX,
     PATH_WORK_TICKET_CANCEL,
@@ -67,6 +72,7 @@ from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.log_tail import read_text_tail
 from qiita_common.models import (
     NON_TERMINAL_WORK_TICKET_STATES,
+    REDRIVABLE_WORK_TICKET_STATES,
     FanoutCohortKind,
     FanoutListResponse,
     FanoutOverrideRequest,
@@ -86,6 +92,7 @@ from qiita_common.models import (
     WorkTicketStepLogs,
     WorkTicketSummary,
 )
+from qiita_common.work_ticket_constants import FORCE_RESUBMIT_EXPLANATION
 
 from ..actions.context_validator import validate_context
 from ..actions.reference import (
@@ -95,6 +102,7 @@ from ..actions.reference import (
 )
 from ..auth.guards import require_caller_has_admin_on_all_studies, require_scope
 from ..auth.principal import Anonymous, HumanUser, Principal, ServiceAccount, get_current_principal
+from ..config import Settings
 from ..deps import get_db_pool
 from ..dispatch import schedule_dispatch
 from ..fanout_dispatch import (
@@ -107,9 +115,11 @@ from ..fanout_dispatch import (
     set_override,
     top_up_dispatch,
 )
+from ..ingest_path import IngestPathError, named_host_paths, resolve_ingest_path
 from ..repositories.prep_sample import fetch_active_study_idxs_for_prep_sample
 from ..step_progress import load_step_progress
 from ..work_ticket_cancel import WorkTicketNotFound, cancel_work_ticket
+from ..workspace import step_attempt_dir, step_logs_dir, ticket_workspace
 from ._helpers import cap_rows
 
 _log = logging.getLogger(__name__)
@@ -120,8 +130,8 @@ _STEP_LOGS_DEFAULT_TAIL_LINES = 200
 _STEP_LOGS_MAX_TAIL_LINES = 5000
 _STEP_LOGS_MAX_TAIL_BYTES = 256 * 1024
 
-# /run applies to a PENDING ticket that was never dispatched and the two redrivable
-# terminal states (FAILED, CANCELLED). Everything else is refused. The
+# /run applies to a PENDING ticket that was never dispatched and the redrivable
+# terminal states (REDRIVABLE_WORK_TICKET_STATES). Everything else is refused. The
 # not-applicable set is the COMPLEMENT of the applicable set, so a new
 # WorkTicketState defaults to REFUSED — the safe direction; listing the refused
 # states positively would silently make a new state runnable.
@@ -132,16 +142,9 @@ _STEP_LOGS_MAX_TAIL_BYTES = 256 * 1024
 # live with a real slurm_job_id. The redrive's step-row cleanup keys off exactly that
 # difference — see the DELETE in the redrive branch. PENDING just (re)dispatches a
 # lost create-time task.
-_RUN_APPLICABLE_STATES = frozenset(
-    {
-        WorkTicketState.PENDING.value,
-        WorkTicketState.FAILED.value,
-        WorkTicketState.CANCELLED.value,
-    }
+_RUN_APPLICABLE_STATES = frozenset({WorkTicketState.PENDING.value}) | (
+    REDRIVABLE_WORK_TICKET_STATES
 )
-# The two terminal states /run redrives by resetting to PENDING (vs. PENDING, which
-# just dispatches).
-_RUN_REDRIVE_STATES = frozenset({WorkTicketState.FAILED.value, WorkTicketState.CANCELLED.value})
 _RUN_NOT_APPLICABLE_STATES = tuple(
     state.value for state in WorkTicketState if state.value not in _RUN_APPLICABLE_STATES
 )
@@ -311,8 +314,9 @@ async def _check_disallow_without_delete(
     uniqueness — a naive re-run double-registers them. There is no
     result-deletion gate for a pool (the result is lake rows, not a single
     minted row), so this check itself refuses a re-submit over a COMPLETED pool
-    ticket unless `force=True` (gated to wet_lab_admin+ at the route). The
-    intended non-force recovery is `delete-sequenced-pool` then resubmit.
+    ticket unless `force=True` (gated to wet_lab_admin+ at the route). What
+    forcing costs, and the recovery that avoids it, are stated once in
+    `FORCE_RESUBMIT_EXPLANATION`, which the 409 below carries.
 
     Best-effort fast path. The atomic gate is the unique partial indexes
     `work_ticket_one_in_flight_per_{reference,study_prep,prep_sample,sequenced_pool}`;
@@ -426,10 +430,10 @@ async def _check_disallow_without_delete(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={
                     "reason": (
-                        "a COMPLETED ticket already exists for this (sequenced_pool, "
-                        "action); re-running re-registers the pool's reads into the "
-                        "lake. Delete the pool (delete-sequenced-pool) and resubmit, "
-                        "or pass force=true (wet_lab_admin+) to intentionally re-run."
+                        "a ticket for this pool and action has already COMPLETED, so "
+                        "the pool's reads are already stored. Pass force=true "
+                        "(`qiita submit-bcl-convert --force`) to submit anyway. "
+                        f"{FORCE_RESUBMIT_EXPLANATION}"
                     ),
                     "blocking_work_ticket_idx": completed,
                 },
@@ -485,8 +489,122 @@ def _basename_carries_prefix(basename: str, prefix: str) -> bool:
     return basename[len(prefix) : len(prefix) + 1] in ("_", ".")
 
 
+def _check_ingest_paths(
+    principal: Principal,
+    *,
+    context_schema: dict[str, Any],
+    action_context: dict[str, Any],
+    roots: tuple[Path, ...],
+) -> None:
+    """Gate every host path the submitted `action_context` names.
+
+    Two rules, in order:
+
+    1. Naming a host path at all is wet_lab_admin-or-higher. A path is
+       re-opened later on a compute node under the job account, so a submitter
+       who can name one reaches every file that account can read — a wider
+       reach than the action's own audience implies. A `user` submits the file
+       as an upload instead and names the `{prefix}_upload_idx` handle, which
+       the runner resolves to a path the submitter never chose.
+    2. The path resolves under one of `PATH_INGEST_ROOTS` and, where the
+       control plane can tell, exists (`ingest_path.resolve_ingest_path`).
+
+    Which keys are host paths comes from the action's own `context_schema` and
+    from the `*_path` / `*_dir` naming convention (`named_host_paths`), so an
+    action that adds one is covered without a change here.
+
+    Every offending path is reported in one 422 body, so a submission naming
+    two bad paths takes one round-trip to fix rather than two.
+    """
+    named = named_host_paths(context_schema, action_context)
+    if not named:
+        return
+
+    if not principal.has_role_at_least(SystemRole.WET_LAB_ADMIN):
+        upload_keys = sorted(
+            key.removesuffix(PATH_SUFFIX) + UPLOAD_IDX_SUFFIX
+            for key in named
+            if key.endswith(PATH_SUFFIX)
+        )
+        detail: dict[str, Any] = {
+            "reason": (
+                "naming a host path in action_context requires wet_lab_admin or system_admin"
+            ),
+            "context_keys": sorted(named),
+        }
+        if upload_keys:
+            detail["upload_instead"] = upload_keys
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
+
+    errors = []
+    for key, raw in sorted(named.items()):
+        try:
+            resolve_ingest_path(raw, roots=roots)
+        except IngestPathError as exc:
+            errors.append({"context_key": key, "path": exc.path, "reason": exc.reason})
+    if errors:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={
+                "reason": "action_context names a host path the compute cluster cannot use",
+                "errors": errors,
+                "ingest_roots": [str(root) for root in roots],
+            },
+        )
+
+
+async def _fastq_upload_filenames(
+    pool: asyncpg.Pool, *, action_context: dict[str, Any], principal_idx: int
+) -> dict[str, str]:
+    """`{context_key: source_filename}` for every fastq key submitted as an
+    upload handle rather than a path.
+
+    An upload-fed submission carries `fastq_upload_idx` instead of
+    `fastq_path`, and the staging path the runner resolves it to
+    (`uploads/{idx}/upload.parquet`) is not a name the submitter chose — so
+    the filename-prefix rule has to read what the client said it sent
+    (`upload.source_filename`). One batched fetch, keyed back to the context
+    key so the 422 names the field the submitter wrote.
+
+    Scoped to uploads the caller created. The runner refuses another
+    principal's upload anyway (`runner._upload`), but the 422 this feeds quotes
+    the filename back, and a filename here carries a `sequenced_pool_item_id` —
+    so an unscoped lookup would answer "what is upload N called" for any N to
+    anyone holding a prep_sample of their own.
+
+    An upload with no `source_filename` (it predates the column, or the client
+    did not send one) is omitted: the rule is vacuous without a name, the same
+    way it is vacuous without a `sequenced_pool_item_id`.
+    """
+    by_idx: dict[int, str] = {}
+    for key in FASTQ_PATH_CONTEXT_KEYS:
+        # Report against the key the submitter actually wrote
+        # (`fastq_upload_idx`), not its resolved `fastq_path` twin.
+        upload_key = key.removesuffix(PATH_SUFFIX) + UPLOAD_IDX_SUFFIX
+        handle = action_context.get(upload_key)
+        if isinstance(handle, int) and not isinstance(handle, bool) and handle > 0:
+            by_idx[handle] = upload_key
+    if not by_idx:
+        return {}
+    rows = await pool.fetch(
+        "SELECT upload_idx, source_filename FROM qiita.upload"
+        " WHERE upload_idx = ANY($1::bigint[]) AND created_by_idx = $2",
+        list(by_idx),
+        principal_idx,
+    )
+    return {
+        by_idx[row["upload_idx"]]: row["source_filename"]
+        for row in rows
+        if row["source_filename"] is not None
+    }
+
+
 async def _check_fastq_filename_prefix(
-    pool: asyncpg.Pool, *, prep_sample_idx: int, action_context: dict[str, Any]
+    pool: asyncpg.Pool,
+    *,
+    prep_sample_idx: int,
+    action_context: dict[str, Any],
+    principal_idx: int,
 ) -> None:
     """422 when a fastq path in `action_context` has a basename that is
     not the prep_sample's `sequenced_pool_item_id` followed by a `_` or
@@ -499,6 +617,12 @@ async def _check_fastq_filename_prefix(
     minted in two separate calls and nothing else couples them, so the
     check lives here. Keyed on the context keys (FASTQ_PATH_CONTEXT_KEYS),
     not the action_id, so the route stays generic over actions.
+
+    Covers both routes a fastq arrives by. A path-fed submission is checked on
+    the basename of the path; an upload-fed one (`fastq_upload_idx`, the route
+    a regular user takes) on the client-claimed `upload.source_filename`, since
+    the staging path the runner resolves the handle to is not a name the
+    submitter chose. See `_fastq_upload_filenames`.
 
     Skipped when the resolved `sequenced_pool_item_id` is NULL. Two
     shapes reach that branch:
@@ -532,7 +656,10 @@ async def _check_fastq_filename_prefix(
         # it is skipped here rather than rejected.
         if isinstance(action_context.get(key), str)
     }
-    if not fastq_paths:
+    fastq_uploads = await _fastq_upload_filenames(
+        pool, action_context=action_context, principal_idx=principal_idx
+    )
+    if not fastq_paths and not fastq_uploads:
         return
     pool_item_id = await pool.fetchval(
         "SELECT sequenced_pool_item_id FROM qiita.sequenced_sample WHERE prep_sample_idx = $1",
@@ -549,6 +676,11 @@ async def _check_fastq_filename_prefix(
         for key, path in sorted(fastq_paths.items())
         if not _basename_carries_prefix(PurePosixPath(path).name, pool_item_id)
     ]
+    mismatched += [
+        {"context_key": key, "source_filename": name, "basename": name}
+        for key, name in sorted(fastq_uploads.items())
+        if not _basename_carries_prefix(name, pool_item_id)
+    ]
     if mismatched:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -563,14 +695,18 @@ async def _check_fastq_filename_prefix(
         )
 
 
-def _require_compute_backend_client(request: Request) -> None:
+def require_compute_backend_client(app: FastAPI) -> None:
     """Guard that 503s if the orchestrator dispatch path is not configured.
     Prevents creating tickets that can never run."""
-    if request.app.state.compute_backend_client is None:
+    if app.state.compute_backend_client is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="compute orchestrator not configured (COMPUTE_ORCHESTRATOR_URL unset)",
         )
+
+
+def _require_compute_backend_client(request: Request) -> None:
+    require_compute_backend_client(request.app)
 
 
 async def _resolve_cancel_filter(pool: asyncpg.Pool, body: WorkTicketCancelRequest) -> list[int]:
@@ -605,18 +741,21 @@ async def _resolve_cancel_filter(pool: asyncpg.Pool, body: WorkTicketCancelReque
 # =============================================================================
 
 
-@router.post(
-    PATH_WORK_TICKET_ROOT,
-    response_model=WorkTicketResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-)
-async def submit_work_ticket(
+async def submit_work_ticket_core(
+    *,
+    app: FastAPI,
+    principal: Principal,
     body: WorkTicketCreateRequest,
-    request: Request,
-    pool: asyncpg.Pool = Depends(get_db_pool),
-    principal: Principal = Depends(get_current_principal),
-    _: None = Depends(_require_compute_backend_client),
 ) -> WorkTicketResponse:
+    """Gate, INSERT, and dispatch one work ticket for `principal`.
+
+    Takes `app` rather than a `Request` so in-process callers get the same gates
+    as `POST /work-ticket`, including the action's audience check.
+    """
+    require_compute_backend_client(app)
+    pool: asyncpg.Pool = app.state.pool
+    settings: Settings = app.state.settings
+
     action = await _fetch_action_for_submission(pool, body.action_id, body.action_version)
     if action is None:
         raise HTTPException(
@@ -726,6 +865,15 @@ async def submit_work_ticket(
             },
         )
 
+    # Every host path in the (now schema-valid) action_context must be one the
+    # caller is allowed to name and the compute cluster can reach.
+    _check_ingest_paths(
+        principal,
+        context_schema=action["context_schema"],
+        action_context=body.action_context,
+        roots=settings.path_ingest_roots,
+    )
+
     # A fastq path in the (now schema-valid) action_context must carry a
     # basename prefixed by the prep_sample's sequenced_pool_item_id.
     if scope_target["kind"] == ScopeTargetKind.PREP_SAMPLE.value:
@@ -733,6 +881,7 @@ async def submit_work_ticket(
             pool,
             prep_sample_idx=scope_target["prep_sample_idx"],
             action_context=body.action_context,
+            principal_idx=principal.principal_idx,
         )
 
     await _check_disallow_without_delete(
@@ -810,7 +959,7 @@ async def submit_work_ticket(
 
     # Fire-and-forget dispatch in the background. The route returns 202
     # immediately; the workflow runs in-process via asyncio.
-    schedule_dispatch(request.app, work_ticket_idx)
+    schedule_dispatch(app, work_ticket_idx)
 
     _log.info(
         "submitted work_ticket %d for action %s/%s by principal %d",
@@ -820,6 +969,20 @@ async def submit_work_ticket(
         principal.principal_idx,
     )
     return WorkTicketResponse(work_ticket_idx=work_ticket_idx, state=WorkTicketState.PENDING)
+
+
+@router.post(
+    PATH_WORK_TICKET_ROOT,
+    response_model=WorkTicketResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def submit_work_ticket(
+    body: WorkTicketCreateRequest,
+    request: Request,
+    principal: Principal = Depends(get_current_principal),
+) -> WorkTicketResponse:
+    """`submit_work_ticket_core` for the requesting principal."""
+    return await submit_work_ticket_core(app=request.app, principal=principal, body=body)
 
 
 # Two-row-source SELECT. work_ticket carries the scope_target_kind plus
@@ -1346,7 +1509,7 @@ async def get_work_ticket_step_logs(
 ) -> WorkTicketStepLogs:
     """Read a bounded tail of a step attempt's stdout/stderr.
 
-    The logs live under `PATH_SCRATCH/ticket/<idx>/<step>/attempt-<n>/logs/`,
+    The logs live in the attempt's `logs/` directory (layout: `workspace.py`),
     owned `qiita-orch:qiita-pipeline` (mode 2770). The CP service account is in
     `qiita-pipeline`, so it reads them straight off shared scratch
     and serves the tail here — letting an operator diagnose an OOM / bad input
@@ -1412,8 +1575,10 @@ async def get_work_ticket_step_logs(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"step_name {chosen.step_name!r} is not a valid path segment",
         )
-    logs_dir = (
-        ticket_root / str(work_ticket_idx) / chosen.step_name / f"attempt-{chosen.attempt}" / "logs"
+    logs_dir = step_logs_dir(
+        step_attempt_dir(
+            ticket_workspace(ticket_root, work_ticket_idx), chosen.step_name, chosen.attempt
+        )
     )
     stdout, stdout_truncated = read_text_tail(
         logs_dir / "stdout", max_lines=tail_lines, max_bytes=_STEP_LOGS_MAX_TAIL_BYTES
@@ -1550,7 +1715,7 @@ async def run_work_ticket(
             },
         )
 
-    if current_state in _RUN_REDRIVE_STATES:
+    if current_state in REDRIVABLE_WORK_TICKET_STATES:
         # Manual restart: FAILED / CANCELLED → PENDING. Per arch.md spec, resets
         # retry_count to 0 (operator override of the auto-retry budget)
         # and clears the failure_* columns so the

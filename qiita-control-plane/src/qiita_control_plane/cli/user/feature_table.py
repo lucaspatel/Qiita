@@ -22,32 +22,46 @@ import sys
 from collections.abc import Callable, Iterator
 from importlib import metadata
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from qiita_common import analytic as ft
 from qiita_common.api_paths import (
     PATH_ALIGNMENT_COHORT_DOGET,
     PATH_ALIGNMENT_PREFIX,
+    PATH_ASSEMBLY_GENOME_MAP_PARQUET,
+    PATH_ASSEMBLY_PREFIX,
+    PATH_ASSEMBLY_RUN_DOGET,
     PATH_EXPORTED_FEATURE_PREFIX,
     PATH_EXPORTED_FEATURE_ROOT,
     PATH_EXPORTED_IDENTIFIER_PREFIX,
     PATH_EXPORTED_IDENTIFIER_ROOT,
     PATH_EXPORTED_PROCESSING_PREFIX,
     PATH_EXPORTED_PROCESSING_ROOT,
+    PATH_PROCESSING_BY_IDX,
+    PATH_PROCESSING_PREFIX,
     PATH_REFERENCE_BY_IDX,
     PATH_REFERENCE_DOGET,
     PATH_REFERENCE_EXCLUSION_BY_IDX,
-    PATH_REFERENCE_GENOME_MAP,
+    PATH_REFERENCE_GENOME_MAP_PARQUET,
     PATH_REFERENCE_PREFIX,
 )
+from qiita_common.assembly_constants import ASSEMBLED_SEQUENCE_TABLE
 from qiita_common.models import (
     MAX_EXPORTED_FEATURE_ENTITIES,
     ExportedFeatureRequest,
     ExportedIdentifierRequest,
     ExportedProcessingRequest,
 )
+from qiita_common.parquet import PARQUET_MEDIA_TYPE
 from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE
 
+if TYPE_CHECKING:
+    import pyarrow as pa
+
+from ...feature_table import (
+    denovo_alignment_processing_idx,
+    denovo_assembly_deprecation_error,
+)
 from .. import _common
 from ._helpers import _UNSET
 from .alignment import (
@@ -62,14 +76,20 @@ from .alignment import (
 # relations, and nothing outside sees them (they are unregistered immediately —
 # see `_stage_genome_map`).
 _GENOME_MAP_SOURCE = "genome_map_response"
+# The two columns either map stages; provenance rides the wire for callers that
+# want it and is dropped here (see `_stage_genome_map`).
+_MAP_KEY_COLUMNS = ["feature_idx", "genome_idx"]
 _MINT_SOURCE = "exported_identifier_response"
 _EXPORTED_FEATURE_SOURCE = "exported_feature_response"
 _EXCLUSION_SOURCE = "reference_exclusion_response"
+_DENOVO_GENOME_MAP_SOURCE = "denovo_genome_map_response"
 
 # The relations each Flight stream is registered as, for the duration of the one
-# CREATE that drains it (see `_staged_stream`).
+# CREATE that drains it (see `staged_stream`).
 _ALIGNMENT_STREAM = "alignment_stream"
 _LENGTHS_STREAM = "reference_lengths_stream"
+_DENOVO_ALIGNMENT_STREAM = "denovo_alignment_stream"
+_DENOVO_LENGTHS_STREAM = "denovo_lengths_stream"
 _TAXONOMY_STREAM = "reference_taxonomy_stream"
 _PHYLOGENY_STREAM = "reference_phylogeny_stream"
 
@@ -88,18 +108,126 @@ _TAXONOMY_TABLE = TAXONOMY_SOURCE_TABLE
 _PHYLOGENY_TABLE = "reference_phylogeny"
 
 
-def _fetch_genome_map(base_url: str, token: str, *, reference_idx: int) -> list[dict[str, Any]]:
-    """GET the whole reference's `feature_idx → genome` map: one entry per (feature,
-    genome) pair with the genome's `source` / `source_id`.
+def _fetch_genome_map(base_url: str, token: str, *, reference_idx: int) -> pa.Table:
+    """GET the whole reference's `feature_idx → genome` map as an Arrow table: one
+    row per (feature, genome) pair with the genome's `source` / `source_id`.
 
-    **A refusal propagates.** Over its hard cap the route 413s, naming the real size,
-    rather than truncating — and there is nothing to fall back to here: a lookup table
-    silently missing rows produces a WRONG feature table rather than a short one, and
-    the route serves the map whole or not at all. So the `HTTPStatusError` travels up
-    to whoever can show the user the size and stop.
+    The Parquet form, because the JSON one caps at `GENOME_MAP_HARD_CAP` — which
+    `routes/_helpers.py` records the deploy's references as exceeding — and
+    because that form needs no cap at all.
     """
-    path = f"{PATH_REFERENCE_PREFIX}{PATH_REFERENCE_GENOME_MAP.format(reference_idx=reference_idx)}"
-    return _common.call("GET", base_url, token, path)["entries"]
+    sub_path = PATH_REFERENCE_GENOME_MAP_PARQUET.format(reference_idx=reference_idx)
+    return _fetch_map_parquet(base_url, token, f"{PATH_REFERENCE_PREFIX}{sub_path}")
+
+
+def _fetch_assembly_genome_map(
+    base_url: str, token: str, *, prep_sample_idx: int, processing_idx: int
+) -> pa.Table:
+    """GET one assembly run's `feature_idx → genome` map, the de novo twin of
+    `_fetch_genome_map`.
+
+    **One call per cohort prep_sample**, because the map is run-scoped where the
+    reference one is whole-reference. The caller re-attaches the prep_sample the
+    response was scoped to — `_stage_denovo_genome_map` says why that key matters.
+
+    Refusals propagate, for the reason its twin's do, and one more of its own: the
+    route 422s a run whose memberships are not all genome-minted, because a map
+    short by a contig does not read as short — it reads as a genome that covered
+    more of a smaller length than it did.
+    """
+    sub_path = PATH_ASSEMBLY_GENOME_MAP_PARQUET.format(
+        prep_sample_idx=prep_sample_idx, processing_idx=processing_idx
+    )
+    return _fetch_map_parquet(base_url, token, f"{PATH_ASSEMBLY_PREFIX}{sub_path}")
+
+
+def _fetch_processing(base_url: str, token: str, *, processing_idx: int) -> dict:
+    """GET one assembly run's params and lifecycle columns."""
+    sub_path = PATH_PROCESSING_BY_IDX.format(processing_idx=processing_idx)
+    return _common.call("GET", base_url, token, f"{PATH_PROCESSING_PREFIX}{sub_path}")
+
+
+def _refuse_deprecated_denovo_run(base_url: str, token: str, *, processing_idx: int) -> None:
+    """Refuse a deprecated assembly run as a de novo arm, the client-side half of the
+    rule `runner/_feature_table.py` applies server-side.
+
+    `denovo_alignment_processing_idx` states why neither driver may be the only one
+    that checks, and `denovo_assembly_deprecation_error` owns the wording so the two
+    cannot word it differently. The read is one GET per build, not per cohort sample:
+    the assembly run is in the de novo alignment's hashed params, so one value covers
+    the whole cohort.
+    """
+    row = _fetch_processing(base_url, token, processing_idx=processing_idx)
+    message = denovo_assembly_deprecation_error(
+        processing_idx=processing_idx,
+        status=row.get("status"),
+        superseded_by=row.get("superseded_by"),
+    )
+    if message is not None:
+        raise ValueError(message)
+
+
+def _fetch_map_parquet(base_url: str, token: str, path: str) -> pa.Table:
+    """The shared half of the two map fetches: read the Parquet body and decode it.
+
+    **A refusal propagates.** There is nothing to fall back to — a lookup table
+    silently missing rows produces a WRONG feature table rather than a short one —
+    so any non-2xx travels up to whoever can show the user what happened.
+    """
+    import pyarrow as pa  # noqa: PLC0415
+    import pyarrow.parquet as pq  # noqa: PLC0415
+
+    body, content_type = _common.fetch_binary(base_url, token, path, accept=PARQUET_MEDIA_TYPE)
+    # Parameters (`; charset=`) are not part of the type, and media types are
+    # case-insensitive. A body that is not Parquet fails in `read_table` anyway,
+    # but with an Arrow error about magic bytes rather than a statement of what
+    # the server actually sent.
+    if content_type.split(";")[0].strip().lower() != PARQUET_MEDIA_TYPE:
+        raise RuntimeError(f"{path}: expected {PARQUET_MEDIA_TYPE}, server sent {content_type!r}")
+    return pq.read_table(pa.BufferReader(body))
+
+
+def _assembly_genome_map_or_none(
+    base_url: str, token: str, *, prep_sample_idx: int, processing_idx: int
+) -> pa.Table | None:
+    """This sample's run-scoped genome map, or `None` when it assembled nothing.
+
+    **A 404 here is the design's graceful path, not an error.** A sample whose
+    assembly produced no contigs has no de novo arm; the combined table degrades to
+    plain reference alignment for it, which is the stated behaviour rather than a
+    state to refuse. Every other status still propagates — a 422 on an unminted map
+    and a 413 over the cap are refusals whose whole point is that they are not
+    silently absorbed.
+
+    The submit-time twin of this is the server-side resolver's arm gate, which reads
+    `assembly_sample` directly and can tell "assembled nothing" from "has not run
+    yet". A client has no such gate, so it takes the 404 at face value — which is
+    why the two drivers are not equally strict here, and the server one is the
+    stricter.
+    """
+    try:
+        return _fetch_assembly_genome_map(
+            base_url, token, prep_sample_idx=prep_sample_idx, processing_idx=processing_idx
+        )
+    except _common.httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            return None
+        raise
+
+
+def _staged_denovo_samples(con) -> list[int]:
+    """The cohort samples the staged de novo map actually named, ascending.
+
+    Read from the map rather than from the cohort, so the lengths are fetched for
+    exactly the runs that contributed a genome — a sample the map skipped has no
+    contigs, and asking the data plane for its assembly would 404 on a run that
+    legitimately produced none. Same rule the server-side job applies, for the same
+    reason.
+    """
+    rows = con.execute(
+        f"SELECT DISTINCT prep_sample_idx FROM {ft.DENOVO_MAP_TABLE} ORDER BY prep_sample_idx"
+    ).fetchall()
+    return [prep_sample_idx for (prep_sample_idx,) in rows]
 
 
 def _fetch_reference_exclusion(
@@ -219,7 +347,29 @@ def _create_alignment_doget_ticket(
     return base64.b64decode(resp["ticket"])
 
 
-def _create_reference_doget_ticket(
+def _create_assembly_run_doget_ticket(
+    base_url: str, token: str, *, prep_sample_idx: int, processing_idx: int, table: str
+) -> bytes:
+    """Mint a DoGet ticket for ONE assembly run's contigs, returning the decoded
+    ticket bytes.
+
+    The human-callable mint (`assembly:doget`), which authorizes this run's
+    prep_sample against the caller's studies before signing — the service-account
+    route beside it is the compute job's and is not reachable with a PAT.
+
+    Run-scoped, so a cohort costs N mints where the reference lengths cost one. That
+    is the ticket's shape, not a choice here: the pair IS the signed filter.
+    """
+    sub_path = PATH_ASSEMBLY_RUN_DOGET.format(
+        prep_sample_idx=prep_sample_idx, processing_idx=processing_idx
+    )
+    resp = _common.call(
+        "POST", base_url, token, f"{PATH_ASSEMBLY_PREFIX}{sub_path}", json={"table": table}
+    )
+    return base64.b64decode(resp["ticket"])
+
+
+def create_reference_doget_ticket(
     base_url: str, token: str, *, reference_idx: int, table: str
 ) -> bytes:
     """Mint a whole-reference DoGet ticket for one of the reference's lake tables.
@@ -244,12 +394,14 @@ def _stage_response(
     """Stage a REST response into the relation `table_sql` builds from it.
 
     **The arrow schema is written out rather than inferred**, and it is what selects the
-    columns: miint's functions take native BIGINT id columns, and an empty response — a
-    16S reference has no genome-bearing features, an unblocked reference no exclusions —
-    would otherwise stage NULL-typed columns that fail the first join. `from_pylist` with
-    an explicit schema also reads the entries once, where a column-at-a-time
-    comprehension walks a quarter-million dicts once per column, and drops the columns
-    nobody staged for free.
+    columns: miint's functions take native BIGINT id columns, and an empty response — an
+    unblocked reference has no exclusions, a cohort no minted handles — would otherwise
+    stage NULL-typed columns that fail the first join. `from_pylist` with an explicit
+    schema also reads the entries once, where a column-at-a-time comprehension walks them
+    once per column, and drops the columns nobody staged for free.
+
+    JSON responses only. The two genome maps arrive as Parquet and stage their Arrow
+    table directly, having no dicts to walk.
 
     Each caller below says which columns those are and why the rest are left behind; that
     choice is the only thing they differ in.
@@ -261,22 +413,61 @@ def _stage_response(
         con.execute(table_sql(relation))
 
 
-def _stage_genome_map(con, entries: list[dict[str, Any]]) -> None:
-    """Stage the genome-map response into the roll-up key, `MAP_TABLE`.
+def _stage_genome_map(con, table: pa.Table) -> None:
+    """Stage the genome-map Parquet into the roll-up key, `MAP_TABLE`.
 
     Neither `source` nor `source_id` is staged. The map's job here is the roll-up key;
     what a published row is NAMED comes from the exported-feature mint, which is the
     only authority on whether a genome's accession is unique in the published namespace.
+
+    The projection happens on the Arrow table rather than in the CREATE, so the two
+    columns nobody stages are dropped before DuckDB ever sees them. The Parquet
+    schema is typed, so an empty map stages BIGINT columns rather than NULL-typed
+    ones the first join would reject.
+    """
+    with _registered(con, _GENOME_MAP_SOURCE, table.select(_MAP_KEY_COLUMNS)):
+        con.execute(ft.map_table_sql(_GENOME_MAP_SOURCE))
+
+
+def _stage_denovo_genome_map(con, per_sample: dict[int, pa.Table]) -> None:
+    """Stage the cohort's per-run genome maps into `DENOVO_MAP_TABLE`, one relation
+    keyed `(prep_sample_idx, feature_idx, genome_idx)`.
+
+    **The prep_sample key is re-attached here**, because the REST route carries it in
+    the path rather than in each entry. `AssemblyGenomeMapResponse` states what goes
+    wrong without it.
+
+    Neither `source` nor `source_id` is staged, for the reason its reference twin
+    gives: the map's job here is the roll-up key.
     """
     import pyarrow as pa  # noqa: PLC0415
 
-    _stage_response(
-        con,
-        entries,
-        relation=_GENOME_MAP_SOURCE,
-        columns=[("feature_idx", pa.int64()), ("genome_idx", pa.int64())],
-        table_sql=ft.map_table_sql,
+    per_run = [
+        table.select(_MAP_KEY_COLUMNS).add_column(
+            0,
+            pa.field("prep_sample_idx", pa.int64()),
+            pa.array([prep_sample_idx] * table.num_rows, type=pa.int64()),
+        )
+        for prep_sample_idx, table in sorted(per_sample.items())
+    ]
+    # Spelled out rather than derived from the served schema: importing it here
+    # would pull a server-side action module into the CLI for three int64 columns.
+    # `test_an_empty_genome_map_still_stages_typed_relations` is what catches a
+    # drift, since it stages through this branch.
+    schema = pa.schema(
+        [
+            ("prep_sample_idx", pa.int64()),
+            ("feature_idx", pa.int64()),
+            ("genome_idx", pa.int64()),
+        ]
     )
+    # `concat_tables` takes no `schema=` (it reads only `promote_options` out of
+    # its kwargs and drops the rest silently), and refuses an empty list outright —
+    # so the no-run case is the `empty_table()` branch, not an argument. A cohort
+    # that assembled nothing still has to stage typed columns.
+    combined = pa.concat_tables(per_run) if per_run else schema.empty_table()
+    with _registered(con, _DENOVO_GENOME_MAP_SOURCE, combined):
+        con.execute(ft.denovo_map_table_sql(_DENOVO_GENOME_MAP_SOURCE))
 
 
 def _stage_blocked_features(con, entries: list[dict[str, Any]]) -> None:
@@ -337,10 +528,10 @@ def _registered(con, relation: str, obj) -> Iterator[str]:
     """Register an Arrow object on `con` as `relation` for the block's duration, and
     release it however the block ends.
 
-    One lifecycle for all three staged inputs — `con.register` takes an Arrow table as
-    happily as a stream reader. The release matters most for what it frees soonest: at
-    the genome-map route's cap the registered table is a quarter-million pairs, and
-    holding it alongside the two relations copied out of it doubles that for nothing.
+    One lifecycle for every staged input — `con.register` takes an Arrow table as
+    happily as a stream reader. The release matters most for what it frees soonest:
+    the genome map is the largest of them by far, and uncapped, so holding it
+    alongside the relations copied out of it doubles that for nothing.
     """
     con.register(relation, obj)
     try:
@@ -350,12 +541,12 @@ def _registered(con, relation: str, obj) -> Iterator[str]:
 
 
 @contextlib.contextmanager
-def _staged_stream(con, flight_client, ticket: bytes, *, relation: str) -> Iterator[str]:
+def staged_stream(con, flight_client, ticket: bytes, *, relation: str) -> Iterator[str]:
     """`_registered` over a Flight DoGet stream.
 
     DuckDB pulls the Arrow stream lazily as the query scans `relation`, so the rows are
-    never buffered in Python — the reason each caller below runs exactly one
-    materializing CREATE inside the block and lets the relation go.
+    never buffered in Python — the reason each caller reads the relation exactly once
+    inside the block and lets it go.
 
     **Scanning this relation logs one Arrow "input buffer was poorly aligned" warning per
     projected column (apache/arrow#37195), and no `ensure_alignment` read option removes
@@ -377,7 +568,7 @@ def _stage_from_stream(con, flight_client, ticket: bytes, *, relation: str, tabl
     which genomes survive, and reopening a client later would break the invariant that
     the client lives only for the streams.
     """
-    with _staged_stream(con, flight_client, ticket, relation=relation) as source:
+    with staged_stream(con, flight_client, ticket, relation=relation) as source:
         con.execute(table_sql(source))
 
 
@@ -431,7 +622,7 @@ def _stage_alignment(con, flight_client, ticket: bytes, *, gate: ft.AlignmentGat
     the gate would drop, and a Flight stream cannot be scanned twice. The diagnostics
     therefore run after the stream is released, off the materialized copy.
     """
-    with _staged_stream(con, flight_client, ticket, relation=_ALIGNMENT_STREAM) as source:
+    with staged_stream(con, flight_client, ticket, relation=_ALIGNMENT_STREAM) as source:
         con.execute(
             ft.alignment_table_sql(source)
             if gate is None
@@ -446,17 +637,20 @@ def _stage_alignment(con, flight_client, ticket: bytes, *, gate: ft.AlignmentGat
         con.execute(sql, parameters)
 
 
-def _build_ogu_output(con, *, scope: ft.CoverageScope, coverage_threshold: float) -> None:
+def _build_ogu_output(
+    con, *, scope: ft.CoverageScope, coverage_threshold: float, combined: bool
+) -> None:
     """Run the analytic: the coverage filter at `scope`, then woltka, landing in
     `OGU_OUTPUT_TABLE`. Requires `ALIGNMENT_TABLE` and `MAP_TABLE`, plus
-    `GENOME_LENGTHS_TABLE` when the threshold filters anything.
+    `GENOME_LENGTHS_TABLE` when the threshold filters anything, and the de novo arm's
+    own relations when `combined`.
 
     Both the statement order and the empty-input short-circuit come from the shared
     module, so this driver and the server-side job's `_write_ogu_table` cannot disagree
     about the analytic — only about how the result is written.
     """
     for sql, parameters in ft.ogu_input_statements(
-        scope=scope, coverage_threshold=coverage_threshold
+        scope=scope, coverage_threshold=coverage_threshold, combined=combined
     ):
         con.execute(sql, parameters)
     rows = con.execute(ft.ogu_input_count_sql()).fetchone()[0]
@@ -600,6 +794,31 @@ def _manifest_gate(gate: ft.AlignmentGate | None) -> dict[str, Any] | None:
     }
 
 
+def _manifest_denovo(
+    *, requested: int | None, applied_processing_idx: int | None, cohort: list[int]
+) -> dict[str, Any] | None:
+    """The de novo arm's record, or None when the build never asked for one.
+
+    **`applied` is separate from `requested` because the two come apart**, and the
+    manifest is what makes that legible: a caller can name an alignment whose whole
+    cohort assembled nothing, and the build then degrades to reference-only. Without
+    this block a combined request and a reference-only request write byte-identical
+    manifests, which is the one thing this file exists not to do.
+
+    The internal cohort is deliberately absent — the identifier map beside the table
+    is the artifact that carries prep_sample_idx, and this file is meant to be
+    publishable. The COUNT is what a reader needs.
+    """
+    if requested is None:
+        return None
+    return {
+        "requested_alignment_idx": requested,
+        "applied": applied_processing_idx is not None,
+        "processing_idx": applied_processing_idx,
+        "prep_samples_with_a_de_novo_arm": len(cohort),
+    }
+
+
 def _manifest_payload(
     *,
     args: argparse.Namespace,
@@ -611,6 +830,7 @@ def _manifest_payload(
     rows: int,
     files: list[Path],
     tools: dict[str, str],
+    denovo: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The bundle's record of what produced the table — the one artifact here that is
     always written, because without it the table is not reproducible.
@@ -652,6 +872,9 @@ def _manifest_payload(
             "coverage_scope": args.coverage_scope,
             "coverage_threshold": args.coverage_threshold,
             "gate": _manifest_gate(gate),
+            # Present only for a build that ASKED for a second arm — see
+            # `_manifest_denovo` for why `applied` is a separate key from the ask.
+            **({"denovo": denovo} if denovo is not None else {}),
             # Sorted, so the record does not depend on the order the mint answered in.
             "cohort": sorted(identifier["export_id"] for identifier in identifiers),
         },
@@ -865,6 +1088,16 @@ def _gate_from_args(args: argparse.Namespace) -> ft.AlignmentGate | None:
                 "--circular-gate does not do: it pools a read's records against one "
                 "reference and keeps mates apart. Pass one or the other."
             )
+        if args.denovo_alignment_idx is not None:
+            raise ValueError(
+                "--circular-gate re-judges every staged record against thresholds the "
+                "producers never aligned at. For the de novo arm that is redundant — "
+                "align_denovo already applied the circular gate before persisting a "
+                "row — and for the reference arm it is wrong: align_sharded scored per "
+                "record, not pooled, so this would newly admit or drop reference "
+                "placements on a rule they were never judged by. Build the combined "
+                "table without it."
+            )
         thresholds = {
             name: default if value is _UNSET else value
             for name, value, default in (
@@ -962,7 +1195,81 @@ def _run_build(
     reference = _fetch_reference(args.base_url, token, reference_idx=reference_idx)
     cohort = _resolve_cohort(args.base_url, token, args)
 
+    # The de novo arm, resolved from the SAME verified pool listing the reference arm
+    # came from — one blob, so the two summaries cannot come from lookups that
+    # disagree. `denovo_alignment_processing_idx` is the shared rule the server-side
+    # resolver applies too; a swapped or mask-mismatched pair is refused here rather
+    # than after a cohort has crossed the wire.
+    denovo_processing_idx: int | None = None
+    denovo_summary: dict | None = None
+    if args.denovo_alignment_idx is not None:
+        denovo_summary = _alignment_summary(
+            _fetch_pool_alignments(
+                args.base_url,
+                token,
+                sequencing_run_idx=args.sequencing_run_idx,
+                sequenced_pool_idx=args.sequenced_pool_idx,
+            ),
+            alignment_idx=args.denovo_alignment_idx,
+        )
+        denovo_processing_idx = denovo_alignment_processing_idx(
+            denovo_alignment_idx=args.denovo_alignment_idx,
+            denovo_params=denovo_summary.get("params"),
+            reference_params=summary.get("params"),
+        )
+        _refuse_deprecated_denovo_run(args.base_url, token, processing_idx=denovo_processing_idx)
+
     _stage_genome_map(con, _fetch_genome_map(args.base_url, token, reference_idx=reference_idx))
+    denovo_cohort: list[int] = []
+    if denovo_processing_idx is not None:
+        # One map per cohort sample, folded into one relation with the sample key
+        # re-attached. A sample that assembled nothing 404s, and that is the design's
+        # graceful path rather than an error: it simply has no de novo arm, so it is
+        # skipped here and stays reference-only downstream.
+        _stage_denovo_genome_map(
+            con,
+            {
+                prep_sample_idx: entries
+                for prep_sample_idx in cohort
+                if (
+                    entries := _assembly_genome_map_or_none(
+                        args.base_url,
+                        token,
+                        prep_sample_idx=prep_sample_idx,
+                        processing_idx=denovo_processing_idx,
+                    )
+                )
+                is not None
+            },
+        )
+        # **The de novo arm's cohort is the samples the MAP named, not the build's.**
+        # Every de novo surface is asked for exactly these: the run-scoped lengths
+        # 404 for a sample with no run, and the alignment mint refuses a cohort
+        # member with no `alignment_sample` row — which is precisely a sample that
+        # assembled nothing, since `align-denovo` ends NO_DATA for it and never
+        # opens a gate row. Passing the whole cohort would turn the design's
+        # graceful degradation into a 422 for the entire build.
+        denovo_cohort = _staged_denovo_samples(con)
+        if denovo_cohort and len(denovo_cohort) < len(cohort):
+            print(
+                f"note: {len(cohort) - len(denovo_cohort)} of {len(cohort)} "
+                f"prep_sample(s) have no contigs from assembly run "
+                f"{denovo_processing_idx} and are reference-only in this table.",
+                file=sys.stderr,
+            )
+        if not denovo_cohort:
+            # Nothing in the cohort assembled: there is no second arm to reconcile
+            # against, so this is a reference-only build rather than an empty one.
+            # Left as a combined build it would sign an unscoped ticket, which the
+            # mint refuses, and bind against a de novo slice nothing staged.
+            print(
+                "note: no prep_sample in this cohort has contigs from assembly run "
+                f"{denovo_processing_idx}, so --denovo-alignment-idx "
+                f"{args.denovo_alignment_idx} contributed nothing and this is a "
+                "reference-only table. The manifest records that it was requested.",
+                file=sys.stderr,
+            )
+            denovo_processing_idx = None
     identifiers = _mint_exported_identifiers(
         args.base_url, token, alignment_idx=args.alignment_idx, prep_sample_idx=cohort
     )
@@ -977,7 +1284,7 @@ def _run_build(
             _stage_from_stream(
                 con,
                 flight_client,
-                _create_reference_doget_ticket(
+                create_reference_doget_ticket(
                     args.base_url, token, reference_idx=reference_idx, table=table
                 ),
                 relation=relation,
@@ -1006,6 +1313,29 @@ def _run_build(
                 relation=_TAXONOMY_STREAM,
                 table_sql=ft.taxonomy_table_sql,
             )
+        if denovo_processing_idx is not None and filtering:
+            # N run-scoped streams, appended into one relation before the roll-up
+            # reads it — the assembly read-back has no whole-cohort form. Only the
+            # samples the map named: a sample with no contigs has no run to read.
+            con.execute(ft.denovo_contig_lengths_table_sql())
+            for prep_sample_idx in denovo_cohort:
+                _stage_from_stream(
+                    con,
+                    flight_client,
+                    _create_assembly_run_doget_ticket(
+                        args.base_url,
+                        token,
+                        prep_sample_idx=prep_sample_idx,
+                        processing_idx=denovo_processing_idx,
+                        # One row per contig — hash and length, no bytes. The
+                        # chunks table beside it is what carries sequence, and
+                        # this recipe never reads it.
+                        table=ASSEMBLED_SEQUENCE_TABLE,
+                    ),
+                    relation=_DENOVO_LENGTHS_STREAM,
+                    table_sql=ft.denovo_contig_lengths_insert_sql,
+                )
+            con.execute(ft.denovo_genome_lengths_insert_sql())
         _stage_alignment(
             con,
             flight_client,
@@ -1018,6 +1348,25 @@ def _run_build(
             ),
             gate=gate,
         )
+        if denovo_processing_idx is not None:
+            # The second arm and precedence over the first, in one sequence — see
+            # `analytic.reconcile.denovo_alignment_statements`. The de novo slice takes
+            # no gate: `--circular-gate` is refused alongside this flag, and the CIGAR
+            # gate would judge it on a rule align_denovo already applied.
+            with staged_stream(
+                con,
+                flight_client,
+                _create_alignment_doget_ticket(
+                    args.base_url,
+                    token,
+                    alignment_idx=args.denovo_alignment_idx,
+                    prep_sample_idx=denovo_cohort,
+                    columns=ft.ALIGNMENT_COLUMNS,
+                ),
+                relation=_DENOVO_ALIGNMENT_STREAM,
+            ) as source:
+                for sql in ft.denovo_alignment_statements(source):
+                    con.execute(sql)
         if args.tree:
             # LAST in the window, after the stream that can refuse: a whole reference's
             # tree is the largest relation this recipe holds, and it is held from here
@@ -1042,6 +1391,7 @@ def _run_build(
         con,
         scope=ft.CoverageScope(args.coverage_scope),
         coverage_threshold=args.coverage_threshold,
+        combined=denovo_processing_idx is not None,
     )
     # The row labels are minted here rather than beside the sample labels above,
     # because only now is the published genome set known — see `_published_genome_idxs`.
@@ -1079,6 +1429,11 @@ def _run_build(
             rows=clearance.rows,
             files=files,
             tools=tools,
+            denovo=_manifest_denovo(
+                requested=args.denovo_alignment_idx,
+                applied_processing_idx=denovo_processing_idx,
+                cohort=denovo_cohort,
+            ),
         ),
         clearances=clearances,
     )
@@ -1127,6 +1482,18 @@ def _handle_feature_table_build(args: argparse.Namespace, parser: argparse.Argum
             written, rows = _run_build(args, token, con, gate=gate)
     except _common.httpx.HTTPStatusError as exc:
         print(f"http error {exc.response.status_code}: {exc.response.text}", file=sys.stderr)
+        return 1
+    except _common.httpx.RemoteProtocolError as exc:
+        # Ahead of RequestError, which it subclasses. httpx raises this both for a
+        # body cut mid-transfer and for a peer that closed before any response, so
+        # the message covers both rather than asserting which happened — the first
+        # is a retry, the second is usually a wrong --base-url.
+        print(
+            f"error: the connection ended before a complete response arrived ({exc})."
+            " Retry; a partial genome map is never used. If it persists, check"
+            " --base-url / $QIITA_CONTROL_PLANE_URL.",
+            file=sys.stderr,
+        )
         return 1
     except _common.httpx.RequestError as exc:
         print(

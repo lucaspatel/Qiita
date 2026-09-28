@@ -210,6 +210,10 @@ class Tier(StrEnum):
     ADMIN = "admin"
 
 
+# The tiers a `study_access` row can carry (`study_access_no_public_tier`).
+STORABLE_ACCESS_TIERS: frozenset[Tier] = frozenset({Tier.VIEWER, Tier.MEMBER, Tier.ADMIN})
+
+
 ReferenceKind = Literal["sequence_reference", "taxonomy_authority", "artifact_sequence_set"]
 """Kinds of reference, mirroring the `qiita.reference.kind` TEXT/CHECK column
 (NOT a Postgres ENUM — see the reference migrations). `artifact_sequence_set` is
@@ -482,6 +486,44 @@ class ReferenceExclusionSyncResponse(BaseModel):
     synced_feature_count: int
 
 
+class ReferencePhylogenyEdgeIdMintResponse(BaseModel):
+    """Result of POST /reference/{idx}/phylogeny/mint-edge-id.
+
+    `already_numbered_rows` counts what carried an `edge_id` before the call, so the
+    two 200 outcomes are distinguishable: `minted_rows == phylogeny_rows` numbered a
+    tree that had none, and `already_numbered_rows == phylogeny_rows` with
+    `minted_rows == 0` is a tree that already had one (a replay, or a tree loaded
+    from a decorated Newick). Anything between the two is refused, not reported —
+    see the route."""
+
+    reference_idx: Annotated[int, Field(gt=0)]
+    phylogeny_rows: Annotated[int, Field(ge=0)]
+    already_numbered_rows: Annotated[int, Field(ge=0)]
+    minted_rows: Annotated[int, Field(ge=0)]
+
+    @model_validator(mode="after")
+    def _counts_must_add_up(self) -> ReferencePhylogenyEdgeIdMintResponse:
+        """Neither count may exceed the tree, and the two together may not exceed it.
+
+        The route's own checks read the counts to choose a status; these bound what
+        the counts can be at all, so an arithmetically impossible reply raises here
+        and reaches the caller as the route's 502 rather than as a 200 whose body
+        does not add up.
+        """
+        if self.already_numbered_rows > self.phylogeny_rows:
+            raise ValueError(
+                f"already_numbered_rows {self.already_numbered_rows} exceeds"
+                f" phylogeny_rows {self.phylogeny_rows}"
+            )
+        if self.already_numbered_rows + self.minted_rows > self.phylogeny_rows:
+            raise ValueError(
+                f"already_numbered_rows {self.already_numbered_rows} +"
+                f" minted_rows {self.minted_rows} exceeds phylogeny_rows"
+                f" {self.phylogeny_rows}"
+            )
+        return self
+
+
 class ReferenceExclusionListItem(BaseModel):
     """One actively-blocked feature that appears in a given reference, with why +
     external ids. `direct_block` / `via_genome` are reported as MUTUALLY EXCLUSIVE:
@@ -536,8 +578,11 @@ class GenomeMapEntry(BaseModel):
 
 class GenomeMapResponse(BaseModel):
     """Returned by GET /reference/{reference_idx}/genome-map: the whole
-    reference's feature_idx → genome lookup, the translation the client-side
-    feature-table recipe joins its alignment rows against.
+    reference's feature_idx → genome lookup, rolling alignment rows up to genomes.
+
+    The same rows are served uncapped at `GET .../genome-map/parquet`, which is
+    what a caller refused by the 413 below should call instead — and what the
+    client-side feature-table recipe reads.
 
     One entry per (feature, genome) pair, ordered by (feature_idx, genome_idx). A
     feature shared across genomes (a plasmid) contributes one entry per genome, so
@@ -549,10 +594,76 @@ class GenomeMapResponse(BaseModel):
     short lookup table yields a WRONG feature table rather than a partial one. A
     200 is always the complete map, so the field could only ever be False — and a
     boolean that never varies is one a caller checks instead of the status
-    code."""
+    code. The Parquet form has no cap at all: `routes/_helpers.GENOME_MAP_HARD_CAP`
+    bounds this representation, not the data."""
 
     reference_idx: Annotated[int, Field(gt=0)]
     entries: list[GenomeMapEntry]
+    count: Annotated[int, Field(ge=0)]
+
+
+class AssemblyGenomeMapResponse(BaseModel):
+    """Returned by GET /assembly/{prep_sample_idx}/{processing_idx}/genome-map: one
+    assembly run's contig → genome lookup, the de novo arm's counterpart to
+    `GenomeMapResponse`.
+
+    Reuses `GenomeMapEntry`, because a qiita genome is a `qiita.genome` row like
+    any other and a consumer rolls both maps up the same way. What differs is the
+    SCOPE, and it is in the path rather than the entries: this map covers exactly
+    one `(prep_sample_idx, processing_idx)` run, so a caller building a cohort's
+    map holds one response per prep_sample and knows which one each came from. A
+    contig two prep_samples assembled is one content-addressed `feature_idx` under
+    two genomes, so that key is what keeps their reads apart — it is not a label,
+    and a consumer that flattened these responses into one unkeyed map would credit
+    each prep_sample's reads to both genomes.
+
+    Refuses over its cap the way its reference twin does, for the same reason, and
+    has the same uncapped Parquet sibling at `.../genome-map/parquet`, and
+    carries no `truncated` for the same reason. 404s a run that never assembled —
+    an unknown prep_sample, an unknown processing_idx, and a real pair that
+    assembled nothing are one answer, matching the assembly DoGet routes."""
+
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    processing_idx: Annotated[int, Field(gt=0)]
+    entries: list[GenomeMapEntry]
+    count: Annotated[int, Field(ge=0)]
+
+
+class AssemblyMembershipEntry(BaseModel):
+    """One `qiita.assembly_membership` row of one assembly run: which subject
+    (`kind`, `bin_id`) a contig belongs to, and the assembler's report on it.
+
+    The four attributes are NULL for a run assembled before the assembler's report
+    was captured. Their meaning is the COMMENT ON COLUMN of the Postgres table.
+    """
+
+    feature_idx: int
+    kind: str
+    bin_id: str
+    raw_name: str | None = None
+    circularity: str | None = None
+    depth: float | None = None
+    mult: float | None = None
+
+
+class AssemblyMembershipResponse(BaseModel):
+    """Returned by GET /assembly/{prep_sample_idx}/{processing_idx}/membership:
+    every membership row of one run, every kind included, ordered by
+    (kind, bin_id, feature_idx).
+
+    The genome map's sibling, over a wider row set: the map admits only the kinds
+    a feature table rolls up and needs every row genome-minted, while this one
+    serves UNBINNED contigs too and does not read `genome_idx` at all. A contig in
+    two subjects of the run is two entries.
+
+    Refuses over its cap with a 413 rather than truncating, and has an uncapped
+    Parquet sibling at `.../membership/parquet`, for the reason
+    `AssemblyGenomeMapResponse` gives.
+    """
+
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    processing_idx: Annotated[int, Field(gt=0)]
+    entries: list[AssemblyMembershipEntry]
     count: Annotated[int, Field(ge=0)]
 
 

@@ -41,6 +41,9 @@ import httpx
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX
 from qiita_common.models import TERMINAL_WORK_TICKET_STATES
 
+from ...backfill.assembly_genome import BackfillPlan as GenomeBackfillPlan
+from ...backfill.assembly_genome import apply_backfill as apply_assembly_genome_backfill
+from ...backfill.assembly_genome import plan_backfill as plan_assembly_genome_backfill
 from ...backfill.host_taxon import (
     BackfillPlan,
     HostTaxonSource,
@@ -48,7 +51,11 @@ from ...backfill.host_taxon import (
     plan_backfill,
 )
 from ...backfill.mask_adapter_hash import RekeyPlan, apply_rekey, plan_rekey
+from ...backfill.syndna_read_count import BackfillPlan as SyndnaBackfillPlan
+from ...backfill.syndna_read_count import apply_backfill as apply_syndna_backfill
+from ...backfill.syndna_read_count import plan_backfill as plan_syndna_backfill
 from ...config import _parse_optional_positive_int_env
+from ...workspace import WORK_TICKET_SUBDIR
 from .. import _common
 from .._reference_exclusion import add_admin_exclusion_subparsers
 from ._helpers import _DB_CONNECT_TIMEOUT_SECONDS, open_admin_pool
@@ -498,6 +505,47 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Write the re-keyed rows (default: dry-run, report only, no writes).",
     )
     p_backfill_mask.set_defaults(handler=_handle_backfill_mask_adapter_hash)
+
+    p_backfill_genome = p_backfill_sub.add_parser(
+        "assembly-genome",
+        help="Mint qiita.genome rows for assembly runs that predate the inline mint",
+        description=(
+            "Mint one qiita-origin genome per assembled subject — per refined bin, per"
+            " LCG contig, per unbinned contig — and stamp it onto"
+            " qiita.assembly_membership.genome_idx, for runs that completed before the"
+            " mint became part of write-assembly-membership. A pure Postgres replay:"
+            " the identity is a hash of columns already on the row, so nothing"
+            " re-assembles and nothing is re-read from the data plane. Run it before a"
+            " feature-table build that rolls de novo contigs up to genomes; no consumer"
+            " reads this column yet, so today it is a prerequisite rather than a"
+            " correction. Idempotent; dry-run by default. Needs DATABASE_URL."
+        ),
+    )
+    p_backfill_genome.add_argument(
+        "--execute",
+        action="store_true",
+        help="Write the genomes and stamps (default: dry-run, report only, no writes).",
+    )
+    p_backfill_genome.set_defaults(handler=_handle_backfill_assembly_genome)
+
+    p_backfill_syndna = p_backfill_sub.add_parser(
+        "syndna-read-count",
+        help="Count SynDNA insert reads for prep_samples masked before counts were persisted",
+        description=(
+            "For every prep_sample completed under a SynDNA mask with no rows in"
+            " qiita.syndna_read_count, count the reads aligned to each insert from the"
+            " syndna step's alignment file in the read-mask ticket's scratch workspace,"
+            " and write them. A prep_sample whose file is gone is listed and skipped; a"
+            " re-mask is then its only source. Idempotent; dry-run by default. Needs"
+            " DATABASE_URL and PATH_SCRATCH."
+        ),
+    )
+    p_backfill_syndna.add_argument(
+        "--execute",
+        action="store_true",
+        help="Write the counts (default: dry-run, report only, no writes).",
+    )
+    p_backfill_syndna.set_defaults(handler=_handle_backfill_syndna_read_count)
 
     p_actions = sub.add_parser("actions", help="Action registry operations")
     p_actions_sub = p_actions.add_subparsers(dest="actions_cmd", required=True)
@@ -1232,6 +1280,118 @@ def _handle_backfill_mask_adapter_hash(
     return 0
 
 
+async def _backfill_assembly_genome(
+    database_url: str, *, execute: bool
+) -> tuple[GenomeBackfillPlan, int]:
+    """Plan, report, and (with `execute`) apply the assembly-genome backfill.
+
+    Returns `(plan, stamped)`; `stamped` is 0 on a dry run. Unlike the mask re-key
+    there is no blocked state: a subject's identity is a hash of its own columns, so
+    every un-minted subject is writable and there is nothing to attribute.
+    """
+    pool = await open_admin_pool(database_url)
+    try:
+        plan = await plan_assembly_genome_backfill(pool)
+        if not execute:
+            return plan, 0
+        return plan, await apply_assembly_genome_backfill(pool, plan)
+    finally:
+        await pool.close()
+
+
+def _handle_backfill_assembly_genome(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> int:
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        print("error: DATABASE_URL not set", file=sys.stderr)
+        return 2
+
+    try:
+        plan, stamped = asyncio.run(_backfill_assembly_genome(database_url, execute=args.execute))
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"subjects without a genome : {plan.genomes_to_mint}")
+    print(f"rows they cover           : {plan.rows_to_stamp}")
+    print(f"rows already stamped      : {plan.already_stamped_rows}")
+
+    if not plan.subjects:
+        # The empty plan IS the completeness signal a feature-table build wants.
+        print("\nnothing to do — every assembly_membership row carries a genome_idx.")
+        return 0
+
+    if args.execute:
+        print(f"\nminted {plan.genomes_to_mint} genome(s), stamped {stamped} row(s)")
+    else:
+        print(
+            f"\nDRY RUN — nothing written. Pass --execute to mint"
+            f" {plan.genomes_to_mint} genome(s) and stamp {plan.rows_to_stamp} row(s)."
+        )
+    return 0
+
+
+async def _backfill_syndna_read_count(
+    database_url: str, *, ticket_root: Path, execute: bool
+) -> tuple[SyndnaBackfillPlan, int]:
+    """Plan, report, and (with `execute`) apply the SynDNA read-count backfill.
+    Returns `(plan, written)`; `written` is 0 on a dry run."""
+    pool = await open_admin_pool(database_url)
+    try:
+        plan = await plan_syndna_backfill(pool, ticket_root=ticket_root)
+        if not execute:
+            return plan, 0
+        return plan, await apply_syndna_backfill(pool, plan)
+    finally:
+        await pool.close()
+
+
+def _handle_backfill_syndna_read_count(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> int:
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        print("error: DATABASE_URL not set", file=sys.stderr)
+        return 2
+    scratch = os.environ.get("PATH_SCRATCH")
+    if not scratch or not Path(scratch).is_absolute():
+        print("error: PATH_SCRATCH must be set to an absolute path", file=sys.stderr)
+        return 2
+
+    try:
+        plan, written = asyncio.run(
+            _backfill_syndna_read_count(
+                database_url,
+                ticket_root=Path(scratch) / WORK_TICKET_SUBDIR,
+                execute=args.execute,
+            )
+        )
+    except (RuntimeError, ValueError, FileNotFoundError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    writable, residue = plan.writable(), plan.residue()
+    print(f"uncounted prep_samples : {len(plan.pairs)}")
+    print(f"with a file           : {len(writable)}")
+    print(f"without one           : {len(residue)}")
+    for pair in residue:
+        print(f"  mask {pair.mask_idx} prep_sample {pair.prep_sample_idx}: {pair.reason}")
+
+    if not plan.pairs:
+        print("\nnothing to do — every completed SynDNA-masked prep_sample has counts.")
+        return 0
+
+    if args.execute:
+        print(f"\nwrote counts for {written} prep_sample(s)")
+    else:
+        print(
+            f"\nDRY RUN — nothing written. Pass --execute to write counts for"
+            f" {len(writable)} prep_sample(s)."
+        )
+    return 0
+
+
 __all__ = [
     "_DB_CONNECT_TIMEOUT_SECONDS",
     "_DEFAULT_ORCHESTRATOR_VENV",
@@ -1262,8 +1422,10 @@ __all__ = [
     "_handle_compute_readiness",
     "_handle_login",
     "_handle_mask_delete",
+    "_backfill_assembly_genome",
     "_backfill_host_taxon_id",
     "_backfill_mask_adapter_hash",
+    "_handle_backfill_assembly_genome",
     "_handle_backfill_host_taxon_id",
     "_handle_backfill_mask_adapter_hash",
     "_handle_mask_purge_failed",

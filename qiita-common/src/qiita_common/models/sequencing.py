@@ -29,6 +29,7 @@ from qiita_common.models._base import (
     PatchRequestModel,
     PrepSampleCohort,
     ReadCounts,
+    check_withdrawal_reason,
 )
 from qiita_common.models.biosample import (
     MetadataChecklistRef,
@@ -207,14 +208,22 @@ class PoolReadMetrics(ReadCounts):
 SequencingRunResponse.model_rebuild()
 
 
-class SequencedPoolResponse(BaseModel):
-    """Returned by GET /api/v1/sequencing-run/{R}/sequenced-pool/{P}.
+class SequencedPoolSummary(BaseModel):
+    """One row of GET /api/v1/sequencing-run/{R}/sequenced-pool (the list view).
 
-    The pool's caller-visible metadata (the BYTEA `run_preflight_blob` is
-    omitted — only `run_preflight_filename` is surfaced) plus the compute-on-read
-    read-metric rollup. There is no stored pool-level metric: `read_metrics`
-    is aggregated from the constituent sequenced_samples at request time, so it
-    never drifts when a sample is re-processed or deleted."""
+    The pool's stored metadata and nothing computed. The BYTEA
+    `run_preflight_blob` is omitted here as it is on the single-pool read; only
+    `run_preflight_filename` is surfaced. It labels a pool rather than keying it:
+    the run's uniqueness indexes on filename and on preflight content are both
+    PARTIAL (`WHERE ... IS NOT NULL`), and the pair is co-populated or both NULL
+    (`sequenced_pool_run_preflight_pair_consistent`), so a non-NULL filename is
+    unique within its run while a run may hold any number of no-preflight pools
+    this field cannot tell apart. Those are distinguishable only by idx.
+
+    No `read_metrics`: that rollup aggregates every constituent sequenced_sample
+    at request time, and a list would pay it per row. The single-pool read
+    carries it for the one pool a caller picked out of this list.
+    """
 
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
     sequencing_run_idx: Annotated[int, Field(gt=0)]
@@ -222,7 +231,35 @@ class SequencedPoolResponse(BaseModel):
     extra_metadata: dict[str, Any] | None
     created_by_idx: Annotated[int, Field(gt=0)]
     created_at: AwareDatetime
+
+
+class SequencedPoolResponse(SequencedPoolSummary):
+    """Returned by GET /api/v1/sequencing-run/{R}/sequenced-pool/{P}.
+
+    The summary above plus the compute-on-read read-metric rollup. There is no
+    stored pool-level metric: `read_metrics` is aggregated from the constituent
+    sequenced_samples at request time, so it never drifts when a sample is
+    re-processed or deleted."""
+
     read_metrics: PoolReadMetrics
+
+
+class SequencedPoolListResponse(BaseModel):
+    """Returned by GET /api/v1/sequencing-run/{R}/sequenced-pool.
+
+    The pools of one run, ascending by `sequenced_pool_idx`, capped at the
+    route's hard limit; `truncated` is True when the run holds more than the page.
+    `sequencing_run_idx` is echoed so a stored response is self-describing.
+
+    This is the read that makes a `sequenced_pool_idx` obtainable: every other
+    pool-scoped route takes one as a path segment or a filter, and before this
+    nothing returned one.
+    """
+
+    sequencing_run_idx: Annotated[int, Field(gt=0)]
+    sequenced_pool: list[SequencedPoolSummary]
+    count: Annotated[int, Field(ge=0)]
+    truncated: bool = False
 
 
 class SampleQCReport(BaseModel):
@@ -407,29 +444,43 @@ class PoolCompletionStatus(BaseModel):
     no_data / failed / not_submitted (precedence highest-first when more than one
     bcl-convert ticket exists; not_submitted when there is none).
 
-    The per-sample buckets below — the HOST-MASKING stage: each non-retired
-    sequenced_sample classified by the state of its read-mask work tickets (any
-    version) and tallied into five mutually-exclusive buckets (precedence,
-    highest first, so a sample appears in exactly one):
-      completed     — has at least one COMPLETED read-mask ticket.
-      in_flight     — no COMPLETED ticket but at least one PENDING/QUEUED/
-                      PROCESSING (e.g. a re-submitted retry); work is ongoing.
-      no_data       — no COMPLETED and nothing in flight, but at least one
-                      NO_DATA (an empty/blank well — a terminal outcome that is
-                      NOT a failure). Outranks failed so a sample carrying both a
-                      no_data and a stale failed ticket counts as no_data.
-      failed        — no COMPLETED, nothing in flight, no NO_DATA, but at least
-                      one FAILED.
-      not_submitted — no read-mask ticket at all (e.g. a sample a partial
-                      submit-host-filter-pool fan-out never reached).
+    The per-sequenced_sample buckets below — the HOST-MASKING stage. Each
+    non-retired sequenced_sample lands in exactly one, by the precedence they are
+    listed in, and the seven sum to `sample_count`:
+
+      completed     — masked under at least one mask in scope.
+      invalidated   — not completed, and a masking run for it was withdrawn.
+                      Ranked above in_flight because a re-mask in progress does
+                      not make a withdrawn pass-set usable, and the question
+                      these buckets answer is "may I use this now".
+      in_flight     — neither of the above, and masking is outstanding: a ticket
+                      still running, or a gate row awaiting its flip.
+      no_data       — an empty/blank well. A terminal outcome that is NOT a
+                      failure, and it outranks the two below so a well that was
+                      retried-then-superseded still lets the pool reach
+                      `complete`.
+      cancelled     — an operator stopped it. Above failed because an operator
+                      cancels to stop a failing retry loop, so ranking it below
+                      would let the stale FAILED hide the deliberate stop — the
+                      thing `WorkTicketState` keeps CANCELLED distinct to avoid.
+      failed        — a masking ticket failed and nothing above applies.
+      not_submitted — the residual: nothing above claimed it. See
+                      `fetch_sequenced_pool_completion` for the one edge it also
+                      absorbs.
+
+    Which source decides which bucket, and how the masking gate and the work
+    tickets are resolved against each other, is on
+    `repositories.sequencing_run.fetch_sequenced_pool_completion`. Both sources
+    span the per-sample and the block masking paths.
 
     `complete` is the host-masking done flag: the pool is non-empty and every
-    sample is in a terminal-accounted state — COMPLETED or NO_DATA (so a plate
-    of real data with empty wells still reaches `complete=True`, and a
-    zero-sample pool reads `complete=False`, not vacuously true). `fully_processed`
-    is the end-to-end flag: demux completed AND `complete`. Everything is
-    compute-on-read over the work_ticket table, so it never drifts when a sample
-    is re-processed, re-submitted, or deleted."""
+    sequenced_sample is in a terminal-accounted state — completed or no_data (so
+    a plate of real data with empty wells still reaches `complete=True`, and a
+    zero-sample pool reads `complete=False`, not vacuously true). A withdrawn
+    sample is in neither bucket, so a pool holding one reads `complete=False`.
+    `fully_processed` is the end-to-end flag: demux completed AND `complete`.
+    Everything is compute-on-read, so it never drifts when a sample is
+    re-processed, re-submitted, withdrawn, or deleted."""
 
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
     sequencing_run_idx: Annotated[int, Field(gt=0)]
@@ -441,18 +492,21 @@ class PoolCompletionStatus(BaseModel):
     demux_state: Literal["completed", "in_flight", "no_data", "failed", "not_submitted"]
     sample_count: Annotated[int, Field(ge=0)]
     samples_completed: Annotated[int, Field(ge=0)]
+    samples_invalidated: Annotated[int, Field(ge=0)]
     samples_in_flight: Annotated[int, Field(ge=0)]
     samples_no_data: Annotated[int, Field(ge=0)]
     samples_failed: Annotated[int, Field(ge=0)]
+    samples_cancelled: Annotated[int, Field(ge=0)]
     samples_not_submitted: Annotated[int, Field(ge=0)]
 
     @computed_field  # type: ignore[prop-decorator]
     @property
     def complete(self) -> bool:
-        """True when the pool has samples and every one is in a terminal-
-        accounted state for HOST-MASKING: a COMPLETED read-mask ticket or a
-        NO_DATA (empty-well) outcome. Says nothing about demux — see
-        `fully_processed` for the end-to-end signal."""
+        """True when the pool has sequenced_samples and every one is in a
+        terminal-accounted state for HOST-MASKING: masked, or a NO_DATA
+        (empty-well) outcome. A withdrawn sample is in neither bucket and so
+        holds this False. Says nothing about demux — see `fully_processed` for
+        the end-to-end signal."""
         return (
             self.sample_count > 0
             and (self.samples_completed + self.samples_no_data) == self.sample_count
@@ -510,8 +564,13 @@ class PoolExceptionsResponse(BaseModel):
 
 
 class PoolReadMaskCoverage(BaseModel):
-    """Read-mask ticket coverage for a pool: how many non-retired samples have a
-    read-mask work ticket (any state) vs. none. `with + without == sample_count`."""
+    """Read-mask ticket coverage for a pool: how many non-retired
+    sequenced_samples have a read-mask work ticket (any state) vs. none.
+    `with + without == sample_count`.
+
+    "Has a ticket" is not "was masked" — a block ticket names no prep_sample
+    (`qiita_common.actions`) — so a block-masked sequenced_sample counts as
+    `without` here while `PoolCompletionStatus` reports it completed."""
 
     samples_with_read_mask_ticket: Annotated[int, Field(ge=0)]
     samples_without_read_mask_ticket: Annotated[int, Field(ge=0)]
@@ -522,11 +581,13 @@ class PoolWorkTicketSummary(BaseModel):
 
     The pool's read-mask work-ticket rollup with TICKETS (not samples) as the
     denominator — distinct from `PoolCompletionStatus`, whose per-sample buckets
-    collapse each sample's tickets by precedence. `read_mask` reconciles with the
-    completion rollup (`samples_with_read_mask_ticket` == `sample_count -
-    samples_not_submitted`); `ticket_state_counts` maps each work_ticket_state to
-    the number of the pool's read-mask tickets in it (states with zero tickets are
-    present with a 0 value). Compute-on-read."""
+    collapse each sequenced_sample's tickets by precedence. Both halves of this
+    response count read-mask TICKETS, so they share a denominator with each other
+    but not with the completion rollup, whose buckets are keyed on the masking
+    gate.
+    `ticket_state_counts` maps each work_ticket_state to the number of the pool's
+    read-mask tickets in it (states with zero tickets are present with a 0 value).
+    Compute-on-read."""
 
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
     sequencing_run_idx: Annotated[int, Field(gt=0)]
@@ -1050,6 +1111,49 @@ class MaskPrepSampleListResponse(BaseModel):
     sequenced_pool_idx: Annotated[int | None, Field(default=None, gt=0)] = None
 
 
+class SyndnaInsert(BaseModel):
+    """One insert of a mask's SynDNA reference. `accession` is the FASTA header the
+    reference load recorded, None where the load predates it."""
+
+    feature_idx: Annotated[int, Field(gt=0)]
+    accession: str | None = None
+
+
+class SyndnaReadCountSample(BaseModel):
+    """One prep_sample's per-insert read counts, in `SyndnaReadCountResponse.inserts`
+    order. `sequenced_pool_idx` is None for a prep_sample that was never pooled."""
+
+    prep_sample_idx: Annotated[int, Field(gt=0)]
+    biosample_accession: str | None = None
+    sequenced_pool_idx: Annotated[int | None, Field(default=None, gt=0)] = None
+    read_counts: list[Annotated[int, Field(ge=0)]]
+
+
+class SyndnaReadCountResponse(BaseModel):
+    """Returned by GET /api/v1/mask-definition/{mask_idx}/syndna-read-count.
+
+    Every selected prep_sample is 'completed' under the mask and counted; the route
+    refuses rather than returning a partial table. The counts are reads with a
+    mapped primary alignment to each insert, ungated (see qiita.syndna_read_count).
+    """
+
+    mask_idx: Annotated[int, Field(gt=0)]
+    reference_idx: Annotated[int, Field(gt=0)]
+    inserts: list[SyndnaInsert]
+    samples: list[SyndnaReadCountSample]
+
+    @model_validator(mode="after")
+    def _counts_follow_inserts(self) -> SyndnaReadCountResponse:
+        width = len(self.inserts)
+        for sample in self.samples:
+            if len(sample.read_counts) != width:
+                raise ValueError(
+                    f"prep_sample {sample.prep_sample_idx} carries"
+                    f" {len(sample.read_counts)} counts for {width} inserts"
+                )
+        return self
+
+
 class MaskDefinitionStatusUpdate(BaseModel):
     """Body for PATCH /api/v1/mask-definition/{mask_idx}/status.
 
@@ -1068,14 +1172,15 @@ class MaskDefinitionStatusUpdate(BaseModel):
 
     @model_validator(mode="after")
     def _reason_required_to_deprecate(self) -> MaskDefinitionStatusUpdate:
-        if self.status is MaskDefinitionStatus.DEPRECATED:
-            if self.reason is None or not self.reason.strip():
-                raise ValueError("reason is required when status is 'deprecated'")
-        else:
-            if self.reason is not None:
-                raise ValueError("reason is only accepted when status is 'deprecated'")
-            if self.superseded_by is not None:
-                raise ValueError("superseded_by is only accepted when status is 'deprecated'")
+        deprecating = self.status is MaskDefinitionStatus.DEPRECATED
+        check_withdrawal_reason(
+            withdrawing=deprecating,
+            reason=self.reason,
+            field="status",
+            value=MaskDefinitionStatus.DEPRECATED.value,
+        )
+        if not deprecating and self.superseded_by is not None:
+            raise ValueError("superseded_by is only accepted when status is 'deprecated'")
         return self
 
 
@@ -1100,11 +1205,12 @@ class MaskSampleStatusUpdate(BaseModel):
 
     @model_validator(mode="after")
     def _reason_required_to_invalidate(self) -> MaskSampleStatusUpdate:
-        if self.state == "invalidated":
-            if self.reason is None or not self.reason.strip():
-                raise ValueError("reason is required when state is 'invalidated'")
-        elif self.reason is not None:
-            raise ValueError("reason is only accepted when state is 'invalidated'")
+        check_withdrawal_reason(
+            withdrawing=self.state == "invalidated",
+            reason=self.reason,
+            field="state",
+            value="invalidated",
+        )
         if len(set(self.prep_sample_idx)) != len(self.prep_sample_idx):
             raise ValueError("prep_sample_idx must not repeat")
         return self

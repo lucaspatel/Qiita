@@ -1,15 +1,4 @@
-"""Integration tests for the POST /api/v1/study/{study_idx}/biosample route.
-
-Exercises wet_lab_admin and system_admin happy paths, the scope and
-study-existence guards, the per-study ADMIN-access guard
-(`require_study_access(min_tier=Tier.ADMIN, bypass_role=WET_LAB_ADMIN)`
-— regular users who own a study or carry an ADMIN study_access row
-may create biosamples there), the parametrised owner-eligibility 422
-surface, the metadata dict's validation 422s (unknown field, parse
-failure, owner-id collision), Pydantic body validation, and DB-level
-exception-mapping (409 / 422). Regular-user 403 paths cover both the
-no-access-row and the below-admin-tier cases.
-"""
+"""Integration tests for the biosample routes."""
 
 import secrets
 from datetime import date
@@ -56,12 +45,15 @@ from .conftest import (
     OWNER_INELIGIBILITY_KINDS,
     STUDY_FIELD_CREATE_AUTHZ_CASES,
     STUDY_FIELD_CREATE_CONFLICT_CASES,
+    STUDY_FIELD_LIST_AUTHZ_CASES,
     IneligibilityKind,
     _grant_study_access,
     _seed_study,
     assert_owner_ineligibility_422,
     assert_study_field_create_authz,
     assert_study_field_create_conflict,
+    assert_study_field_get_authz,
+    assert_study_field_list_authz,
     delete_idxs,
     etag_for_row,
     post_study_field,
@@ -175,13 +167,6 @@ async def ctx(role_keyed_clients):
     }
     yield {**role_keyed_clients, "created": created}
     await _cleanup_tracked(role_keyed_clients["pool"], created)
-
-
-@pytest_asyncio.fixture
-async def no_biosample_write_client(make_pat_client):
-    """A regular_user PAT with a scope set that EXCLUDES Scope.BIOSAMPLE_WRITE —
-    drives the require_scope guard's missing-scope 403."""
-    return await make_pat_client(label="bs-no-write", scopes=[Scope.SELF_PROFILE])
 
 
 # ---------------------------------------------------------------------------
@@ -2434,7 +2419,7 @@ async def _etag_for(pool, bs_idx: int) -> str:
     conftest helper so the test-file call sites keep their existing
     two-argument shape.
     """
-    return await etag_for_row(pool, table="biosample", row_idx=bs_idx)
+    return await etag_for_row(pool, table="qiita.biosample", row_idx=bs_idx)
 
 
 async def _seed_biosample_for_patch(ctx) -> int:
@@ -3152,8 +3137,10 @@ async def test_create_biosample_field_admin_local(ctx):
         "required": False,
         "terminology_idx": None,
         "tier_override": None,
+        "unique_in_study": False,
         "created_by_idx": ctx["user_session"]["principal_idx"],
         "created_at": body["created_at"],
+        "updated_at": body["updated_at"],
     }
     assert body == expected
 
@@ -3203,8 +3190,10 @@ async def test_create_biosample_field_admin_linked_inherits(ctx):
         "required": False,
         "terminology_idx": None,
         "tier_override": None,
+        "unique_in_study": False,
         "created_by_idx": ctx["user_session"]["principal_idx"],
         "created_at": body["created_at"],
+        "updated_at": body["updated_at"],
     }
     assert body == expected
 
@@ -3286,6 +3275,72 @@ async def _patch_biosample_metadata(
         URL_BIOSAMPLE_METADATA_BY_STUDY.format(study_idx=study_idx, biosample_idx=biosample_idx),
         json=body,
     )
+
+
+async def _seed_study_with_unique_field(ctx, *, suffix, unique_in_study=True):
+    """Seed a wet-owned study carrying one purely-local text field. Returns
+    (study_idx, display_name, study_field_idx).
+
+    unique_in_study False seeds the field without the policy, for a test that
+    writes values first and switches the policy on afterwards.
+    """
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix=suffix)
+    display_name = unique_field_name("Uniq")
+    created = await ctx["wet"].post(
+        URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY.format(study_idx=study_idx),
+        json={
+            "display_name": display_name,
+            "data_type": "text",
+            "unique_in_study": unique_in_study,
+        },
+    )
+    assert created.status_code == 201, created.text
+    field_idx = created.json()["biosample_study_field_idx"]
+    ctx["created"]["biosample_study_field"].append(field_idx)
+    return study_idx, display_name, field_idx
+
+
+async def test_patch_biosample_metadata_duplicate_on_unique_field_409(ctx):
+    """Tests the case where a second biosample is given a value another
+    biosample in the study already holds through a unique_in_study field:
+    the collision answers 409 rather than reaching the caller as a 500.
+    """
+    study_idx, display_name, _ = await _seed_study_with_unique_field(ctx, suffix="uniq-dup")
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    first_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
+    second_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
+
+    first = await _patch_biosample_metadata(
+        ctx["wet"], study_idx, first_idx, {display_name: "Sample 1"}
+    )
+    assert first.status_code == 200, first.text
+    await track_biosample_metadata_outputs(ctx["pool"], ctx["created"], first_idx, study_idx, [])
+
+    second = await _patch_biosample_metadata(
+        ctx["wet"], study_idx, second_idx, {display_name: "Sample 1"}
+    )
+
+    assert second.status_code == 409, second.text
+    assert "is unique within this study" in second.json()["detail"]
+
+
+async def test_patch_biosample_metadata_missing_marker_on_unique_field_422(ctx):
+    """Tests the case where a unique_in_study field is given a missing-value
+    marker: the field cannot hold one, and the refusal is a 422.
+    """
+    study_idx, display_name, _ = await _seed_study_with_unique_field(ctx, suffix="uniq-miss")
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    bs_idx = await _seed_link_to_study(ctx, study_idx=study_idx, owner_idx=wet_idx)
+
+    resp = await _patch_biosample_metadata(
+        ctx["wet"], study_idx, bs_idx, {display_name: "not applicable"}
+    )
+
+    assert resp.status_code == 422, resp.text
+    # Assert the reason, not just the field name: an unknown-field or parse
+    # rejection would also be a 422 naming this field.
+    assert "cannot be given a missing-value marker" in resp.json()["detail"]
 
 
 async def _seed_linked_biosample_and_global_field(ctx, *, suffix, data_type=FieldDataType.TEXT):
@@ -3974,3 +4029,329 @@ async def test_patch_biosample_metadata_admin_tier_writes(ctx):
             }
         }
     }
+
+
+# ===========================================================================
+# GET /api/v1/study/{study_idx}/biosample-field
+# ===========================================================================
+
+
+async def _list_biosample_fields(client, study_idx: int):
+    return await client.get(BIOSAMPLE_FIELD_SURFACE.url_template.format(study_idx=study_idx))
+
+
+async def test_list_biosample_fields_in_study_resolves_linked_and_local(ctx):
+    """Tests the case where a study carries one globally-linked and one
+    purely-local field: both come back ordered by display_name, the linked one
+    with data_type, required, and terminology_idx resolved from its global row.
+
+    The global row's three inherited columns all differ from the local field's,
+    so each one discriminates whether the read resolved it or fell back to the
+    study row.
+    """
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="lf-mix"
+    )
+    # Reuse the seeded NCBI Taxonomy so the global field can be TERMINOLOGY,
+    # which the local field cannot be without a terminology of its own.
+    terminology_idx = (await fetch_seeded_metagenome_term(ctx["pool"]))["terminology_idx"]
+    suffix = secrets.token_hex(4)
+    global_idx = await seed_biosample_global_field(
+        ctx["pool"],
+        internal_name=f"lf_{suffix}",
+        display_name=f"Global {suffix}",
+        data_type=FieldDataType.TERMINOLOGY,
+        created_by_idx=SYSTEM_PRINCIPAL_IDX,
+        terminology_idx=terminology_idx,
+        required=True,
+    )
+    ctx["created"]["biosample_global_field"].append(global_idx)
+
+    # Names chosen so the local field sorts first, proving the ORDER BY rather
+    # than insertion order.
+    local_name = unique_field_name("AAA-local")
+    linked_name = unique_field_name("ZZZ-linked")
+    local_resp = await _post_biosample_field(
+        ctx["user"], ctx, study_idx, display_name=local_name, data_type="text"
+    )
+    assert local_resp.status_code == 201, local_resp.text
+    linked_resp = await _post_biosample_field(
+        ctx["user"], ctx, study_idx, display_name=linked_name, biosample_global_field_idx=global_idx
+    )
+    assert linked_resp.status_code == 201, linked_resp.text
+
+    resp = await _list_biosample_fields(ctx["user"], study_idx)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    expected = [
+        {
+            "biosample_study_field_idx": body[0]["biosample_study_field_idx"],
+            "created_at": body[0]["created_at"],
+            "updated_at": body[0]["updated_at"],
+            "study_idx": study_idx,
+            "biosample_global_field_idx": None,
+            "display_name": local_name,
+            "description": None,
+            "data_type": "text",
+            "required": False,
+            "terminology_idx": None,
+            "tier_override": None,
+            "unique_in_study": False,
+            "created_by_idx": ctx["user_session"]["principal_idx"],
+        },
+        {
+            "biosample_study_field_idx": body[1]["biosample_study_field_idx"],
+            "created_at": body[1]["created_at"],
+            "updated_at": body[1]["updated_at"],
+            "study_idx": study_idx,
+            "biosample_global_field_idx": global_idx,
+            "display_name": linked_name,
+            "description": None,
+            "data_type": "terminology",
+            "required": True,
+            "terminology_idx": terminology_idx,
+            "tier_override": None,
+            "unique_in_study": False,
+            "created_by_idx": ctx["user_session"]["principal_idx"],
+        },
+    ]
+    assert body == expected
+
+
+async def test_list_biosample_fields_in_study_no_fields_empty(ctx):
+    """Tests the case where the study exists but carries no fields: the route
+    returns an empty list rather than a 404."""
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="lf-empty"
+    )
+
+    resp = await _list_biosample_fields(ctx["user"], study_idx)
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == []
+
+
+async def test_list_biosample_fields_in_study_excludes_other_studies(ctx):
+    """Tests the case where two studies each carry a field: the response is
+    scoped to the path's study only."""
+    owner_idx = ctx["user_session"]["principal_idx"]
+    study_a = await _seed_study(ctx, owner_idx=owner_idx, suffix="lf-sa")
+    study_b = await _seed_study(ctx, owner_idx=owner_idx, suffix="lf-sb")
+    name_a = unique_field_name("OnlyA")
+    for study_idx, name in ((study_a, name_a), (study_b, unique_field_name("OnlyB"))):
+        created = await _post_biosample_field(
+            ctx["user"], ctx, study_idx, display_name=name, data_type="text"
+        )
+        assert created.status_code == 201, created.text
+
+    resp = await _list_biosample_fields(ctx["user"], study_a)
+    assert resp.status_code == 200, resp.text
+    assert [row["display_name"] for row in resp.json()] == [name_a]
+
+
+async def test_list_biosample_fields_in_study_anonymous_401(ctx):
+    """Tests the case where an unauthenticated caller hits the route: the
+    require_human gate rejects with 401 even for a real study."""
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="lf-anon"
+    )
+
+    from qiita_control_plane.main import app
+
+    app.state.pool = ctx["pool"]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
+        resp = await _list_biosample_fields(anon, study_idx)
+    assert resp.status_code == 401
+
+
+@pytest.mark.parametrize("case", STUDY_FIELD_LIST_AUTHZ_CASES)
+async def test_list_biosample_fields_in_study_authz(ctx, case, no_biosample_read_client):
+    """Tests the case where each row of the shared list access matrix calls the
+    route: owner, viewer/member/admin grants, and wet_lab_admin bypass are
+    admitted; no access and a missing scope are refused; a nonexistent study is
+    404 even for a role-bypass caller.
+    """
+    await assert_study_field_list_authz(
+        ctx,
+        case=case,
+        surface=BIOSAMPLE_FIELD_SURFACE,
+        no_scope_client=no_biosample_read_client,
+    )
+
+
+@pytest.mark.parametrize("case", STUDY_FIELD_LIST_AUTHZ_CASES)
+async def test_get_biosample_field_authz(ctx, case, no_biosample_read_client):
+    """Tests the case where each row of the shared list access matrix calls the
+    read-one route: it sits at the same viewer floor as the list, since both
+    return a field definition and no metadata value.
+    """
+    await assert_study_field_get_authz(
+        ctx,
+        case=case,
+        surface=BIOSAMPLE_FIELD_SURFACE,
+        no_scope_client=no_biosample_read_client,
+    )
+
+
+async def test_import_biosample_mints_owner_id_field_unique_in_study(ctx):
+    """Tests the case where an import creates the owner-id field: it is minted
+    already declaring that its values identify the study's samples.
+    """
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="uniq-mint"
+    )
+
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=unique_field_name(),
+        owner_biosample_id_value="Sample 1",
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["owner_id_biosample_study_field_created"] is True
+    flagged = await ctx["pool"].fetchval(
+        "SELECT unique_in_study FROM qiita.biosample_study_field WHERE idx = $1",
+        resp.json()["owner_id_biosample_study_field_idx"],
+    )
+    assert flagged is True
+
+
+async def test_import_biosample_rejects_owner_id_field_not_unique_in_study(ctx):
+    """Tests the case where the named field already exists without the policy:
+    the import is refused rather than treating a field that guarantees no
+    distinctness as the owner's identifier.
+    """
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="uniq-unflagged"
+    )
+    field_name = unique_field_name()
+    created = await ctx["wet"].post(
+        URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY.format(study_idx=study_idx),
+        json={"display_name": field_name, "data_type": "text"},
+    )
+    assert created.status_code == 201, created.text
+    ctx["created"]["biosample_study_field"].append(created.json()["biosample_study_field_idx"])
+
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=field_name,
+        owner_biosample_id_value="Sample 1",
+    )
+
+    assert resp.status_code == 409, resp.text
+    assert "does not declare its values unique within this study" in resp.json()["detail"]
+
+
+async def test_import_biosample_accepts_owner_id_field_already_unique_in_study(ctx):
+    """Tests the case where the named field already exists WITH the policy:
+    the import proceeds, so declaring the field up front is a supported flow.
+    """
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="uniq-preflagged"
+    )
+    field_name = unique_field_name()
+    created = await ctx["wet"].post(
+        URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY.format(study_idx=study_idx),
+        json={"display_name": field_name, "data_type": "text", "unique_in_study": True},
+    )
+    assert created.status_code == 201, created.text
+    ctx["created"]["biosample_study_field"].append(created.json()["biosample_study_field_idx"])
+
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=field_name,
+        owner_biosample_id_value="Sample 1",
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["owner_id_biosample_study_field_created"] is False
+
+
+async def test_import_biosample_rejects_owner_id_field_not_text(ctx):
+    """Tests the case where the named field is eligible for the uniqueness
+    policy but stores a non-text value: the import is refused up front rather
+    than writing text into a numeric field and failing deep in the database.
+    """
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="uniq-numeric"
+    )
+    field_name = unique_field_name()
+    created = await ctx["wet"].post(
+        URL_BIOSAMPLE_STUDY_FIELD_BY_STUDY.format(study_idx=study_idx),
+        json={"display_name": field_name, "data_type": "numeric", "unique_in_study": True},
+    )
+    assert created.status_code == 201, created.text
+    ctx["created"]["biosample_study_field"].append(created.json()["biosample_study_field_idx"])
+
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=field_name,
+        owner_biosample_id_value="Sample 1",
+    )
+
+    assert resp.status_code == 409, resp.text
+    assert "does not store text" in resp.json()["detail"]
+
+
+async def test_import_biosample_rejects_repeated_owner_id_in_one_study(ctx):
+    """Tests the case where a second biosample claims an owner id the study
+    already holds: the refusal names the value, not a generic conflict.
+    """
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["wet_session"]["principal_idx"], suffix="uniq-repeat"
+    )
+    field_name = unique_field_name()
+    first = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=field_name,
+        owner_biosample_id_value="Sample 1",
+    )
+    assert first.status_code == 201, first.text
+
+    resp = await _post_biosample(
+        ctx["wet"],
+        ctx,
+        study_idx,
+        owner_idx=ctx["wet_session"]["principal_idx"],
+        owner_biosample_id_field_name=field_name,
+        owner_biosample_id_value="Sample 1",
+    )
+
+    assert resp.status_code == 409, resp.text
+    assert f"already used by another biosample through {field_name!r}" in resp.json()["detail"]
+
+
+async def test_import_biosample_allows_same_owner_id_in_another_study(ctx):
+    """Tests the case where one owner names samples the same way in two
+    studies: the policy is per-study, so the second study is unaffected by
+    the first's values.
+    """
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    first_study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix="uniq-study-a")
+    second_study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix="uniq-study-b")
+    field_name = unique_field_name()
+
+    for study_idx in (first_study_idx, second_study_idx):
+        resp = await _post_biosample(
+            ctx["wet"],
+            ctx,
+            study_idx,
+            owner_idx=wet_idx,
+            owner_biosample_id_field_name=field_name,
+            owner_biosample_id_value="Sample 1",
+        )
+        assert resp.status_code == 201, resp.text

@@ -23,24 +23,25 @@ The read side answers three questions a client otherwise needs a psql shell for:
 which masks exist (`list_mask_definitions`), what one mask encodes
 (`fetch_mask_definition_by_idx`), and which samples are masked under it
 (`fetch_mask_prep_samples`). The two list reads resolve a sample's masking state
-the same way and narrow to the samples the caller may see; the shared SQL
-fragments that do so are defined once below and interpolated into each query.
+the same way, from the `masked_sample` CTE defined once below, and narrow to the
+samples the caller may see via the shared `_sample_scope.sample_scope_sql` — the
+same narrowing the assembly roster applies.
 """
 
 import json
-from typing import Literal, get_args
+from typing import Literal
 
 import asyncpg
 from qiita_common.actions import PER_SAMPLE_MASK_ACTION_IDS
 from qiita_common.hashing import canonical_params_hash
 from qiita_common.models import (
     MaskDefinitionStatus,
-    MaskSampleState,
-    Tier,
     WorkTicketState,
 )
 
 from . import require_transaction
+from ._sample_scope import sample_scope_sql
+from .block import MASK_SAMPLE_COMPLETED, MASK_SAMPLE_INVALIDATED, MASK_SAMPLE_PENDING
 
 # Column projection backing every MaskDefinition response. Defined once because
 # three readers (the mint, the by-idx fetch, and the list) return the same shape,
@@ -72,29 +73,6 @@ class MaskDefinitionDeprecated(Exception):
         self.detail = detail
         super().__init__(detail)
 
-
-def _state_literal(value: str) -> str:
-    """Assert `value` is a MaskSampleState member and return it.
-
-    A membership check, not a lookup: the string is still written here. What it
-    buys is that a renamed or removed member fails at import instead of silently
-    matching no rows."""
-    members = get_args(MaskSampleState)
-    if value not in members:
-        raise ValueError(f"{value!r} is not a MaskSampleState; have {members}")
-    return value
-
-
-# The mask_sample states this module writes into SQL, each asserted against the
-# wire type so a renamed member fails at import rather than matching no rows.
-# Looked up by value, not by position: the Literal has three members and the
-# roster CTE synthesizes only two — 'invalidated' can only be read off an
-# existing mask_sample row.
-_MASK_STATE_PENDING, _MASK_STATE_COMPLETED, _MASK_STATE_INVALIDATED = (
-    _state_literal("pending"),
-    _state_literal("completed"),
-    _state_literal("invalidated"),
-)
 
 # Per-(mask, sample) masking state.
 #
@@ -183,50 +161,13 @@ masked_sample AS (
 _MASKED_SAMPLE_ARGS: tuple = (
     list(PER_SAMPLE_MASK_ACTION_IDS),
     WorkTicketState.COMPLETED.value,
-    _MASK_STATE_COMPLETED,
-    _MASK_STATE_PENDING,
+    MASK_SAMPLE_COMPLETED,
+    MASK_SAMPLE_PENDING,
 )
 
-# The per-study narrowing predicate for a plain user: a correlated NOT EXISTS over
-# `msk.prep_sample_idx`, admitting a sample only when no linked study denies it.
-#
-# SQL restatement of the policy the submission gate applies in Python
-# (`auth.guards.require_caller_has_admin_on_all_studies`, as reached from
-# routes/work_ticket.py). Arm for arm: the caller must hold Tier.ADMIN — or own the
-# study — on EVERY non-retired link; a study row that does not exist is skipped
-# (inner JOIN); a sample whose links are all retired is admitted (vacuous NOT
-# EXISTS). Nothing pins the two together, so a change to either belongs in a PR
-# that changes both — the guard carries the reciprocal note.
-#
-# Composition note: as a GATE the orphan case means "you already named the sample".
-# As a FILTER it means every study-less prep_sample is visible to every caller.
-#
-# `{caller}` is the positional parameter holding the caller's principal_idx;
-# `{tier}` the one holding the required tier.
-_CALLER_MAY_SEE_SAMPLE = """
-    NOT EXISTS (
-        SELECT 1
-          FROM qiita.prep_sample_to_study pts
-          JOIN qiita.study s ON s.idx = pts.study_idx
-          LEFT JOIN qiita.study_access sa
-            ON sa.study_idx = pts.study_idx AND sa.principal_idx = {caller}
-         WHERE pts.prep_sample_idx = msk.prep_sample_idx
-           AND pts.retired = false
-           AND s.owner_idx IS DISTINCT FROM {caller}
-           AND (sa.access_tier IS NULL OR sa.access_tier <> {tier}::qiita.tier)
-    )
-"""
-
-# Both reads exclude an entity-retired prep_sample, so the list's tally and the
-# roster it invites the caller to fetch count the same set. Applied to the shared
-# `masked_sample` CTE, not to either query alone. Distinct from the
-# `prep_sample_to_study.retired` LINK flag inside the predicate above.
-_SAMPLE_NOT_RETIRED = """
-    EXISTS (
-        SELECT 1 FROM qiita.prep_sample ps_live
-         WHERE ps_live.idx = msk.prep_sample_idx AND ps_live.retired = false
-    )
-"""
+# The alias both queries below give the `masked_sample` CTE. `sample_scope_sql`
+# correlates its clauses on `<alias>.prep_sample_idx`, so the two have to agree.
+_ROSTER_ALIAS = "msk"
 
 # Value stamped on qiita.mask_definition.adapter_hash_scheme for a row whose
 # params.resolved_qc.adapter_set_hash came from the reference's sorted
@@ -235,14 +176,15 @@ _SAMPLE_NOT_RETIRED = """
 # CHECK constraint in the 20260804000000 migration; adding a value changes both.
 ADAPTER_HASH_SCHEME_SEQUENCE_HASH = "sequence_hash_v1"
 
-# The two `params` keys addressing the adapter identity inside the blob
-# `runner._mask._build_mask_params` produces. They live here, not next to that
-# builder, because this module and the re-key backfill both address the path
-# without going through it — the scheme stamp below, the backfill's SQL, and its
-# params rewrite — and the repository is what every one of them already imports.
-# A rename in the builder has to reach these.
+# `params` keys inside the blob `runner._mask._build_mask_params` produces. They
+# live here, not next to that builder, because readers address the paths without
+# going through it — the adapter scheme stamp below, the re-key backfill's SQL and
+# params rewrite, and the SynDNA read-count reads — and the repository is what
+# every one of them already imports. A rename in the builder has to reach these.
 RESOLVED_QC_KEY = "resolved_qc"
 ADAPTER_SET_HASH_KEY = "adapter_set_hash"
+RESOLVED_SYNDNA_KEY = "resolved_syndna"
+SYNDNA_REFERENCE_IDX_KEY = "reference_idx"
 # The same path as a Postgres jsonb text accessor:
 # `params->'resolved_qc'->>'adapter_set_hash'`.
 ADAPTER_SET_HASH_JSON_PATH = f"'{RESOLVED_QC_KEY}'->>'{ADAPTER_SET_HASH_KEY}'"
@@ -335,51 +277,6 @@ async def fetch_mask_definition_by_idx(
     )
 
 
-def _sample_scope_sql(
-    *,
-    args: list,
-    sequenced_pool_idx: int | None,
-    prep_sample_idx: int | None,
-    visible_to_principal_idx: int | None,
-) -> tuple[str, bool]:
-    """Build the `masked_sample` narrowing clauses, appending each bound value to
-    `args`. Returns (sql, narrowed), where `narrowed` is True iff a caller-supplied
-    narrowing was applied.
-
-    The SQL is ANDed onto a query whose FROM carries the `masked_sample` CTE
-    aliased `msk`. The retirement exclusion is unconditional and does not count as
-    a narrowing — it bounds both reads identically rather than reflecting anything
-    the caller asked for. The three that do: `sequenced_pool_idx` joins through
-    qiita.sequenced_sample, `prep_sample_idx` matches directly, and
-    `visible_to_principal_idx` applies the per-study predicate. Pass None for
-    `visible_to_principal_idx` only for a caller holding the bypass role — it
-    means "see every sample".
-    """
-    clauses = f" AND {_SAMPLE_NOT_RETIRED}"
-    narrowed = False
-    if sequenced_pool_idx is not None:
-        narrowed = True
-        args.append(sequenced_pool_idx)
-        clauses += (
-            f" AND EXISTS (SELECT 1 FROM qiita.sequenced_sample ss"
-            f"              WHERE ss.prep_sample_idx = msk.prep_sample_idx"
-            f"                AND ss.sequenced_pool_idx = ${len(args)})"
-        )
-    if prep_sample_idx is not None:
-        narrowed = True
-        args.append(prep_sample_idx)
-        clauses += f" AND msk.prep_sample_idx = ${len(args)}"
-    if visible_to_principal_idx is not None:
-        narrowed = True
-        args.append(visible_to_principal_idx)
-        caller_param = f"${len(args)}"
-        args.append(Tier.ADMIN.value)
-        clauses += " AND " + _CALLER_MAY_SEE_SAMPLE.format(
-            caller=caller_param, tier=f"${len(args)}"
-        )
-    return clauses, narrowed
-
-
 async def list_mask_definitions(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     *,
@@ -419,9 +316,12 @@ async def list_mask_definitions(
     length > cap means the set exceeded the cap.
     """
     args: list = [*_MASKED_SAMPLE_ARGS]
-    args.append(_MASK_STATE_INVALIDATED)
+    # Not a leading bind: the roster CTE synthesizes only `pending` and `completed`,
+    # and `invalidated` can only be read off an existing mask_sample row.
+    args.append(MASK_SAMPLE_INVALIDATED)
     invalidated_param = f"${len(args)}"
-    scope, narrowed = _sample_scope_sql(
+    scope, narrowed = sample_scope_sql(
+        alias=_ROSTER_ALIAS,
         args=args,
         sequenced_pool_idx=sequenced_pool_idx,
         prep_sample_idx=prep_sample_idx,
@@ -488,7 +388,8 @@ async def fetch_mask_prep_samples(
     """
     args: list = [*_MASKED_SAMPLE_ARGS, mask_idx]
     mask_param = f"${len(args)}"
-    scope, _narrowed = _sample_scope_sql(
+    scope, _narrowed = sample_scope_sql(
+        alias=_ROSTER_ALIAS,
         args=args,
         sequenced_pool_idx=sequenced_pool_idx,
         prep_sample_idx=None,
@@ -601,11 +502,11 @@ async def set_mask_sample_states(
         )
     }
     not_found = [idx for idx in prep_sample_idxs if idx not in present]
-    skipped_pending = [idx for idx, st in present.items() if st == _MASK_STATE_PENDING]
+    skipped_pending = [idx for idx, st in present.items() if st == MASK_SAMPLE_PENDING]
     unchanged = [idx for idx, st in present.items() if st == state]
-    to_update = [idx for idx, st in present.items() if st not in (state, _MASK_STATE_PENDING)]
+    to_update = [idx for idx, st in present.items() if st not in (state, MASK_SAMPLE_PENDING)]
     if to_update:
-        invalidating = state == _MASK_STATE_INVALIDATED
+        invalidating = state == MASK_SAMPLE_INVALIDATED
         await conn.execute(
             "UPDATE qiita.mask_sample"
             "    SET state = $3,"

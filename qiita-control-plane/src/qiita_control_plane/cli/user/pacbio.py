@@ -18,7 +18,7 @@ rather than as a single BCL run bcl-convert demuxes in-workflow:
      across cells is real and cannot be disambiguated by barcode alone. The
      preflight now records the SMRT cell per sample (`smrt_cell`, from the reader),
      so a follow-up can key resolution on `(smrt_cell, barcode)` and drop that
-     collision guard — see `_index_run_bams`. (The sample identity / pool-item-id
+     collision guard — see `qiita_common.pacbio.index_run_bams`. (The sample identity / pool-item-id
      is `pacbio_sample_idx`, never the barcode; the barcode is only the BAM key.)
 
 Preflight read: per-sample PacBio facts come from kl-run-preflight's
@@ -40,15 +40,18 @@ from qiita_common.api_paths import (
     PATH_WORK_TICKET_PREFIX,
 )
 from qiita_common.models import (
+    PacbioRunIndex,
     Platform,
     ScopeTargetKind,
     SequencedPoolCreateRequest,
     SequencingRunCreateRequest,
     WorkTicketCreateRequest,
+    WorkTicketState,
 )
 
 from ...preflight import SHEET_TYPE_PACBIO_ABSQUANT
 from .. import _common
+from ._helpers import _inspect_run_folder, _load_preflight_conn
 from .pool import _provision_run_pool_roster
 
 # action_id + version for the per-sample read loader this command fans out to.
@@ -65,13 +68,6 @@ _BAM_TO_PARQUET_ACTION_VERSION = "1.0.0"
 # client (this ingest) and the server (the roster's protocol read-back).
 _SHEET_TYPE_ABSQUANT = SHEET_TYPE_PACBIO_ABSQUANT
 _SHEET_TYPE_METAG = "pacbio_metag"
-
-# Per-cell reads PacBio's demux could not assign to a barcode; never a sample.
-_UNASSIGNED_BAM_SUFFIX = ".unassigned.bam"
-
-# Per-SMRT-cell subdirectory holding demultiplexed HiFi BAMs, and the filename
-# field that names it: `{run}/{well}/hifi_reads/{movie}.hifi_reads.{barcode}.bam`.
-_HIFI_READS_DIR = "hifi_reads"
 
 
 class _PacbioPreflightRow(NamedTuple):
@@ -107,7 +103,7 @@ class _PacbioPreflightRow(NamedTuple):
 def _read_pacbio_preflight_rows(
     preflight_blob: Path, parser: argparse.ArgumentParser
 ) -> list[_PacbioPreflightRow]:
-    """Open the preflight SQLite and return one `_PacbioPreflightRow` per PacBio sample.
+    """Load the preflight SQLite and return one `_PacbioPreflightRow` per `pacbio_sample` row.
 
     Reads via kl-run-preflight's `get_pacbio_sample_info` (the PacBio analogue of
     `get_illumina_sample_info` that `pool._read_preflight_rows` uses): per sample it
@@ -118,21 +114,15 @@ def _read_pacbio_preflight_rows(
     The `pacbio_sample_idx` it returns is the sample's unique id (used as the
     pool-item-id).
 
-    Operator-actionable errors (not a SQLite, a non-PacBio sheet, an empty sample
-    set, a missing accession, or an impossible protocol combo) raise via
-    `parser.error` so the CLI surfaces one stderr line and exits 2 before any
+    Operator-actionable errors (an unloadable preflight, a non-PacBio sheet, no
+    `pacbio_sample` rows, a missing accession, or an impossible protocol combo) raise
+    via `parser.error` so the CLI surfaces one stderr line and exits 2 before any
     network call — matching `_read_preflight_rows`.
     """
-    from run_preflight import get_pacbio_sample_info, load_file  # noqa: PLC0415
+    from run_preflight import get_pacbio_sample_info  # noqa: PLC0415
     from run_preflight.db import get_run_legacy_format, get_single_run_idx  # noqa: PLC0415
 
-    try:
-        conn = load_file(preflight_blob)
-    except (FileNotFoundError, sqlite3.DatabaseError, ValueError) as exc:
-        # load_file's error contract: FileNotFoundError (no such path),
-        # sqlite3.DatabaseError (truncated SQLite), ValueError (not a SQLite / bad
-        # legacy CSV). All mean "not a usable preflight file" here.
-        parser.error(f"--preflight-blob {preflight_blob}: not a readable SQLite file: {exc}")
+    conn = _load_preflight_conn(preflight_blob, parser, flag="--preflight-blob")
     try:
         run_idx = get_single_run_idx(conn)
         legacy_format = get_run_legacy_format(conn.cursor(), run_idx)
@@ -252,53 +242,17 @@ def _validate_pacbio_protocol(
         )
 
 
-def _index_run_bams(run_folder: Path) -> tuple[dict[str, Path], set[str]]:
-    """Index a PacBio run folder's per-barcode HiFi BAMs.
-
-    Globs `{run_folder}/*/hifi_reads/*.bam` — each SMRT cell is a well
-    subdirectory (`1_A01`, `1_B01`, ...) holding its demultiplexed reads — and
-    keys each BAM on its barcode, the second-to-last dot field of the filename
-    (`m84137_..._s1.hifi_reads.bc2073.bam` -> `bc2073`). Per-cell
-    `*.unassigned.bam` files are skipped (reads with no barcode are not samples).
-
-    Returns `(index, duplicated)`: `index` maps barcode -> BAM for every barcode
-    that resolves to exactly one file; `duplicated` is the set of barcodes seen
-    under more than one SMRT cell. A duplicated barcode is left OUT of `index` and
-    is a hard error at resolution time — barcode reuse across SMRT cells within a
-    run is real (e.g. bc2083 under both 1_B01 and 1_C01) and cannot be
-    disambiguated without the SMRT cell. This is the graceful-degradation rule:
-    unique barcodes just resolve; a collision on a barcode a sample actually needs
-    fails loud rather than silently binding the wrong cell's reads. (The preflight
-    now carries a SMRT-cell field; once it is populated, key on `(smrt_cell, barcode)`
-    — matching the well subdirectory or the movie name's `s#` token — and this
-    collision set becomes empty.)
-    """
-    index: dict[str, Path] = {}
-    duplicated: set[str] = set()
-    for bam in sorted(run_folder.glob(f"*/{_HIFI_READS_DIR}/*.bam")):
-        if bam.name.endswith(_UNASSIGNED_BAM_SUFFIX):
-            continue
-        parts = bam.name.split(".")
-        # Require the exact demux shape "<movie>.hifi_reads.<barcode>.bam" so a
-        # non-demuxed combined BAM ("<movie>.hifi_reads.bam") isn't indexed under a
-        # spurious barcode ("hifi_reads"). ["m84_s1", "hifi_reads", "bc2073", "bam"].
-        if len(parts) < 4 or parts[-3] != _HIFI_READS_DIR:
-            continue
-        barcode = parts[-2]
-        if barcode in index or barcode in duplicated:
-            duplicated.add(barcode)
-            index.pop(barcode, None)
-        else:
-            index[barcode] = bam
-    return index, duplicated
-
-
 def _resolve_sample_bams(
     rows: list[_PacbioPreflightRow],
     run_folder: Path,
+    run_index: PacbioRunIndex,
     parser: argparse.ArgumentParser,
 ) -> dict[str, Path]:
-    """Resolve every sample's absolute BAM path before any network call.
+    """Pair every sample against its BAM in the run folder's index.
+
+    `run_index` comes from POST /run-folder/inspect — the control plane globs
+    the folder, because this machine may not mount it. The pairing stays here:
+    it needs the pre-flight roster, which never leaves the client.
 
     Returns barcode -> absolute BAM path. Barcode is the sample's BAM-locating key
     (NOT its identity — that is `pacbio_sample_idx`), and it is not guaranteed
@@ -309,7 +263,8 @@ def _resolve_sample_bams(
     sample whose barcode has no BAM, or either ambiguity — one actionable error
     instead of N FAILED `bam-to-parquet` tickets.
     """
-    index, duplicated = _index_run_bams(run_folder)
+    index = {bc: Path(p) for bc, p in run_index.hifi_bam_by_barcode.items()}
+    duplicated = set(run_index.duplicated_barcodes)
     if not index and not duplicated:
         parser.error(
             f"--run-folder {run_folder} contains no HiFi BAMs (expected */hifi_reads/*.bam)"
@@ -331,10 +286,12 @@ def _resolve_sample_bams(
         elif row.barcode not in index:
             missing.append(label)
         else:
-            # .absolute(), not .resolve(): the orchestrator binds the BAM's parent
-            # dir by its given absolute path, so dereferencing symlinks here could
-            # yield a path outside that bind mount (invisible to the compute node).
-            resolved[row.barcode] = index[row.barcode].absolute()
+            # Already absolute — the server globbed an absolute run folder and
+            # returned absolute paths. Not `.resolve()`d, deliberately: the
+            # orchestrator binds the BAM's parent dir by its given absolute
+            # path, so dereferencing symlinks could yield a path outside that
+            # bind mount, invisible to the compute node.
+            resolved[row.barcode] = index[row.barcode]
     if ambiguous:
         parser.error(
             f"--run-folder {run_folder}: barcode(s) reused across samples or SMRT"
@@ -373,25 +330,32 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
        makes a retry converge instead of aborting on the first already-created sample.
     5. Fan out one `bam-to-parquet` ticket per sample (scope prep_sample,
        action_context {bam_path, expect_unaligned: true}). Per-sample resilient:
-       one sample's ticket failure is recorded and the fan-out continues. A 409
-       (sample already COMPLETED under disallow-without-delete, or already
-       in-flight) is recorded as SKIPPED — the convergence signal, not a failure —
-       so re-running to retry a failed sample never reports the finished ones as
-       failures. The command exits non-zero only if a real (non-409) failure
-       occurred (mirrors submit-host-filter-pool).
+       one prep_sample's ticket failure is recorded and the fan-out continues. A
+       409 (a ticket for that prep_sample already in flight) is recorded as
+       SKIPPED — the convergence signal, not a failure. The command exits non-zero
+       only if a real (non-409) failure occurred (mirrors submit-host-filter-pool).
 
     Convergent retry: find-or-create on the run + pool, create-missing on the
     roster (step 4), and the 409-as-skip fan-out (step 5) together mean re-running
-    the identical gesture after a partial failure reuses everything already made,
-    skips the already-done samples (exit 0), and only re-submits the still-missing
-    / previously-FAILED ones (the route resets a FAILED ticket). --force is the
-    separate, deliberate re-ingest path (it re-registers reads → lake duplicates),
-    NOT the retry route. All calls share one PAT.
+    the identical gesture after a partial failure reuses everything already made
+    and re-submits the rest. The in-flight gate blocks only non-terminal tickets,
+    so a reused prep_sample with a COMPLETED bam-to-parquet ticket is SKIPPED
+    here: a fresh ticket would stop at the read-numbering step without storing
+    anything (see `sequence_range_retry.mint_or_reuse_sequence_range`). The
+    lookup uses `?all=true`, which the submitter can pass because naming the BAM
+    path already needs wet_lab_admin. A FAILED prep_sample's
+    ticket is not reset by a submit either: the new ticket converges if the failed
+    one never numbered the reads, and otherwise stops, naming `qiita ticket run`
+    for the failed one. There is no --force: Illumina's `--force` waives a
+    sequenced_pool-scoped gate, and this command has none to waive; a deliberate
+    re-load goes through removing the pool. All calls share one PAT.
     """
+    # The path is checked SERVER-side (POST /run-folder/inspect, below), not
+    # here: it names the folder as the CLUSTER sees it, and a check against this
+    # machine's filesystem proves nothing about that. Only the shape is worth
+    # asserting locally.
     if not args.run_folder.is_absolute():
         parser.error(f"--run-folder must be absolute, got {args.run_folder}")
-    if not args.run_folder.is_dir():
-        parser.error(f"--run-folder {args.run_folder} is not a directory")
     if not args.preflight_blob.is_file():
         parser.error(f"--preflight-blob {args.preflight_blob} is not a regular file")
     blob_bytes = args.preflight_blob.read_bytes()
@@ -399,9 +363,6 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
         parser.error(f"--preflight-blob {args.preflight_blob} is empty")
 
     preflight_rows = _read_pacbio_preflight_rows(args.preflight_blob, parser)
-    # Resolve BAMs before any network call — a missing/ambiguous BAM is
-    # operator-actionable and must not create a half-populated pool.
-    bam_by_barcode = _resolve_sample_bams(preflight_rows, args.run_folder, parser)
 
     run_body = SequencingRunCreateRequest(
         instrument_run_id=args.instrument_run_id,
@@ -414,6 +375,18 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
     ).model_dump(exclude_unset=True, mode="json")
 
     def _run(token: str) -> dict:
+        # Step 0: index the run folder on the control plane, then pair it against
+        # the pre-flight roster HERE. The glob needs the folder (which this
+        # machine may not mount); the pairing needs the roster (which never
+        # leaves this machine). Both happen before any row is minted, so a
+        # missing or ambiguous BAM is one actionable error rather than a
+        # half-populated pool.
+        inspected = _inspect_run_folder(args.base_url, token, args.run_folder, Platform.PACBIO_SMRT)
+        assert inspected.pacbio is not None  # platform=pacbio_smrt always populates it
+        bam_by_barcode = _resolve_sample_bams(
+            preflight_rows, args.run_folder, inspected.pacbio, parser
+        )
+
         # Shared run → pool → roster provisioning (create-missing; fails fast on an
         # unresolved accession). PacBio keys the pool-item-id on pacbio_sample_idx —
         # the sample's unique preflight id (the barcode is only the BAM-locating key
@@ -427,7 +400,7 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
             prep_protocol_idx=args.prep_protocol_idx,
             pool_item_id=lambda row: str(row.pacbio_sample_idx),
             row_label=lambda row: f"pacbio_sample_idx {row.pacbio_sample_idx}",
-            row_noun="sample",
+            row_noun="pacbio_sample",
         )
         sequencing_run_idx = provision.sequencing_run_idx
         sequenced_pool_idx = provision.sequenced_pool_idx
@@ -447,20 +420,61 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
 
         # Fan out one bam-to-parquet ingest ticket per sample. Per-sample
         # resilient: a single ticket's failure is recorded and the loop CONTINUES,
-        # so one bad sample never strands the rest (mirrors submit-host-filter-pool).
+        # so one bad prep_sample never strands the rest (mirrors submit-host-filter-pool).
         #
-        # A 409 is NOT a failure — it is the convergence signal: a sample already
-        # COMPLETED (disallow-without-delete) or already in-flight
-        # (PENDING/QUEUED/PROCESSING) rejects a duplicate submit with 409. That is
-        # exactly "already done / already running", so we record it as SKIPPED and
-        # do NOT count it toward the non-zero exit — re-running the gesture to
-        # retry a failed sample must not report the finished ones as failures.
-        # (A FAILED sample's ticket is reset by the route and re-submitted 201,
-        # so it converges without a skip. --force is the separate, deliberate
-        # re-ingest path and intentionally NOT the recovery route here.)
+        # A 409 is NOT a failure — it means the prep_sample already has a ticket
+        # in flight (PENDING/QUEUED/PROCESSING), so this submit is a duplicate of
+        # work already running. Recorded as SKIPPED and NOT counted toward the
+        # non-zero exit, so re-running to retry one prep_sample does not report the
+        # running ones as failures.
+        # A reused prep_sample whose reads a COMPLETED ticket loaded is skipped
+        # before the POST; a FAILED one is admitted. The docstring's
+        # convergent-retry paragraph says why.
         failures: list[dict] = []
         skipped: list[dict] = []
+
+        def _row(entry: dict, **extra) -> dict:
+            return {
+                "pacbio_sample_idx": entry["pacbio_sample_idx"],
+                "prep_sample_idx": entry["prep_sample_idx"],
+                "barcode": entry["barcode"],
+                **extra,
+            }
+
+        def _failure(entry: dict, exc: httpx.HTTPError, context: str = "") -> dict:
+            if isinstance(exc, httpx.HTTPStatusError):
+                return _row(
+                    entry,
+                    status_code=exc.response.status_code,
+                    error=context + exc.response.text[:500],
+                )
+            return _row(entry, status_code=None, error=f"{context}{type(exc).__name__}: {exc}")
+
         for entry in per_sample:
+            if entry["reused"]:
+                try:
+                    completed = _common.call(
+                        "GET",
+                        args.base_url,
+                        token,
+                        PATH_WORK_TICKET_PREFIX,
+                        params={
+                            "all": "true",
+                            "prep_sample_idx": entry["prep_sample_idx"],
+                            "action_id": _BAM_TO_PARQUET_ACTION_ID,
+                            "state": WorkTicketState.COMPLETED.value,
+                            "limit": 1,
+                        },
+                    )
+                except httpx.HTTPError as exc:
+                    failures.append(_failure(entry, exc, "looking up its completed ingest: "))
+                    continue
+                if completed["tickets"]:
+                    loaded_by = completed["tickets"][0]["work_ticket_idx"]
+                    skipped.append(
+                        _row(entry, reason=f"reads already loaded by ticket {loaded_by}")
+                    )
+                    continue
             ticket_body = WorkTicketCreateRequest(
                 action_id=_BAM_TO_PARQUET_ACTION_ID,
                 action_version=_BAM_TO_PARQUET_ACTION_VERSION,
@@ -472,7 +486,6 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
                     "bam_path": entry["bam_path"],
                     "expect_unaligned": True,
                 },
-                force=args.force,
             ).model_dump(exclude_unset=True, mode="json")
             try:
                 ticket_resp, _status = _common.call_with_status(
@@ -480,37 +493,14 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
                 )
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 409:
-                    # Already ingested (COMPLETED) or already in-flight — converged,
-                    # not failed. Skip without contributing to the non-zero exit.
-                    skipped.append(
-                        {
-                            "pacbio_sample_idx": entry["pacbio_sample_idx"],
-                            "prep_sample_idx": entry["prep_sample_idx"],
-                            "barcode": entry["barcode"],
-                            "reason": exc.response.text[:500],
-                        }
-                    )
+                    # Already in flight — converged, not failed. Skip without
+                    # contributing to the non-zero exit.
+                    skipped.append(_row(entry, reason=exc.response.text[:500]))
                     continue
-                failures.append(
-                    {
-                        "pacbio_sample_idx": entry["pacbio_sample_idx"],
-                        "prep_sample_idx": entry["prep_sample_idx"],
-                        "barcode": entry["barcode"],
-                        "status_code": exc.response.status_code,
-                        "error": exc.response.text[:500],
-                    }
-                )
+                failures.append(_failure(entry, exc))
                 continue
             except httpx.HTTPError as exc:
-                failures.append(
-                    {
-                        "pacbio_sample_idx": entry["pacbio_sample_idx"],
-                        "prep_sample_idx": entry["prep_sample_idx"],
-                        "barcode": entry["barcode"],
-                        "status_code": None,
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }
-                )
+                failures.append(_failure(entry, exc))
                 continue
             entry["work_ticket_idx"] = ticket_resp.get("work_ticket_idx")
 

@@ -67,10 +67,13 @@ def is_pacbio_sheet_type(sheet_type: str | None) -> bool:
 def open_blob(blob: bytes) -> Iterator[sqlite3.Connection]:
     """Open a stored pre-flight blob as a run_preflight sqlite3 connection.
 
-    `load_db_bytes` loads the blob into a DETACHED in-memory connection (nothing
-    reaches the caller's bytes) at the latest schema version, so no temp file is
-    needed. The run_preflight import is lazy and local so the git-pinned
-    dependency loads only on this path.
+    `load_db_bytes` deserializes into a detached in-memory database and applies any
+    pending schema patches there. The run_preflight import is lazy and local so the
+    git-pinned dependency loads only on this path.
+
+    RAISES `ValueError` when `blob` is not a SQLite database at all or was written
+    against a newer pre-flight schema than this deployment ships, and
+    `sqlite3.DatabaseError` when it carries the header but is unreadable.
     """
     from run_preflight import load_db_bytes  # noqa: PLC0415
 

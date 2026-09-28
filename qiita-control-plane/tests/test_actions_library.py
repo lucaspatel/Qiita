@@ -1,9 +1,11 @@
-"""Unit tests for the action-library registry shape (no DB).
+"""Unit tests for the action library (no DB).
 
-Catches drift between qiita_common.api_paths.LibraryPrimitive (the closed
-set of names workflow YAML can reference via `action:` entries) and the
-qiita_control_plane.actions.library.LIBRARY dispatch dict (what the
-runner actually calls).
+Two subjects. The registry-shape tests catch drift between
+qiita_common.api_paths.LibraryPrimitive (the closed set of names workflow YAML
+can reference via `action:` entries) and the
+qiita_control_plane.actions.library.LIBRARY dispatch dict (what the runner
+actually calls). The rest exercise the SQL and reporting the primitives own,
+against DuckDB and Parquet fixtures rather than a database.
 """
 
 import inspect
@@ -396,10 +398,18 @@ def test_assembly_membership_join_resolves_contigs_to_bins_and_features(tmp_path
     synthetic read_id through bin_map (kind, bin_id) and manifest -> feature_map
     (sequence_hash -> feature_idx) to one (kind, bin_id, feature_idx) row per
     contig. Two contigs that collapse to the same feature_idx (identical bytes)
-    stay distinct rows because their bin/kind differ."""
+    stay distinct rows because their bin/kind differ.
+
+    Also pins the per-contig attributes riding the same join: they must not add
+    rows. The two identical contigs inside bin.1 carry DIFFERENT attributes here,
+    which is the case that would break the Postgres upsert if the join emitted one
+    row per attribute variant — `insert_assembly_membership_rows` refuses a
+    duplicated conflict target. One representative contig is chosen, and all four
+    of its values travel together rather than being mixed across the two rows."""
     import uuid
 
     import duckdb
+    from qiita_common.assembly_constants import register_contig_attribute_table
 
     from qiita_control_plane.actions.library import ASSEMBLY_MEMBERSHIP_JOIN_SQL
 
@@ -417,11 +427,15 @@ def test_assembly_membership_join_resolves_contigs_to_bins_and_features(tmp_path
     feature_map = tmp_path / "feature_map.parquet"
     _write(
         bin_map,
-        "read_id VARCHAR, kind VARCHAR, bin_id VARCHAR",
+        "read_id VARCHAR, kind VARCHAR, bin_id VARCHAR, contig_id VARCHAR",
         [
-            ("LCG:circ1:1", "LCG", "circ1"),
-            ("MAG:bin.1:1", "MAG", "bin.1"),
-            ("MAG:bin.2:1", "MAG", "bin.2"),
+            ("LCG:circ1:1", "LCG", "circ1", "u1ctg"),
+            ("MAG:bin.1:1", "MAG", "bin.1", "u2ctg"),
+            # A SECOND identical contig in the SAME bin. `assembly_hash` composes
+            # read_id as kind:bin_id:sequence_index, so duplicated bytes inside one
+            # bin arrive as two read_ids resolving to one feature_idx.
+            ("MAG:bin.1:2", "MAG", "bin.1", "u3ctg"),
+            ("MAG:bin.2:1", "MAG", "bin.2", "u4ctg"),
         ],
     )
     _write(
@@ -430,18 +444,49 @@ def test_assembly_membership_join_resolves_contigs_to_bins_and_features(tmp_path
         [
             ("LCG:circ1:1", str(h1), 10),
             ("MAG:bin.1:1", str(h2), 20),
+            ("MAG:bin.1:2", str(h2), 20),
             # bin.2 shares bytes with bin.1 -> same hash -> same feature_idx.
             ("MAG:bin.2:1", str(h2), 20),
         ],
     )
     _write(feature_map, "sequence_hash UUID, feature_idx BIGINT", [(str(h1), 100), (str(h2), 200)])
 
+    # The two bin.1 contigs disagree on every attribute, so a join that let them
+    # through separately would be visible as an extra row below. u4ctg is absent
+    # on purpose: a contig with no sidecar row must still produce its membership
+    # row, with NULLs.
+    attrs = tmp_path / "contig_attributes.tsv"
+    attrs.write_text(
+        "contig_id\traw_name\tcircularity\tdepth\tmult\n"
+        "u1ctg\tu1ctg_len-10_circular-yes\tyes\t30.0\t1.02\n"
+        # u2ctg is the representative (lex-smallest id) AND carries the LARGER
+        # depth/mult and the later-sorting circularity, so a per-column min()
+        # would differ from it on three of the four columns.
+        "u2ctg\tu2ctg_len-20_circular-yes\tyes\t99.0\t9.99\n"
+        "u3ctg\tu3ctg_len-20_circular-no\tno\t11.0\t1.00\n"
+    )
+
     with duckdb.connect(":memory:") as c:
+        register_contig_attribute_table(c, attrs)
         rows = c.execute(
             ASSEMBLY_MEMBERSHIP_JOIN_SQL, [str(bin_map), str(manifest), str(feature_map)]
         ).fetchall()
+    # THREE rows, not four. The duplicate WITHIN bin.1 collapses (the constant's
+    # GROUP BY); the same feature under a DIFFERENT bin does not, because
+    # (kind, bin_id, feature_idx) still differs. Without that collapse this returns
+    # four rows and the Postgres write raises `cardinality_violation` — ON CONFLICT
+    # DO UPDATE refuses to touch one conflict target twice.
+    #
+    # bin.1 takes u2ctg's attributes, not u3ctg's, and takes ALL FOUR from it:
+    # `min(contig_id)` picks the representative and the attributes join onto that
+    # one row. A per-column aggregate would be free to return u2ctg's circularity
+    # beside u3ctg's depth, describing a contig that does not exist.
     assert sorted(rows) == sorted(
-        [("LCG", "circ1", 100), ("MAG", "bin.1", 200), ("MAG", "bin.2", 200)]
+        [
+            ("LCG", "circ1", 100, "u1ctg_len-10_circular-yes", "yes", 30.0, 1.02),
+            ("MAG", "bin.1", 200, "u2ctg_len-20_circular-yes", "yes", 99.0, 9.99),
+            ("MAG", "bin.2", 200, None, None, None, None),
+        ]
     )
 
 
@@ -523,6 +568,132 @@ def test_membership_accession_join_keeps_features_with_no_manifest_match(tmp_pat
             c.execute(MEMBERSHIP_ACCESSION_JOIN_SQL, [str(feature_map), str(manifest)]).fetchall()
         )
     assert rows == {100: "ACC1", 999: None}, "orphan feature survives with NULL accession"
+
+
+def _write_parquet(path, schema, rows):
+    import duckdb
+
+    with duckdb.connect(":memory:") as c:
+        c.execute(f"CREATE TEMP TABLE t ({schema})")
+        c.executemany(f"INSERT INTO t VALUES ({', '.join('?' for _ in rows[0])})", rows)
+        c.execute(f"COPY t TO '{path}' (FORMAT PARQUET)")
+
+
+_GENOME_MAP_SCHEMA = "read_id VARCHAR, genome_source VARCHAR, genome_source_id VARCHAR"
+
+
+def _genome_map_and_manifest(tmp_path, map_rows, manifest_read_ids):
+    genome_map = tmp_path / "genome_map.parquet"
+    manifest = tmp_path / "manifest.parquet"
+    _write_parquet(genome_map, _GENOME_MAP_SCHEMA, map_rows)
+    _write_parquet(manifest, "read_id VARCHAR", [(r,) for r in manifest_read_ids])
+    return genome_map, manifest
+
+
+def test_check_genome_map_full_match_is_silent(tmp_path, caplog):
+    import logging
+
+    from qiita_control_plane.actions.library import _check_genome_map
+
+    genome_map, manifest = _genome_map_and_manifest(
+        tmp_path,
+        [("READ1", "genbank", "G001"), ("READ2", "genbank", "G002")],
+        ["READ1", "READ2"],
+    )
+
+    with caplog.at_level(logging.WARNING):
+        assert _check_genome_map(genome_map, manifest, "work_ticket 7") is False
+
+    assert caplog.records == []
+
+
+def test_check_genome_map_zero_match_names_unmatched_read_ids(tmp_path):
+    import pytest
+
+    from qiita_control_plane.actions.library import _check_genome_map
+
+    genome_map, manifest = _genome_map_and_manifest(
+        tmp_path,
+        [("READX", "genbank", "G001"), ("READY", "genbank", "G002")],
+        ["READ1"],
+    )
+
+    with pytest.raises(ValueError, match=r"none of its 2 read_id\(s\).*READX, READY"):
+        _check_genome_map(genome_map, manifest, "work_ticket 7")
+
+
+def test_check_genome_map_partial_match_counts_read_ids_not_genomes(tmp_path, caplog):
+    """G001 keeps READ1, so it is still associated; its unmatched READ3 is counted."""
+    import logging
+
+    from qiita_control_plane.actions.library import _check_genome_map
+
+    genome_map, manifest = _genome_map_and_manifest(
+        tmp_path,
+        [
+            ("READ1", "genbank", "G001"),
+            ("READ3", "genbank", "G001"),
+            ("READMISSING", "genbank", "G002"),
+        ],
+        ["READ1", "READ2"],
+    )
+
+    with caplog.at_level(logging.WARNING):
+        _check_genome_map(genome_map, manifest, "work_ticket 7")
+
+    (record,) = caplog.records
+    assert record.getMessage() == (
+        "work_ticket 7: 2 of 3 genome-map read_id(s) are not sequence IDs in the reference "
+        "FASTA and get no genome association (e.g. READ3, READMISSING)"
+    )
+
+
+def test_check_genome_map_rejects_empty_map(tmp_path):
+    import duckdb
+    import pytest
+
+    from qiita_control_plane.actions.library import _check_genome_map
+
+    genome_map = tmp_path / "genome_map.parquet"
+    manifest = tmp_path / "manifest.parquet"
+    with duckdb.connect(":memory:") as c:
+        c.execute(f"CREATE TEMP TABLE t ({_GENOME_MAP_SCHEMA})")
+        c.execute(f"COPY t TO '{genome_map}' (FORMAT PARQUET)")
+    _write_parquet(manifest, "read_id VARCHAR", [("READ1",)])
+
+    with pytest.raises(ValueError, match="genome map has no rows"):
+        _check_genome_map(genome_map, manifest, "work_ticket 7")
+
+
+def test_check_genome_map_requires_read_id_column(tmp_path):
+    import pytest
+
+    from qiita_control_plane.actions.library import _check_genome_map
+
+    genome_map = tmp_path / "genome_map.parquet"
+    manifest = tmp_path / "manifest.parquet"
+    _write_parquet(
+        genome_map, "genome_source VARCHAR, genome_source_id VARCHAR", [("genbank", "G001")]
+    )
+    _write_parquet(manifest, "read_id VARCHAR", [("READ1",)])
+
+    with pytest.raises(ValueError, match=r"missing required column\(s\): \['read_id'\]"):
+        _check_genome_map(genome_map, manifest, "work_ticket 7")
+
+
+def test_check_genome_map_rejects_null_read_id(tmp_path):
+    import pytest
+
+    from qiita_control_plane.actions.library import _check_genome_map
+
+    genome_map, manifest = _genome_map_and_manifest(
+        tmp_path,
+        [("READ1", "genbank", "G001"), (None, "genbank", "G002")],
+        ["READ1"],
+    )
+
+    with pytest.raises(ValueError, match=r"1 row\(s\) with a NULL read_id"):
+        _check_genome_map(genome_map, manifest, "work_ticket 7")
 
 
 def test_reap_staged_reads_none_root_is_noop():
@@ -610,3 +781,239 @@ async def test_register_files_stays_quiet_when_nothing_was_replaced(monkeypatch,
                 == []
             )
         assert "replaced" not in caplog.text
+
+
+def _miint_conn():
+    from qiita_control_plane.miint import connect_with_miint
+
+    return connect_with_miint()
+
+
+def _canonical_hashes(sequences):
+    """The canonical hash of each sequence, one per record (no dedup).
+
+    Evaluates `canonical_sequence_hash_expr` itself rather than mirroring it in
+    Python: it folds both case and strand, and a hand-rolled twin drifts without
+    the test noticing.
+    """
+    from qiita_common.chunking import canonical_sequence_hash_expr
+
+    with _miint_conn() as conn:
+        conn.execute("CREATE TABLE _seq (i INTEGER, sequence VARCHAR)")
+        conn.executemany("INSERT INTO _seq VALUES (?, ?)", list(enumerate(sequences)))
+        rows = conn.execute(
+            f"SELECT i, {canonical_sequence_hash_expr('sequence')} AS h FROM _seq ORDER BY i"
+        ).fetchall()
+    return [h for _, h in rows]
+
+
+def _revcomp(sequence):
+    """miint's reverse complement, case preserved.
+
+    `sequence_dna_reverse_complement` preserves case
+    (https://the-miint.github.io/duckdb-miint/utilities/), so a mixed-case
+    argument yields a mixed-case twin — which is what lets one fixture below
+    fold case and strand at the same time.
+    """
+    with _miint_conn() as conn:
+        return conn.execute("SELECT sequence_dna_reverse_complement(?)", [sequence]).fetchone()[0]
+
+
+def _write_manifest(path, read_ids, sequences):
+    import duckdb
+
+    hashes = _canonical_hashes(sequences)
+    # Three columns, matching what hash_sequences emits — the warning's own
+    # argument leans on sequence_length_bp not discriminating.
+    with duckdb.connect(":memory:") as c:
+        c.execute(
+            "CREATE TEMP TABLE t (read_id VARCHAR, sequence_hash UUID, sequence_length_bp BIGINT)"
+        )
+        c.executemany(
+            "INSERT INTO t VALUES (?, ?, ?)",
+            [(r, str(h), len(q)) for r, h, q in zip(read_ids, hashes, sequences, strict=True)],
+        )
+        c.execute(f"COPY t TO '{path}' (FORMAT PARQUET)")
+    return len(set(hashes))
+
+
+# Non-palindromic on purpose: a sequence equal to its own reverse complement
+# cannot tell a strand fold from an identity, so it would pass either way.
+_FWD = "ACGTTGCAAGGTCCATTGCA"
+_MIXED_CASE = "acgtACGTttccGGaa"
+_SOLO = "TTTTGGGGCCCCAAAATTTT"
+
+
+def test_warn_on_collapsed_records_counts_and_names_the_absorbed_records(tmp_path, caplog):
+    """Records folded together by case, by strand, or by both are absent from the
+    reference; the warning reports how many and which read_ids shared a hash."""
+    import logging
+
+    from qiita_control_plane.actions.library import _warn_on_collapsed_records
+
+    read_ids = ["fwd", "rev", "mixed", "mixed_rc", "mixed_upper", "solo"]
+    sequences = [
+        _FWD,
+        _revcomp(_FWD),
+        _MIXED_CASE,
+        # Case-preserving, so this one folds case AND strand together — the
+        # combination a hand-rolled hash oracle got wrong before.
+        _revcomp(_MIXED_CASE),
+        _MIXED_CASE.upper(),
+        _SOLO,
+    ]
+    manifest = tmp_path / "manifest.parquet"
+    features = _write_manifest(manifest, read_ids, sequences)
+    # fwd/rev fold on strand; mixed/mixed_rc/mixed_upper on case, strand, and
+    # both at once; solo stands alone.
+    assert features == 3
+
+    with caplog.at_level(logging.WARNING):
+        collapsed = _warn_on_collapsed_records("reference 42", manifest)
+
+    assert collapsed == 3
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert message.startswith("reference 42: ")
+    assert "6 submitted record(s) collapsed to 3 feature(s)" in message
+    assert "fwd, rev" in message
+    # A three-member group is listed together, ordered within the group.
+    assert "mixed, mixed_rc, mixed_upper" in message
+    assert "solo" not in message
+
+
+def test_warn_on_collapsed_records_is_silent_when_nothing_collapsed(tmp_path, caplog):
+    """The control: distinct sequences leave record count equal to feature count,
+    so the same call warns nothing and reports zero."""
+    import logging
+
+    from qiita_control_plane.actions.library import _warn_on_collapsed_records
+
+    manifest = tmp_path / "manifest.parquet"
+    features = _write_manifest(manifest, ["fwd", "solo"], [_FWD, _SOLO])
+    assert features == 2
+
+    with caplog.at_level(logging.WARNING):
+        collapsed = _warn_on_collapsed_records("reference 42", manifest)
+
+    assert collapsed == 0
+    assert caplog.records == []
+
+
+def test_warn_on_collapsed_records_marks_a_truncated_group_list(tmp_path, caplog):
+    """Past the cap the message lists that many groups and says it was cut; the
+    count itself still covers every collapsed record."""
+    import logging
+
+    from qiita_control_plane.actions.library import (
+        _MAX_REPORTED,
+        _warn_on_collapsed_records,
+    )
+
+    pairs = _MAX_REPORTED + 3
+    read_ids, sequences = [], []
+    for i in range(pairs):
+        # Distinct per pair, and non-palindromic so each pair folds on strand.
+        seq = f"{'ACGTTGCAAGG' * 2}{'ACGT' * (i + 1)}TTCCA"
+        read_ids += [f"r{i:02d}_fwd", f"r{i:02d}_rev"]
+        sequences += [seq, _revcomp(seq)]
+    manifest = tmp_path / "manifest.parquet"
+    features = _write_manifest(manifest, read_ids, sequences)
+    assert features == pairs
+
+    with caplog.at_level(logging.WARNING):
+        collapsed = _warn_on_collapsed_records("reference 42", manifest)
+
+    assert collapsed == pairs
+    message = caplog.records[0].getMessage()
+    assert message.endswith("(truncated)")
+    assert message.count(";") == _MAX_REPORTED - 1
+
+
+def test_warn_on_collapsed_records_leads_with_the_caller_s_scope(tmp_path, caplog):
+    """The helper serves both membership writers, so the thing being loaded is the
+    caller's to name — an assembly run is not a reference."""
+    import logging
+
+    from qiita_control_plane.actions.library import _warn_on_collapsed_records
+
+    manifest = tmp_path / "manifest.parquet"
+    _write_manifest(manifest, ["c_fwd", "c_rev"], [_FWD, _revcomp(_FWD)])
+
+    with caplog.at_level(logging.WARNING):
+        collapsed = _warn_on_collapsed_records(
+            "assembly run (prep_sample 7, processing 3)", manifest
+        )
+
+    assert collapsed == 1
+    message = caplog.records[0].getMessage()
+    assert message.startswith("assembly run (prep_sample 7, processing 3): ")
+    assert "c_fwd, c_rev" in message
+
+
+async def test_mint_phylogeny_edge_id_data_signs_and_dispatches_the_same_name(monkeypatch):
+    """The action name the CP signs must be the name the DP dispatches on. The two
+    live in different languages, so nothing but a test holds them together: the Rust
+    side pins its half against `REPLAY_SAFE_ACTIONS`, this pins ours."""
+    import json
+
+    from qiita_control_plane.actions import library as lib
+
+    captured: dict = {}
+
+    def _fake_do_action(action_type, data_plane_url, token, timeout_seconds=None):
+        captured["action_type"] = action_type
+        captured["timeout_seconds"] = timeout_seconds
+        captured["token"] = token
+        return [
+            _FakeResult(
+                json.dumps(
+                    {
+                        "reference_idx": 7,
+                        "phylogeny_rows": 9,
+                        "already_numbered_rows": 0,
+                        "minted_rows": 9,
+                    }
+                ).encode()
+            )
+        ]
+
+    monkeypatch.setattr(lib, "_do_action", _fake_do_action)
+
+    result = await lib.mint_phylogeny_edge_id_data(
+        reference_idx=7,
+        signing_key=b"\x00" * 32,
+        data_plane_url="grpc://dp:50051",
+    )
+
+    assert captured["action_type"] == "mint_phylogeny_edge_id"
+    assert captured["timeout_seconds"] == lib._MINT_PHYLOGENY_EDGE_ID_DO_ACTION_TIMEOUT_S
+    assert _decode_action_payload(captured["token"]) == {
+        "action": "mint_phylogeny_edge_id",
+        "reference_idx": 7,
+    }
+    # The data plane's counts are relayed verbatim; the route decides what they mean.
+    assert result == {
+        "reference_idx": 7,
+        "phylogeny_rows": 9,
+        "already_numbered_rows": 0,
+        "minted_rows": 9,
+    }
+
+
+async def test_mint_phylogeny_edge_id_data_raises_when_the_data_plane_returns_nothing(
+    monkeypatch,
+):
+    """An empty result body means what the call changed is unknown, which is not a
+    thing to paper over with a zero."""
+    import pytest
+
+    from qiita_control_plane.actions import library as lib
+
+    monkeypatch.setattr(lib, "_do_action", lambda *a, **k: [])
+    with pytest.raises(RuntimeError, match="no result body"):
+        await lib.mint_phylogeny_edge_id_data(
+            reference_idx=7,
+            signing_key=b"\x00" * 32,
+            data_plane_url="grpc://dp:50051",
+        )

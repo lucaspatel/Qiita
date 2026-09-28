@@ -4,10 +4,61 @@ Split out of the former single-file ``cli.user`` module; behavior unchanged.
 """
 
 import argparse
+import sqlite3
+from pathlib import Path
 
 from pydantic import BaseModel, ValidationError
+from qiita_common.api_paths import PATH_RUN_FOLDER_INSPECT, PATH_RUN_FOLDER_PREFIX
+from qiita_common.models import Platform, RunFolderInspectRequest, RunFolderInspectResponse
 
 from .. import _common
+
+
+def _inspect_run_folder(
+    base_url: str, token: str, run_folder: Path, platform: Platform
+) -> RunFolderInspectResponse:
+    """Read a sequencing run folder on the control plane.
+
+    Doing the read server-side is what frees a submit gesture from a machine
+    that mounts the cluster. The route applies the same PATH_INGEST_ROOTS gate
+    the work-ticket submit does, so a path that submit would reject fails here,
+    before any row is minted. Caller asserts the platform arm it asked for.
+    """
+    return RunFolderInspectResponse.model_validate(
+        _common.call(
+            "POST",
+            base_url,
+            token,
+            f"{PATH_RUN_FOLDER_PREFIX}{PATH_RUN_FOLDER_INSPECT}",
+            json=RunFolderInspectRequest(path=str(run_folder), platform=platform).model_dump(
+                mode="json"
+            ),
+        )
+    )
+
+
+def _load_preflight_conn(
+    preflight_blob: Path, parser: argparse.ArgumentParser, *, flag: str
+) -> sqlite3.Connection:
+    """Load an operator-supplied preflight SQLite into a detached connection.
+
+    `load_db_file` reads the file into an in-memory copy, so the operator's
+    preflight is never written to — schema patches land in memory and are
+    discarded. Caller owns the returned connection and must close it.
+
+    Requires a path that opens for reading; an OS-level open failure propagates.
+    A file that carries no SQLite header, is truncated, or was written against a
+    newer preflight schema than this client ships raises via `parser.error`, so the
+    CLI surfaces one stderr line and exits 2 before any network call. `flag` names
+    the option the path came from, so the message points at what the operator typed.
+    """
+    from run_preflight import load_db_file  # noqa: PLC0415
+
+    try:
+        conn = load_db_file(preflight_blob)
+    except (sqlite3.DatabaseError, ValueError) as exc:
+        parser.error(f"{flag} {preflight_blob}: cannot load preflight SQLite: {exc}")
+    return conn
 
 
 def _build_body(
@@ -101,14 +152,17 @@ def _proportion_or_none_arg(raw: str) -> float | None:
 
 
 def _handle_read(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    """Fetch a resource by idx (GET) and print its JSON body.
+    """Fetch a resource (GET) and print its JSON body.
 
-    The per-command `set_defaults` supplies `read_path` (a subpath
-    template) and `read_idx_arg` (the namespace attr whose value fills
-    the template), so the path formats from exactly one identifier.
+    The per-command `set_defaults` supplies `read_path` (a subpath template)
+    and `read_idx_arg` (the namespace attr whose value fills the template), so
+    the path formats from exactly one identifier. A read whose path carries no
+    placeholder declares `read_idx_arg=None`; a template still carrying one
+    then fails loudly rather than dialing a literal `{...}` segment.
     """
     idx_arg = args.read_idx_arg
-    path = args.read_path.format(**{idx_arg: getattr(args, idx_arg)})
+    fill = {} if idx_arg is None else {idx_arg: getattr(args, idx_arg)}
+    path = args.read_path.format(**fill)
     return _common.run_http_subcommand(lambda t: _common.call("GET", args.base_url, t, path))
 
 

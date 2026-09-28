@@ -4,8 +4,8 @@ The compute orchestrator owns three distinct storage concerns, and this module
 makes the third one explicit:
 
   * the **data plane** owns persistent data (DuckLake + permanent Parquet);
-  * the orchestrator owns the **ephemeral per-attempt workspace**
-    (``$QIITA_OUTPUT_PATH`` / scratch — disposable, one per step attempt);
+  * the orchestrator owns the **per-attempt scratch workspace**
+    (``$QIITA_OUTPUT_PATH`` / scratch — one per step attempt, not durable storage);
   * the orchestrator *also* owns **derived storage** — the persistent
     host-filter indexes under ``PATH_DERIVED``. These are per-reference and
     durable (they outlive the work ticket and are consumed at host-filter
@@ -30,7 +30,7 @@ manifest write and the verifier both require every declared output to resolve
 under ``$QIITA_OUTPUT_PATH``, so an out-of-tree output is a CONTRACT_VIOLATION.
 Communicate a derived artifact's location via an in-tree meta JSON instead
 (``register-index`` reads ``fs_path`` from it). The home for this rule is
-``docs/architecture.md`` (the native-step note under the Container contract).
+``docs/architecture/processing.md`` (the native-step note under the Container contract).
 
 This module is a sibling of ``jobs/`` (not inside it) by design: the boot scan
 validates every non-dunder module under ``jobs/`` as a native job, so shared

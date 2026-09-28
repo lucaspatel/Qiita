@@ -1,26 +1,30 @@
 """Unit tests for the PacBio HiFi ingest submission CLI (cli/user/pacbio.py).
 
 Three surfaces, all pure-unit (no Postgres):
-  * `_index_run_bams` / `_resolve_sample_bams` — the BAM glob + (barcode)
+  * `index_run_bams` / `_resolve_sample_bams` — the BAM glob + (barcode)
     disambiguation, exercised against a synthetic run folder on disk.
   * `_read_pacbio_preflight_rows` — the preflight reader (kl-run-preflight's
     `get_pacbio_sample_info`), exercised end-to-end against a REAL kl-run-preflight
-    SQLite built from the pinned case-5 fixture (good_pacbio_absquantv11.csv).
+    SQLite built from the pinned case-5 fixture (good_pacbio_absquantv11.csv),
+    including the load failure an unusable file produces and the read-only source
+    the load must leave untouched.
   * `_handle_submit_pacbio_ingest` — the full submit flow, HTTP mocked, asserting
     the run/pool/sample setup and the per-sample bam-to-parquet fan-out.
 """
 
 from __future__ import annotations
 
+import argparse
 import sqlite3
 from pathlib import Path
 
 import httpx
 import pytest
+from qiita_common.models import PacbioRunIndex
+from qiita_common.pacbio import index_run_bams
 
 from qiita_control_plane.cli import _common
 from qiita_control_plane.cli.user import (
-    _index_run_bams,
     _read_pacbio_preflight_rows,
     _resolve_sample_bams,
     main,
@@ -58,7 +62,7 @@ def test_index_run_bams_keys_by_barcode_and_skips_unassigned(tmp_path):
     _make_bam(tmp_path, "1_A01", "m84_s1", "bc1")
     _make_bam(tmp_path, "1_A01", "m84_s1", "bc2")
     _make_bam(tmp_path, "1_A01", "m84_s1", "unassigned")  # dropped
-    index, duplicated = _index_run_bams(tmp_path)
+    index, duplicated = index_run_bams(tmp_path)
     assert set(index) == {"bc1", "bc2"}
     assert duplicated == set()
     # keyed on the *.bam file itself, under the SMRT-cell well dir
@@ -71,7 +75,7 @@ def test_index_run_bams_quarantines_barcode_reused_across_cells(tmp_path):
     _make_bam(tmp_path, "1_A01", "m84_s1", "bc1")
     _make_bam(tmp_path, "1_B01", "m84_s2", "bc1")  # collision
     _make_bam(tmp_path, "1_B01", "m84_s2", "bc3")
-    index, duplicated = _index_run_bams(tmp_path)
+    index, duplicated = index_run_bams(tmp_path)
     assert set(index) == {"bc3"}
     assert duplicated == {"bc1"}
 
@@ -91,9 +95,24 @@ def _row(barcode: str, idx: int = 1):
     )
 
 
+def _run_index(run_folder) -> PacbioRunIndex:
+    """The index POST /run-folder/inspect returns for `run_folder`.
+
+    The glob itself moved to the control plane (`qiita_common.pacbio`), which
+    is what lets the submit run from a machine that does not mount the cluster.
+    These tests still build it from a real folder — the pairing under test is
+    index x roster, and a real glob keeps the fixture honest about what the
+    server would actually send."""
+    index, duplicated = index_run_bams(run_folder)
+    return PacbioRunIndex(
+        hifi_bam_by_barcode={bc: str(p) for bc, p in index.items()},
+        duplicated_barcodes=sorted(duplicated),
+    )
+
+
 def test_resolve_sample_bams_happy_path(tmp_path):
     _make_bam(tmp_path, "1_A01", "m84_s1", "bc1")
-    resolved = _resolve_sample_bams([_row("bc1")], tmp_path, _RaisingParser())
+    resolved = _resolve_sample_bams([_row("bc1")], tmp_path, _run_index(tmp_path), _RaisingParser())
     assert set(resolved) == {"bc1"}
     assert resolved["bc1"].name == "m84_s1.hifi_reads.bc1.bam"
 
@@ -101,7 +120,7 @@ def test_resolve_sample_bams_happy_path(tmp_path):
 def test_resolve_sample_bams_errors_on_missing(tmp_path):
     _make_bam(tmp_path, "1_A01", "m84_s1", "bc1")
     with pytest.raises(_RaisingParser.Error, match="no HiFi BAM found"):
-        _resolve_sample_bams([_row("bcX", 5)], tmp_path, _RaisingParser())
+        _resolve_sample_bams([_row("bcX", 5)], tmp_path, _run_index(tmp_path), _RaisingParser())
 
 
 def test_resolve_sample_bams_errors_on_cross_cell_barcode(tmp_path):
@@ -109,7 +128,7 @@ def test_resolve_sample_bams_errors_on_cross_cell_barcode(tmp_path):
     _make_bam(tmp_path, "1_A01", "m84_s1", "bc1")
     _make_bam(tmp_path, "1_B01", "m84_s2", "bc1")
     with pytest.raises(_RaisingParser.Error, match="reused across samples or SMRT cells"):
-        _resolve_sample_bams([_row("bc1", 5)], tmp_path, _RaisingParser())
+        _resolve_sample_bams([_row("bc1", 5)], tmp_path, _run_index(tmp_path), _RaisingParser())
 
 
 def test_resolve_sample_bams_errors_on_two_samples_sharing_a_barcode(tmp_path):
@@ -117,12 +136,17 @@ def test_resolve_sample_bams_errors_on_two_samples_sharing_a_barcode(tmp_path):
     BAM(s) without the SMRT cell — ambiguous, not a silent shared BAM."""
     _make_bam(tmp_path, "1_A01", "m84_s1", "bc1")
     with pytest.raises(_RaisingParser.Error, match="reused across samples or SMRT cells"):
-        _resolve_sample_bams([_row("bc1", 1), _row("bc1", 2)], tmp_path, _RaisingParser())
+        _resolve_sample_bams(
+            [_row("bc1", 1), _row("bc1", 2)],
+            tmp_path,
+            _run_index(tmp_path),
+            _RaisingParser(),
+        )
 
 
 def test_resolve_sample_bams_errors_on_empty_run_folder(tmp_path):
     with pytest.raises(_RaisingParser.Error, match="no HiFi BAMs"):
-        _resolve_sample_bams([_row("bc1")], tmp_path, _RaisingParser())
+        _resolve_sample_bams([_row("bc1")], tmp_path, _run_index(tmp_path), _RaisingParser())
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +246,46 @@ def test_read_preflight_rows_fails_on_missing_accession(build_case5_preflight):
         _read_pacbio_preflight_rows(db, _RaisingParser())
 
 
+def test__read_pacbio_preflight_rows_rejects_a_non_sqlite_blob(tmp_path, capsys):
+    """Tests the case where --preflight-blob names a file that is not a SQLite
+    database at all — the operator pointed at the CSV, or at a truncated copy.
+
+    Uses a real `argparse.ArgumentParser` rather than this module's `_RaisingParser`,
+    because the assertion is the argparse behaviour itself: one stderr line and exit
+    2, not a traceback. Pins the message, since a load failure and a query failure
+    are reported differently and the operator's next move differs."""
+    not_a_db = tmp_path / "preflight.db"
+    not_a_db.write_bytes(b"sample_name,barcode\nA,bc1001\n")
+
+    parser = argparse.ArgumentParser(prog="qiita")
+    with pytest.raises(SystemExit) as excinfo:
+        _read_pacbio_preflight_rows(not_a_db, parser)
+
+    assert excinfo.value.code == 2
+    assert "cannot load preflight SQLite" in capsys.readouterr().err
+
+
+def test__read_pacbio_preflight_rows_leaves_the_source_unwritten(build_case5_preflight):
+    """Tests the case where the operator's pre-flight is not writable by whoever
+    runs the CLI — a shared `644` file under the sequencing mounts.
+
+    This CANNOT fail against the reader as it stands today, and is not claimed to:
+    the fixture is stamped at the latest pre-flight schema, so there is nothing to
+    migrate and a writing loader would leave the bytes alone too. It is deliberate
+    insurance for the change that would break it — a reader that writes a migration
+    back, or persists the connection to the file — which would fail here rather than
+    in production against a file nobody owns. Acquiring the file read-write is NOT
+    itself caught: SQLite falls back to read-only and defers the error to the write."""
+    db = build_case5_preflight()
+    before = db.read_bytes()
+    db.chmod(0o444)
+
+    rows = _read_pacbio_preflight_rows(db, _RaisingParser())
+
+    assert rows, "case-5 fixture produced no CLI rows"
+    assert db.read_bytes() == before
+
+
 # ---------------------------------------------------------------------------
 # _handle_submit_pacbio_ingest — full flow, HTTP mocked
 # ---------------------------------------------------------------------------
@@ -234,6 +298,8 @@ def _stub_submit_flow(
     existing_samples: list[dict] | None = None,
     fail_ticket_when=None,
     conflict_ticket_when=None,
+    completed_prep_samples=(),
+    lookup_fails=False,
 ) -> None:
     """Route each POST/GET of the submit flow to a canned response and record
     every request.
@@ -249,11 +315,28 @@ def _stub_submit_flow(
     roster = {"samples": list(existing_samples or [])}
 
     def fake_request(method, url, headers=None, json=None, params=None, timeout=None):
-        captured["requests"].append({"method": method, "url": url, "json": json})
+        captured["requests"].append({"method": method, "url": url, "json": json, "params": params})
 
         def resp(status, body):
             return httpx.Response(status, json=body, request=httpx.Request(method, url))
 
+        if url.endswith("/run-folder/inspect"):
+            # Glob the real folder, as the route does. The CLI no longer globs
+            # it itself — that is what lets the submit run from a machine with
+            # no view of the cluster — so this leg is where the index enters.
+            index, duplicated = index_run_bams(Path(json["path"]))
+            return resp(
+                200,
+                {
+                    "path": json["path"],
+                    "platform": json["platform"],
+                    "illumina": None,
+                    "pacbio": {
+                        "hifi_bam_by_barcode": {bc: str(p) for bc, p in index.items()},
+                        "duplicated_barcodes": sorted(duplicated),
+                    },
+                },
+            )
         if url.endswith("/auth/whoami"):
             return resp(200, {"kind": "human", "principal_idx": 7})
         if url.endswith("/lookup-by-accession") and "biosample" in url:
@@ -276,6 +359,12 @@ def _stub_submit_flow(
             counter["sample"] += 1
             n = counter["sample"]
             return resp(201, {"prep_sample_idx": 100 + n, "sequenced_sample_idx": 200 + n})
+        if method == "GET" and url.endswith("/work-ticket"):
+            if lookup_fails:
+                return resp(500, {"detail": "boom"})
+            idx = int(params["prep_sample_idx"])
+            tickets = [{"work_ticket_idx": 700 + idx}] if idx in completed_prep_samples else []
+            return resp(200, {"tickets": tickets, "count": len(tickets), "truncated": False})
         if url.endswith("/work-ticket"):
             if fail_ticket_when is not None and fail_ticket_when(json):
                 return resp(500, {"detail": "boom"})
@@ -381,8 +470,8 @@ def test_submit_pacbio_ingest_fans_out_bam_to_parquet(monkeypatch, tmp_path, bui
 def test_submit_pacbio_ingest_ambiguous_barcode_aborts_before_network(
     monkeypatch, tmp_path, build_case5_preflight
 ):
-    """A barcode reused across SMRT cells fails fast (exit 2) with NO network
-    call — resolution happens before the flow's _run."""
+    """A barcode reused across SMRT cells fails fast (exit 2) after the run
+    folder is indexed and before anything is minted."""
     db = build_case5_preflight()
     run = tmp_path / "run"
     _make_bam(run, "1_A01", "m84_s1", "bc3011")
@@ -410,14 +499,17 @@ def test_submit_pacbio_ingest_ambiguous_barcode_aborts_before_network(
             ]
         )
     assert ei.value.code == 2
-    assert captured["requests"] == []  # aborted before any HTTP
+    # The run folder is indexed server-side now, so that one call happens; the
+    # pairing against the roster still runs on this machine, and still aborts
+    # before anything is minted.
+    assert [r["url"].split("/api/v1")[-1] for r in captured["requests"]] == ["/run-folder/inspect"]
 
 
 def test_submit_pacbio_ingest_missing_bam_aborts_before_network(
     monkeypatch, tmp_path, build_case5_preflight
 ):
-    """A sample whose barcode has no BAM fails fast (exit 2) before any HTTP,
-    like the ambiguous case — no half-populated pool."""
+    """A sample whose barcode has no BAM fails fast (exit 2) before anything is
+    minted, like the ambiguous case — no half-populated pool."""
     db = build_case5_preflight()
     run = tmp_path / "run"
     _make_bam(run, "1_A01", "m84_s1", "bc3011")
@@ -429,7 +521,40 @@ def test_submit_pacbio_ingest_missing_bam_aborts_before_network(
     with pytest.raises(SystemExit) as ei:
         main(_submit_args(run, db))
     assert ei.value.code == 2
-    assert captured["requests"] == []
+    assert [r["url"].split("/api/v1")[-1] for r in captured["requests"]] == ["/run-folder/inspect"]
+
+
+def test_submit_pacbio_ingest_names_missing_rows_as_pacbio_sample_rows(
+    monkeypatch, tmp_path, build_case5_preflight, capsys
+):
+    """A biosample accession Qiita does not have is reported against the
+    pre-flight's `pacbio_sample` rows, as Illumina's names `illumina_sample`."""
+    db = build_case5_preflight()
+    run = tmp_path / "run"
+    for bc in ("bc3011", "bc0112", "bc9992"):
+        _make_bam(run, "1_A01", "m84_s1", bc)
+
+    captured: dict = {}
+    _stub_submit_flow(monkeypatch, captured)
+    stubbed = _common.httpx.request
+
+    def missing_one(method, url, headers=None, json=None, params=None, timeout=None):
+        if url.endswith("/lookup-by-accession") and "biosample" in url:
+            return httpx.Response(
+                200,
+                json={
+                    "resolved": {"BIO_sample.1": 11, "BIO_sample.2": 12},
+                    "missing": ["BIO_sample.3"],
+                },
+                request=httpx.Request(method, url),
+            )
+        return stubbed(method, url, headers=headers, json=json, params=params, timeout=timeout)
+
+    monkeypatch.setattr(_common.httpx, "request", missing_one)
+    with pytest.raises(SystemExit):
+        main(_submit_args(run, db))
+    err = capsys.readouterr().err
+    assert "affecting 1 pacbio_sample row" in err
 
 
 def test_submit_pacbio_ingest_resilient_to_ticket_failure(
@@ -461,24 +586,14 @@ def test_submit_pacbio_ingest_resilient_to_ticket_failure(
     assert len(ticket_posts) == 3
 
 
-def test_submit_pacbio_ingest_force_reaches_ticket_body(
-    monkeypatch, tmp_path, build_case5_preflight
-):
-    db = build_case5_preflight()
-    run = tmp_path / "run"
-    for bc in ("bc3011", "bc0112", "bc9992"):
-        _make_bam(run, "1_A01", "m84_s1", bc)
-
-    captured: dict = {}
-    _stub_submit_flow(monkeypatch, captured)
-    rc = main(_submit_args(run, db, force=True))
-    assert rc == 0
-    ticket_posts = [
-        r
-        for r in captured["requests"]
-        if r["method"] == "POST" and r["url"].endswith("/work-ticket")
-    ]
-    assert ticket_posts and all(r["json"]["force"] is True for r in ticket_posts)
+def test_submit_pacbio_ingest_has_no_force_flag(tmp_path, capsys):
+    """`force` waives only the sequenced_pool COMPLETED gate, and PacBio ingest
+    submits prep_sample-scoped tickets, so the flag would change nothing but the
+    role check; it is not offered."""
+    with pytest.raises(SystemExit) as ei:
+        main(_submit_args(tmp_path / "run", tmp_path / "pf.db", force=True))
+    assert ei.value.code == 2
+    assert "unrecognized arguments: --force" in capsys.readouterr().err
 
 
 def test_submit_pacbio_ingest_retry_reuses_existing_roster(
@@ -550,10 +665,10 @@ def test_submit_pacbio_ingest_reused_sample_biosample_mismatch_fails(
 def test_submit_pacbio_ingest_409_ticket_is_skip_not_failure(
     monkeypatch, tmp_path, build_case5_preflight
 ):
-    """A real re-submit: the samples exist AND their ingest tickets already
-    COMPLETED (or are in-flight), so the work-ticket POSTs 409. Those are the
-    convergence signal, not failures — the command records them as skipped and
-    exits 0 (the operator must be able to tell already-done from a real failure)."""
+    """A real re-submit: the samples exist AND their ingest tickets are in
+    flight, so the work-ticket POSTs 409. Those are the convergence signal, not
+    failures — the command records them as skipped and exits 0 (the operator
+    must be able to tell already-running from a real failure)."""
     db = build_case5_preflight()
     run = tmp_path / "run"
     for bc in ("bc3011", "bc0112", "bc9992"):
@@ -573,6 +688,98 @@ def test_submit_pacbio_ingest_409_ticket_is_skip_not_failure(
     )
     rc = main(_submit_args(run, db))
     assert rc == 0  # all-already-done converges to success, not a failure exit
+
+
+def test_submit_pacbio_ingest_skips_a_prep_sample_whose_ingest_completed(
+    monkeypatch, tmp_path, build_case5_preflight, capsys
+):
+    """A re-run does not queue a ticket for a reused prep_sample that already has a
+    COMPLETED bam-to-parquet ticket: that ticket would stop at read numbering. It is
+    reported as skipped, naming the ticket; the others are still submitted."""
+    db = build_case5_preflight()
+    run = tmp_path / "run"
+    for bc in ("bc3011", "bc0112", "bc9992"):
+        _make_bam(run, "1_A01", "m84_s1", bc)
+
+    existing = [
+        {
+            "sequenced_pool_item_id": str(i + 1),
+            "prep_sample_idx": 300 + i,
+            "sequenced_sample_idx": 400 + i,
+        }
+        for i in range(3)
+    ]
+    captured: dict = {}
+    _stub_submit_flow(
+        monkeypatch, captured, existing_samples=existing, completed_prep_samples={300}
+    )
+    assert main(_submit_args(run, db)) == 0
+
+    posted = [
+        r["json"]["scope_target"]["prep_sample_idx"]
+        for r in captured["requests"]
+        if r["method"] == "POST" and r["url"].endswith("/work-ticket")
+    ]
+    assert sorted(posted) == [301, 302]
+    # Other admins' tickets count, and only a COMPLETED one means the reads loaded.
+    lookups = [
+        r["params"]
+        for r in captured["requests"]
+        if r["method"] == "GET" and r["url"].endswith("/work-ticket")
+    ]
+    assert len(lookups) == 3
+    for params in lookups:
+        assert params["all"] == "true"
+        assert params["state"] == "completed"
+        assert params["action_id"] == "bam-to-parquet"
+    out = capsys.readouterr().out
+    assert "reads already loaded by ticket 1000" in out
+    assert '"samples_skipped": 1' in out
+
+
+def test_submit_pacbio_ingest_a_failed_lookup_is_a_failure_not_a_submit(
+    monkeypatch, tmp_path, build_case5_preflight, capsys
+):
+    """If the completed-ingest lookup fails, the prep_sample is recorded as a
+    failure and not submitted, and the run exits non-zero."""
+    db = build_case5_preflight()
+    run = tmp_path / "run"
+    for bc in ("bc3011", "bc0112", "bc9992"):
+        _make_bam(run, "1_A01", "m84_s1", bc)
+    existing = [
+        {
+            "sequenced_pool_item_id": str(i + 1),
+            "prep_sample_idx": 300 + i,
+            "sequenced_sample_idx": 400 + i,
+        }
+        for i in range(3)
+    ]
+    captured: dict = {}
+    _stub_submit_flow(monkeypatch, captured, existing_samples=existing, lookup_fails=True)
+    with pytest.raises(SystemExit) as ei:
+        main(_submit_args(run, db))
+    assert ei.value.code == 1
+    assert "looking up its completed ingest: " in capsys.readouterr().err
+    assert not [
+        r
+        for r in captured["requests"]
+        if r["method"] == "POST" and r["url"].endswith("/work-ticket")
+    ]
+
+
+def test_submit_pacbio_ingest_new_prep_samples_are_not_looked_up(
+    monkeypatch, tmp_path, build_case5_preflight
+):
+    """A prep_sample this run created cannot have tickets, so it gets no lookup."""
+    db = build_case5_preflight()
+    run = tmp_path / "run"
+    for bc in ("bc3011", "bc0112", "bc9992"):
+        _make_bam(run, "1_A01", "m84_s1", bc)
+    captured: dict = {}
+    _stub_submit_flow(monkeypatch, captured)
+    main(_submit_args(run, db))
+    ticket_calls = [r for r in captured["requests"] if r["url"].endswith("/work-ticket")]
+    assert [r["method"] for r in ticket_calls] == ["POST", "POST", "POST"]
 
 
 def test_read_preflight_rows_rejects_non_pacbio_sheet(build_case5_preflight):
@@ -615,6 +822,6 @@ def test_index_run_bams_skips_combined_bam_without_barcode(tmp_path):
     d.mkdir(parents=True)
     (d / "m84_s1.hifi_reads.bam").write_text("x")  # combined, no barcode
     (d / "m84_s1.hifi_reads.bc1.bam").write_text("x")
-    index, duplicated = _index_run_bams(tmp_path)
+    index, duplicated = index_run_bams(tmp_path)
     assert set(index) == {"bc1"}
     assert duplicated == set()
