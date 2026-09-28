@@ -22,9 +22,10 @@ description: >
   DuckLake `amplicon_membership` (prep_sample_idx, processing_idx, feature_idx,
   count) plus the ASV sequences themselves (`amplicon_sequence` +
   `amplicon_sequence_chunks`, keyed by feature_idx, so an ASV is never recomputed
-  to read back); register-files loads them. The closed-reference (e.g. GG2)
+  to read back); register-files loads them. The ASV-reference-match (e.g. GG2)
   feature table is DERIVED on demand by intersecting feature_idx with a
-  reference's membership — never stored here.
+  reference's membership (an exact ASV match, not similarity-based
+  closed-reference) — never stored here.
 
 scopes: []
 

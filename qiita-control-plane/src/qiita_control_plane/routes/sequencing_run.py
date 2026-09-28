@@ -32,7 +32,6 @@ the sibling sequenced_sample route module.
 
 import base64
 import json
-import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated, Any
@@ -393,33 +392,31 @@ def _apply_preflight_lane_update(
     """Apply ``run_preflight.update_lane`` to a preflight SQLite blob, returning
     the edited bytes and the number of sample rows reassigned.
 
-    The blob is materialized to a private temp file because run_preflight
-    operates on a file-backed sqlite3 connection and commits the lane update in
-    place; the edited bytes are then read back. The ``run_preflight`` import is
-    lazy and local — matching ``jobs/bcl_convert_prep.py`` — so the git-pinned
-    dependency only loads on the rare edit path, never at module import.
-    ``open_db_file`` also applies any pending preflight-schema patches, which can
+    ``load_db_bytes`` loads the blob into a detached in-memory connection (never
+    touching the caller's bytes), ``update_lane`` edits it, and ``dump_db_bytes``
+    serializes the edited image back out — no temp file. The ``run_preflight``
+    import is lazy and local — matching ``jobs/bcl_convert_prep.py`` — so the
+    git-pinned dependency only loads on the rare edit path, never at module import.
+    ``load_db_bytes`` also applies any pending preflight-schema patches, which can
     legitimately rewrite bytes even on a zero-row update; that is intended (it
     keeps a stored preflight current).
 
     Only update_lane's own ``ValueError`` (bad request) is translated to
-    ``_LaneUpdateRejected``; a ``ValueError`` from ``open_db_file`` (e.g. a stored
+    ``_LaneUpdateRejected``; a ``ValueError`` from ``load_db_bytes`` (e.g. a stored
     blob whose schema version exceeds the deployed run_preflight patch set — a
     server/version-skew condition, not a bad request) is deliberately left to
     propagate so the route returns 5xx rather than mislabeling it 422."""
-    from run_preflight import open_db_file, update_lane  # noqa: PLC0415
+    from run_preflight import dump_db_bytes, load_db_bytes, update_lane  # noqa: PLC0415
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        db_path = Path(tmpdir) / "preflight.db"
-        db_path.write_bytes(blob)
-        conn = open_db_file(str(db_path))
-        try:
-            rows_updated = update_lane(conn, platform, from_lane, to_lane, reason)
-        except ValueError as exc:
-            raise _LaneUpdateRejected(str(exc)) from exc
-        finally:
-            conn.close()
-        return db_path.read_bytes(), rows_updated
+    conn = load_db_bytes(blob)
+    try:
+        rows_updated = update_lane(conn, platform, from_lane, to_lane, reason)
+    except ValueError as exc:
+        raise _LaneUpdateRejected(str(exc)) from exc
+    else:
+        return dump_db_bytes(conn), rows_updated
+    finally:
+        conn.close()
 
 
 @router.post(PATH_SEQUENCED_POOL_PREFLIGHT_UPDATE_LANE)

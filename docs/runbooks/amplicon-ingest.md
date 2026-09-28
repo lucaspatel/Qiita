@@ -17,7 +17,7 @@ repeated here — see [`user-cli-quickstart.md`](user-cli-quickstart.md).
 - _(TODO)_ A SortMeRNA 16S database loaded as an ACTIVE `sequence_reference`; its
   `reference_idx` is the `amplicon` submit arg `sortmerna_reference_idx`. (The
   Golay decode cloud is **not** a prerequisite — it is generated in-job.)
-- _(TODO)_ For the derived closed-reference feature table: the reference (e.g. GG2)
+- _(TODO)_ For the derived ASV-reference-match feature table: the reference (e.g. GG2)
   loaded so its `reference_membership` can be intersected with the ASV features.
   **The feature-table reader itself is not part of these workflows** — see the
   tracked follow-up.
@@ -50,8 +50,11 @@ repeated here — see [`user-cli-quickstart.md`](user-cli-quickstart.md).
   `(prep_sample_idx, processing_idx)`, so the re-run replaces its own rows rather
   than doubling the counts.
 
-## Deriving the closed-reference (e.g. GG2) feature table
+## Deriving the ASV-reference-match feature table
 
 - _(TODO — tracked follow-up, not in this PR)_ The feature table is derived on
   demand by intersecting `amplicon_membership.feature_idx` with a reference's
-  `reference_membership`; it is never stored per-reference.
+  `reference_membership`; it is never stored per-reference. This is an **exact ASV
+  match** (identical sequence -> shared `feature_idx`), NOT the similarity-based
+  "closed-reference" of classic OTU pipelines — the name is deliberately distinct
+  to avoid implying a percent-identity clustering step that does not happen here.

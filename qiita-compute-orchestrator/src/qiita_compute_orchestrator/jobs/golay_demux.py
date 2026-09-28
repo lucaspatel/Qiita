@@ -8,8 +8,9 @@ sequence_idx range per sample, write the sorted read.parquet). The I1 index keys
 record, so R1 and R2 land under the same prep_sample; R2 is persisted as
 sequence2/qual2 in `read` (deblur is R1-only, matching the GG2 V4 catalog).
 
-TODO(converge): the per-sample write duplicates fastq_to_parquet/ingest_reads; fold
-into a shared read-ingest core.
+The per-sample mint + sorted write is the shared `read_storage` core `ingest_reads`
+uses; golay only differs in re-numbering each sample's slice of the pooled demux
+intermediate (see the `write_sorted_sample_reads` call below).
 """
 
 from __future__ import annotations
@@ -17,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import itertools
 import math
-import os
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -27,7 +27,6 @@ from qiita_common.parquet import validate_parquet_path
 
 from ..cp_client import make_cp_client
 from ..miint import (
-    PARQUET_OPTS,
     PARQUET_OPTS_INTERMEDIATE,
     apply_duckdb_settings,
     duckdb_tmp_dir,
@@ -36,6 +35,7 @@ from ..miint import (
     resolve_duckdb_memory_gb,
 )
 from ..sequence_range_retry import mint_or_reuse_sequence_range
+from ._read_storage import hardlink, write_sorted_sample_reads
 
 YAML_STEP_NAME = "golay_demux"
 
@@ -231,45 +231,6 @@ def _sample_counts(demuxed_out: Path, duckdb_tmp: Path, *, memory_gb: int) -> li
     return [(int(r[0]), int(r[1])) for r in rows]
 
 
-def _write_sample_reads(
-    demuxed_out: Path,
-    prep_sample_idx: int,
-    start: int,
-    out_path: Path,
-    duckdb_tmp: Path,
-    *,
-    memory_gb: int,
-) -> None:
-    """write one sample's read.parquet from its slice: re-number the reads,
-    assign sequence_idx, sort by it. publish via a .partial sibling."""
-    partial = out_path.parent / f"{out_path.name}.partial"
-    safe_partial = validate_parquet_path(partial)
-    try:
-        with open_conn() as conn:
-            apply_duckdb_settings(conn, duckdb_tmp, memory_gb=memory_gb, threads=_DUCKDB_THREADS)
-            conn.execute(
-                "COPY (SELECT ?::BIGINT AS prep_sample_idx, "
-                "  ROW_NUMBER() OVER (ORDER BY sequence_index) + ? - 1 AS sequence_idx, "
-                "  read_id, sequence1, qual1, sequence2, qual2 "
-                "FROM read_parquet(?) WHERE prep_sample_idx = ? ORDER BY sequence_idx) "
-                f"TO '{safe_partial}' ({PARQUET_OPTS})",
-                [prep_sample_idx, start, str(demuxed_out), prep_sample_idx],
-            )
-        os.replace(partial, out_path)
-    finally:
-        partial.unlink(missing_ok=True)
-
-
-def _hardlink(src: Path, dst: Path) -> None:
-    dst.unlink(missing_ok=True)
-    try:
-        os.link(src, dst)
-    except OSError:
-        import shutil  # noqa: PLC0415
-
-        shutil.copyfile(src, dst)
-
-
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     """demux the pool's FASTQ and ingest per-sample reads. returns
     {"read_staging_dir": workspace}; StepNoData when no read matches a barcode."""
@@ -314,16 +275,23 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                         work_ticket_idx=inputs.work_ticket_idx,
                         step_name=YAML_STEP_NAME,
                     )
+                    # The demux intermediate numbers reads across ALL samples, so
+                    # re-number this sample's slice 1..count with ROW_NUMBER before
+                    # applying the mint offset (ingest_reads' source is already
+                    # per-sample and passes sequence_index verbatim).
                     await asyncio.to_thread(
-                        _write_sample_reads,
+                        write_sorted_sample_reads,
                         demuxed,
-                        prep_sample_idx,
-                        start,
-                        durable,
-                        duckdb_tmp,
+                        prep_sample_idx=prep_sample_idx,
+                        sequence_idx_start=start,
+                        out_path=durable,
+                        duckdb_tmp=duckdb_tmp,
                         memory_gb=memory_gb,
+                        threads=_DUCKDB_THREADS,
+                        local_index_sql="ROW_NUMBER() OVER (ORDER BY sequence_index)",
+                        where_sql=f"prep_sample_idx = {int(prep_sample_idx)}",
                     )
-                    _hardlink(durable, register_dir / f"{prep_sample_idx}.parquet")
+                    hardlink(durable, register_dir / f"{prep_sample_idx}.parquet")
         finally:
             demuxed.unlink(missing_ok=True)
 

@@ -684,7 +684,7 @@ def _write_reference_fasta(
     sql_path = str(partial).replace("'", "''")
     try:
         (count,) = con.execute(
-            "COPY (SELECT feature_idx::VARCHAR AS read_id,"
+            "COPY (SELECT feature_idx AS read_id,"
             "        string_agg(chunk_data, '' ORDER BY chunk_index) AS sequence1"
             "   FROM ref_chunks GROUP BY feature_idx ORDER BY feature_idx)"
             f" TO '{sql_path}' (FORMAT FASTA)"

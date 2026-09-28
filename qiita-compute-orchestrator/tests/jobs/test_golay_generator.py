@@ -1,12 +1,15 @@
 """tests for the in-job Golay decode-cloud generator.
 
 pin the correctness invariants without the vendored table (min distance 8, so
-k<=3 neighbours are unique and the counts are combinatorial). when the vendored
-table is present locally, also assert an exact match for errors<=3.
+k<=3 neighbours are unique and the counts are combinatorial), then assert the
+generator reproduces the canonical duckdb-miint table EXACTLY on a committed
+golden subset (always runs). when the full 16.7M-row vendored table is present
+locally, also assert the exhaustive match for errors<=3.
 """
 
 from __future__ import annotations
 
+import csv
 import math
 from pathlib import Path
 
@@ -19,8 +22,14 @@ from qiita_compute_orchestrator.jobs.golay_demux import (
     _golay_codeword,
 )
 
-# The vendored table, if a dev checkout has it — used only by the optional
-# exact-match test, skipped in CI where it is absent.
+# A committed deterministic subset of the canonical table: all 4096 codewords
+# plus strided samples of correctable neighbours (errors 1-3) and
+# non-correctable 12-mers (errors >3). Small enough to commit, so the
+# match-the-canonical-table assertion runs in CI, not just on a dev checkout.
+_GOLDEN_SUBSET = Path(__file__).resolve().parent / "data" / "golay_golden_subset.csv"
+
+# The full 16.7M-row table (every 12-mer), if a dev checkout has it — used only
+# by the optional exhaustive test, skipped in CI where it is absent.
 _VENDORED_GOLAY = Path(__file__).resolve().parents[3] / "ref" / "golay_corrected_ordered.parquet"
 
 
@@ -74,10 +83,35 @@ def test_correctable_radius():
     assert _correctable_radius(0.5) == 0
 
 
-@pytest.mark.skipif(not _VENDORED_GOLAY.exists(), reason="vendored golay table not present")
+def test_matches_canonical_golden_subset():
+    """The generated cloud reproduces the canonical duckdb-miint table EXACTLY on
+    the committed golden subset: every correctable (errors≤3) sample maps to the
+    same corrected codeword and error count, and every non-correctable (errors>3)
+    sample is absent from the cloud (the decoder must not over-correct). Always
+    runs — this is the load-bearing "matches prior implementations" assertion."""
+    # raw -> (corrected, errors); unique for errors≤3 (min distance 8).
+    gen = {raw: (corrected, errors) for raw, corrected, errors in _golay_cloud_rows(3)}
+
+    correctable = noncorrectable = 0
+    with _GOLDEN_SUBSET.open(newline="") as fh:
+        for row in csv.DictReader(fh):
+            raw, corrected, errors = row["raw"], row["corrected"], int(row["errors"])
+            if errors <= 3:
+                assert gen.get(raw) == (corrected, errors), raw
+                correctable += 1
+            else:
+                assert raw not in gen, raw
+                noncorrectable += 1
+    # guard against an empty/mis-generated fixture silently passing.
+    assert correctable >= 4096  # at least all codewords
+    assert noncorrectable > 0
+
+
+@pytest.mark.skipif(not _VENDORED_GOLAY.exists(), reason="full vendored golay table not present")
 def test_matches_vendored_table_for_correctable_errors():
-    """When the vendored duckdb-miint table is available, the generated cloud
-    reproduces it EXACTLY for errors≤3 (the correctable range the demux uses)."""
+    """Exhaustive local check: when the full 16.7M-row table is available, the
+    generated cloud reproduces it EXACTLY for errors≤3 (the correctable range the
+    demux uses). The committed golden subset covers the CI case."""
     import duckdb  # noqa: PLC0415
 
     gen = {(raw, corrected, errors) for raw, corrected, errors in _golay_cloud_rows(3)}

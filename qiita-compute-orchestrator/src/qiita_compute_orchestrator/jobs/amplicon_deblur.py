@@ -2,9 +2,11 @@
 
 Reference-agnostic. Denoise the pool's reads into ASVs; emit each ASV's canonical
 sequence_hash and per-sample count. mint-features mints feature_idx from the hash;
-the closed-reference table is derived later.
+the ASV-reference-match feature table (exact match, not similarity-based
+closed-reference) is derived later.
 
-Refinements over the historical deblur.sql (reproduce the golden):
+Refinements over the reference implementation (duckdb-miint's amplicon
+`deblur.sql`), whose per-sample ASV output this job is built to reproduce:
   * primer orient is optional (`orient_primer`, default off);
   * UCHIME chimera detection runs before the MSA;
   * feature identity is the shared canonical hash.
@@ -70,9 +72,16 @@ class Inputs(BaseModel):
     work_ticket_idx: int
 
 
-# filter: trim, per-sample derep, SortMeRNA, drop thin samples.
+# The relations these blocks feed to miint table functions (derep, alignable,
+# alignable2, aligned) are regular TABLEs/VIEWs, never TEMP: miint resolves a
+# relation-name argument on a SEPARATE DuckDB connection, which cannot see TEMP
+# tables or CTEs (see docs/duckdb-miint.md "reading tables/views inside table
+# functions"). A plain-DuckDB helper table (e.g. feature_map in amplicon_load)
+# is free to be TEMP; anything a miint call names by string must not be.
+
+# filter: trim, per-sample derep, SortMeRNA, drop samples with <2 ASVs.
 _FILTER_SQL = """
-CREATE OR REPLACE TABLE trimmed AS
+CREATE OR REPLACE VIEW trimmed AS
 SELECT sample_id, sample_id || '_r' || sequence_index AS read_id,
        sequence1[:getvariable('rapid_trim')] AS sequence1
 FROM _inputs
@@ -90,10 +99,11 @@ CREATE OR REPLACE TABLE alignable AS
 WITH joined AS (SELECT d.sample_id, d.read_id, d.sequence1, d.abundance
                 FROM derep d JOIN is_rrna USING (read_id))
 SELECT * FROM joined WHERE sample_id IN (
+    -- keep samples with >=2 distinct ASVs: MAFFT needs 2+ sequences to align.
     SELECT sample_id FROM joined GROUP BY sample_id HAVING COUNT(DISTINCT sequence1) >= 2);
 """
 
-# chimera filter before the MSA, then drop thin samples. the uchime parameters are
+# chimera filter before the MSA, then drop samples left with <2 ASVs. the uchime parameters are
 # the biocore/deblur port (deblur/workflow.py): 1 mismatch in the A/B region cancels
 # a chimera call, ~3 unique reads per region without mismatches makes one.
 _CHIMERA_SQL = """
@@ -105,6 +115,7 @@ SELECT a.sample_id, a.read_id, a.sequence1, a.abundance
 FROM alignable a JOIN (SELECT read_id FROM chimera_calls WHERE flag='N') USING (read_id);
 CREATE OR REPLACE TABLE alignable2 AS
 SELECT * FROM nonchim WHERE sample_id IN (
+    -- keep samples with >=2 distinct ASVs: MAFFT needs 2+ sequences to align.
     SELECT sample_id FROM nonchim GROUP BY sample_id HAVING COUNT(DISTINCT sequence1) >= 2);
 """
 
@@ -273,7 +284,7 @@ def _write_outputs(conn, *, counts_out: Path, manifest_out: Path, chunks_dir: Pa
             f"ORDER BY prep_sample_idx, sequence_hash) TO '{safe_counts}' ({PARQUET_OPTS})"
         )
         conn.execute(
-            f"COPY (SELECT sequence_hash::VARCHAR AS read_id, sequence_hash, sequence_length_bp "
+            f"COPY (SELECT sequence_hash AS read_id, sequence_hash, sequence_length_bp "
             f"FROM asv_seq ORDER BY sequence_hash) TO '{safe_manifest}' ({PARQUET_OPTS})"
         )
         conn.execute(

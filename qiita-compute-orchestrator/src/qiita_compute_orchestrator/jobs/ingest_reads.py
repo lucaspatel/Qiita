@@ -64,8 +64,6 @@ StepNoData (the whole ticket is no-data).
 from __future__ import annotations
 
 import asyncio
-import os
-import shutil
 from pathlib import Path
 
 import duckdb
@@ -78,7 +76,6 @@ from qiita_common.parquet import validate_parquet_path
 
 from ..cp_client import make_cp_client
 from ..miint import (
-    PARQUET_OPTS,
     PARQUET_OPTS_INTERMEDIATE,
     apply_duckdb_settings,
     duckdb_headroom_gb,
@@ -88,6 +85,7 @@ from ..miint import (
     slurm_alloc_gb,
 )
 from ..sequence_range_retry import mint_or_reuse_sequence_range
+from ._read_storage import hardlink, write_sorted_sample_reads
 
 # YAML step name this module implements. Hard-coded because execute()
 # raises BackendFailures itself (which need a step_name); the integration
@@ -227,59 +225,6 @@ def _stage_intermediate_reads(
     return int(count)
 
 
-def _write_sorted_reads(
-    intermediate_path: Path,
-    prep_sample_idx: int,
-    sequence_idx_start: int,
-    out_path: Path,
-    duckdb_tmp: Path,
-    memory_gb: int,
-    threads: int,
-) -> None:
-    """Second pass: read the staged intermediate, assign the minted
-    `sequence_idx`, and write the durable `read.parquet` at `out_path` sorted by
-    `sequence_idx`. No FASTQ re-parse — the heavy parse already happened in
-    `_stage_intermediate_reads`. `sequence_idx_start` is the inclusive mint start;
-    `sequence_index` is miint's 1-based per-file row index.
-
-    Sorts by `sequence_idx` alone: `prep_sample_idx` is a constant literal for the
-    whole sample (cardinality 1), so adding it to the sort key orders nothing —
-    the output is identical to sorting by `(prep_sample_idx, sequence_idx)`. The
-    explicit ORDER BY is load-bearing: the read happens with
-    `preserve_insertion_order=false`, which lets DuckDB write rows out of order,
-    so only the sort guarantees `sequence_idx` is ordered at rest (for DuckLake
-    pruning / row-group pushdown).
-
-    **Atomic publish.** The sorted COPY lands in a `.partial` sibling, then
-    `os.replace`s into `out_path` (atomic on the same filesystem). This is
-    load-bearing for idempotency: `out_path` is ALSO the retry sentinel
-    (execute() skips a sample whose durable copy exists), so it must only ever
-    appear complete — DuckDB `COPY ... TO` is not atomic, and an OOM-kill /
-    walltime cut mid-COPY would otherwise leave a truncated `read.parquet` that
-    the next attempt skips and registers as the full read set."""
-    partial_path = out_path.parent / f"{out_path.name}.partial"
-    partial = validate_parquet_path(partial_path)
-    try:
-        with open_conn() as conn:
-            apply_duckdb_settings(conn, duckdb_tmp, memory_gb=memory_gb, threads=threads)
-            conn.execute(
-                "COPY ( SELECT "
-                "  ?::BIGINT AS prep_sample_idx,"
-                "  sequence_index + ? - 1 AS sequence_idx,"
-                "  read_id, sequence1, qual1, sequence2, qual2 "
-                "FROM read_parquet(?) "
-                "ORDER BY sequence_idx ) "
-                f"TO '{partial}' ({PARQUET_OPTS})",
-                [prep_sample_idx, sequence_idx_start, str(intermediate_path)],
-            )
-        # Publish atomically: the durable path only ever appears complete.
-        os.replace(partial_path, out_path)
-    finally:
-        # If the COPY died before the replace, drop the half-written partial so
-        # a retry re-derives instead of finding stale bytes.
-        partial_path.unlink(missing_ok=True)
-
-
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     """Ingest every pool sample's reads, up to `_CONCURRENCY` at once. See the
     module docstring for the per-sample pipeline and idempotency model."""
@@ -311,7 +256,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # Re-create the register hardlink (the prior workspace is gone) so the
             # retry still registers this sample.
             if durable.exists():
-                _hardlink(durable, part)
+                hardlink(durable, part)
                 return "registered"
 
             r1 = _match_fastq(inputs.convert_dir, pool_item_id, "R1")
@@ -351,18 +296,18 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                     step_name=YAML_STEP_NAME,
                 )
                 await asyncio.to_thread(
-                    _write_sorted_reads,
+                    write_sorted_sample_reads,
                     intermediate,
-                    prep_sample_idx,
-                    sequence_idx_start,
-                    durable,
-                    sample_tmp,
-                    memory_gb,
-                    threads,
+                    prep_sample_idx=prep_sample_idx,
+                    sequence_idx_start=sequence_idx_start,
+                    out_path=durable,
+                    duckdb_tmp=sample_tmp,
+                    memory_gb=memory_gb,
+                    threads=threads,
                 )
             finally:
                 intermediate.unlink(missing_ok=True)
-            _hardlink(durable, part)
+            hardlink(durable, part)
             return "registered"
 
     with duckdb_tmp_dir(workspace) as duckdb_tmp:
@@ -404,14 +349,3 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     # `read_staging_dir` is the workspace: register-files finds the `read/`
     # subdir of per-sample parts and loads them all into the `read` table.
     return {"read_staging_dir": workspace}
-
-
-def _hardlink(src: Path, dst: Path) -> None:
-    """Hardlink `src` -> `dst` (same scratch filesystem), replacing an
-    existing dst. Falls back to a copy across filesystems (defensive — the
-    durable copy and the workspace are both under PATH_SCRATCH)."""
-    dst.unlink(missing_ok=True)
-    try:
-        os.link(src, dst)
-    except OSError:
-        shutil.copyfile(src, dst)

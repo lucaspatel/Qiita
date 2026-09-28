@@ -8,6 +8,14 @@ description: >
   DuckLake `read` table — the analogue of bcl-convert for runs that arrive
   already converted-but-multiplexed.
 
+  There is NO bcl-convert step in this workflow: an EMP 16S run's per-sample
+  identity is a Golay barcode carried IN the reads (I1), not an Illumina
+  sample-sheet index, so BCL->FASTQ conversion happens upstream (at the core /
+  a plain bcl2fastq run with no per-sample indices) and yields ONE multiplexed
+  Undetermined I1/R1/R2 set. This step's input IS that already-converted set;
+  it does the demux the instrument could not. (Contrast: bcl-convert demuxes by
+  index in-workflow; PacBio arrives per-barcode BAM, already demuxed.)
+
   The `golay_demux` step pairs I1 against R1/R2 by record order (I1 is submitted
   RC to the prep), assigns each read to the prep_sample whose barcode its
   corrected index matches (Golay error-correction cloud), mints a sequence_idx

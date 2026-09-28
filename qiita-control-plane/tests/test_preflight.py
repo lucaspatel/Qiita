@@ -87,16 +87,19 @@ def test_pacbio_readers_decline_a_non_pacbio_blob(build_case5_preflight):
     exception type — and, critically, an Illumina pool never pays for a PacBio read.
 
     Uses a real pre-flight with its sheet_type swapped (rather than an empty SQLite):
-    `open_db_file` applies run_preflight's schema patches on open, so a schema-less
-    database is not a "non-PacBio blob" — it is an unopenable one."""
+    `load_db_bytes` applies run_preflight's schema patches on load, so a schema-less
+    database is not a "non-PacBio blob" — it is an unloadable one."""
     db = build_case5_preflight(sheet_type="bclconvert")
     assert pacbio_protocol_from_blob(db.read_bytes()) == {}
 
 
 def test_pacbio_protocol_raises_on_an_unreadable_blob():
     """An unreadable blob PROPAGATES: the roster route degrades it to "unknown" and
-    warns; the CLI fails fast. Neither is served by swallowing it here."""
-    with pytest.raises(sqlite3.DatabaseError):
+    warns; the CLI fails fast. Neither is served by swallowing it here.
+
+    load_db_bytes sniffs the header, so a non-SQLite blob raises ValueError; a
+    header-bearing but truncated one raises sqlite3.DatabaseError. Both propagate."""
+    with pytest.raises((sqlite3.DatabaseError, ValueError)):
         pacbio_protocol_from_blob(b"this is not a sqlite file")
 
 

@@ -123,12 +123,15 @@ def _read_pacbio_preflight_rows(
     `parser.error` so the CLI surfaces one stderr line and exits 2 before any
     network call — matching `_read_preflight_rows`.
     """
-    from run_preflight import get_pacbio_sample_info, open_db_file  # noqa: PLC0415
+    from run_preflight import get_pacbio_sample_info, load_file  # noqa: PLC0415
     from run_preflight.db import get_run_legacy_format, get_single_run_idx  # noqa: PLC0415
 
     try:
-        conn = open_db_file(preflight_blob)
-    except sqlite3.DatabaseError as exc:
+        conn = load_file(preflight_blob)
+    except (FileNotFoundError, sqlite3.DatabaseError, ValueError) as exc:
+        # load_file's error contract: FileNotFoundError (no such path),
+        # sqlite3.DatabaseError (truncated SQLite), ValueError (not a SQLite / bad
+        # legacy CSV). All mean "not a usable preflight file" here.
         parser.error(f"--preflight-blob {preflight_blob}: not a readable SQLite file: {exc}")
     try:
         run_idx = get_single_run_idx(conn)

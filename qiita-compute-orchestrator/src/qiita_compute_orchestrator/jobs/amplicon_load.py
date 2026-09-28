@@ -130,10 +130,10 @@ def _write_amplicon_membership(
     conn.execute(
         "COPY ("
         "  SELECT"
-        "    c.prep_sample_idx AS prep_sample_idx,"
+        "    c.prep_sample_idx,"
         f"    CAST({processing_idx} AS BIGINT) AS processing_idx,"
-        "    fm.feature_idx AS feature_idx,"
-        "    c.count AS count"
+        "    fm.feature_idx,"
+        "    c.count"
         "  FROM read_parquet(?) c"
         "  JOIN feature_map fm ON c.sequence_hash = fm.sequence_hash"
         "  ORDER BY prep_sample_idx, feature_idx"

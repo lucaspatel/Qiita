@@ -122,11 +122,14 @@ def _read_preflight_rows(
     primary_project_accession) raise via parser.error so the CLI
     surfaces a single stderr line and exits 2 before any network call.
     """
-    from run_preflight import get_illumina_sample_info, open_db_file  # noqa: PLC0415
+    from run_preflight import get_illumina_sample_info, load_file  # noqa: PLC0415
 
     try:
-        conn = open_db_file(preflight_blob)
-    except sqlite3.DatabaseError as exc:
+        conn = load_file(preflight_blob)
+    except (FileNotFoundError, sqlite3.DatabaseError, ValueError) as exc:
+        # load_file's error contract: FileNotFoundError (no such path),
+        # sqlite3.DatabaseError (truncated SQLite), ValueError (not a SQLite / bad
+        # legacy CSV). All mean "not a usable preflight file" here.
         parser.error(f"--preflight-blob {preflight_blob}: not a readable SQLite file: {exc}")
     try:
         illumina_samples = get_illumina_sample_info(conn)
