@@ -22,11 +22,15 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 ### Added
 
 - **Rapid 16S amplicon processing: `golay-demux` + `amplicon` workflows (#244).**
-  Two workflows bring EMP-style 16S into Qiita. `golay-demux` (ingest) Golay-barcode
-  demultiplexes a pool's multiplexed FASTQ (R1 + I1 + optional R2) into per-sample reads
-  in the DuckLake `read` table — the analogue of bcl-convert for runs that arrive
-  already-converted-but-multiplexed; the [24,12,8] Golay decode cloud is generated
-  in-job (no vendored table / operator path). `amplicon` (process) denoises a pool's
+  Two workflows bring EMP-style 16S into Qiita. `golay-demux` (ingest) converts a pool's
+  Illumina 16S run with bcl-convert using a no-index dummy sheet built from RunInfo.xml
+  (every read to Undetermined, the Golay I1 emitted as a FASTQ), then Golay-barcode
+  demultiplexes the Undetermined I1/R1/R2 into per-sample reads in the DuckLake `read`
+  table; the [24,12,8] Golay decode cloud is generated in-job (no vendored table /
+  operator path). A run is submitted by id — `qiita submit-golay-demux
+  --instrument-run-id <id>` — which the control plane resolves to the BCL run folder
+  against `PATH_INGEST_ROOTS`, so the submitter never names a host path. `amplicon`
+  (process) denoises a pool's
   stored reads with deblur (trim → dereplicate → SortMeRNA 16S pre-filter → UCHIME
   chimera → MAFFT → deblur), **reference-agnostically**: every ASV gets a `feature_idx`
   from its canonical sequence hash and per-sample counts land in the new DuckLake
@@ -45,6 +49,19 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   deblur step works around [duckdb-miint#194](https://github.com/the-miint/duckdb-miint/issues/194)
   (MAFFT litters `order`/`pre`/`trace` into the CWD on some strategies) by running MAFFT
   in a per-job scratch dir (`miint.mafft_scratch_cwd`).
+- **`qiita submit-ena-import` / `qiita ena-import-status` submit and watch a batch ENA
+  study import from the CLI (#629).** `submit-ena-import ACCESSION [ACCESSION ...]` (or
+  `--from-file`, one accession per line — a whole-line `#` comment only; a trailing
+  comment or more than one accession on a line is refused, naming the line number)
+  validates every accession locally, `POST`s `/ena-import-batch`, and by default polls
+  to terminal with bounded `--poll-interval-seconds` / `--timeout-seconds` flags —
+  printing each item's state change and exiting `1` if any item ends `failed` or the
+  watch times out (naming every still-pending accession and its last known state); a
+  transient error while polling is retried until the deadline instead of failing the
+  watch. `--no-watch` returns right after submit; Ctrl-C exits `130`, naming the batch
+  to poll if it had already been created. `ena-import-status IDX` reads a batch's
+  current state. Both require wet_lab_admin or system_admin, matching the routes' own
+  gate.
 - **A study reader can export per-prep_sample SynDNA insert read counts as BIOM or Parquet
   (#621).** The read-mask workflow's new `persist-syndna-read-count` action (gated on
   `syndna_enabled`, appended after `finalize-mask-sample`) reduces the `syndna` step's
@@ -1987,6 +2004,8 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **Native sequenced-sample import now locks its sequencing run and refuses pools whose download roster is already staged** — the POST route takes #602's sequencing_run advisory lock around the insert and 409s (covering a queued download ticket too) when the pool's latest download-ena-study ticket has already read its run roster, naming the run and telling the caller to add the sample to a new pool instead. The lock wait is bounded at 5s, well under the CLI's own HTTP timeout, and a wait that exhausts it answers 503 with Retry-After rather than an unbounded hang (#627).
+
 - **The `reference_load` tests pin the host RAM they assume (#616).** Off SLURM,
   `load`'s DuckDB limit is detected RAM minus its 8-thread headroom (#606), which is
   1 GB on the 7 GB macOS runner, and `read_jplace` asks DuckDB 1.5.4 for about
@@ -3888,6 +3907,14 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   command prints it.
 
 ### Changed
+
+- **INSDC accession validation moved into `qiita-common` (#629).** `EnaAccessionKind`,
+  `InvalidEnaAccessionError`, `detect_accession_kind`, and `validate_study_accession` now
+  live in `qiita_common.ena_accession`, not `qiita_control_plane.ena_import.accession` —
+  the CLI's accession checks (`qiita submit-ena-import`) need them without importing the
+  control plane. `qiita_control_plane.ena_import` still re-exports the first three.
+  `qiita_common.models.ena_import` also gained `TERMINAL_BATCH_ITEM_STATES`, named beside
+  `BatchItemState` the way `TERMINAL_WORK_TICKET_STATES` sits beside `WorkTicketState`.
 
 - **CLAUDE.md: read DuckLake data through the catalog, never `read_parquet` over its files
   (#611).** Ad-hoc scripts that globbed a table's Parquet read files the catalog does not
