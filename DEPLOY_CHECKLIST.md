@@ -15,7 +15,11 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 1. Env vars — set BEFORE the deploy (most are `from_env()` fail-fast; a missing one keeps the unit down)
 
-_None yet._
+- `[operator]` **`PATH_INGEST_ROOTS` must cover the sequencer run-folder root(s).** No new
+  variable — but `submit-golay-demux --instrument-run-id <id>` resolves the run folder by
+  scanning `PATH_INGEST_ROOTS` for a directory whose basename matches the run id, so a run
+  living under a path the roots don't cover cannot be submitted. Ensure the existing value
+  includes wherever instruments copy runs. (#244)
 
 ### 2. One-time host setup
 
@@ -42,7 +46,9 @@ _None yet._
   build — a stale build missing one fails the deploy here, not at the first amplicon submit.
   The `amplicon` workflow additionally needs a SortMeRNA 16S database loaded as an ACTIVE
   `sequence_reference` (its `reference_idx` is a submit-time context arg) — a per-study data
-  setup, not a deploy step. (#244)
+  setup, not a deploy step. `golay-demux` now runs bcl-convert (a container step) before the
+  demux, so it needs `bcl-convert-4.5.4.sif` present — the same SIF the `bcl-convert` workflow
+  uses, rebuilt automatically at deploy — and a compute node that can run it. (#244)
 
 ### 6. After the deploy verifies green
 
