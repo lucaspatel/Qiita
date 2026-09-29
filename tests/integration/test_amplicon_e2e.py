@@ -75,20 +75,18 @@ _EXPECTED_FEATURES = 124
 _TRIM = 150
 
 
-def _parse_fasta(path: Path) -> list[str]:
-    """Return the sequence strings from a plain (uncompressed) FASTA."""
-    seqs: list[str] = []
-    current: list[str] = []
-    for line in path.read_text().splitlines():
-        if line.startswith(">"):
-            if current:
-                seqs.append("".join(current))
-                current = []
-        else:
-            current.append(line.strip())
-    if current:
-        seqs.append("".join(current))
-    return seqs
+def _read_fasta_sequences(path: Path) -> list[str]:
+    """Return the sequence strings from a FASTA via miint's read_fastx (which
+    reads .gz natively), rather than a hand-rolled parser."""
+    from qiita_compute_orchestrator.miint import open_miint_conn
+
+    with open_miint_conn() as conn:
+        return [
+            row[0]
+            for row in conn.execute(
+                "SELECT sequence1 FROM read_fastx(?)", [str(path)]
+            ).fetchall()
+        ]
 
 
 # The native tail of the shipped golay-demux workflow (golay_demux ->
@@ -256,7 +254,7 @@ async def sortmerna_reference(postgres_pool, human_admin_session, data_plane):
     it is left out.
     """
     owner = human_admin_session["principal_idx"]
-    sequences = _parse_fasta(_FIXTURE / "sortmerna_16s_ref.fasta")
+    sequences = _read_fasta_sequences(_FIXTURE / "sortmerna_16s_ref.fasta.gz")
 
     reference_idx = await postgres_pool.fetchval(
         "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"

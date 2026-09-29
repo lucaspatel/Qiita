@@ -2,8 +2,8 @@
 
 Two surfaces, pure-unit (no Postgres):
   * `_read_amplicon_preflight_rows` — the preflight reader (kl-run-preflight's
-    `get_amplicon_sample_info`), exercised end-to-end against a REAL kl-run-preflight
-    SQLite built from the pinned good_amplicon_v1 fixture.
+    `get_amplicon_sample_info`), exercised end-to-end against the committed migrated
+    preflight SQLite (good_amplicon_v1.sqlite.gz).
   * `_handle_submit_golay_demux` — the full submit flow, HTTP mocked, asserting the
     run/pool/sample setup and the ONE pool-scoped golay-demux ticket, including the
     barcode_map and the CP-resolved bcl_input_dir carried in action_context.
@@ -11,6 +11,7 @@ Two surfaces, pure-unit (no Postgres):
 
 from __future__ import annotations
 
+import gzip
 import sqlite3
 from pathlib import Path
 
@@ -21,7 +22,12 @@ from qiita_control_plane.cli import _common
 from qiita_control_plane.cli.user import main
 from qiita_control_plane.cli.user.amplicon import _read_amplicon_preflight_rows
 
-_AMPLICON_V1_CSV = Path(__file__).parent / "data" / "good_amplicon_v1.txt"
+# The migrated preflight SQLite Qiita-MIINT actually consumes, committed directly
+# (gzipped) rather than a Qiita-classic prep template migrated at test time —
+# Qiita-MIINT knows nothing about classic prep files. To regenerate after a
+# preflight schema change: migrate the source prep sheet with run_preflight and
+# gzip the result over this file.
+_AMPLICON_V1_SQLITE_GZ = Path(__file__).parent / "data" / "good_amplicon_v1.sqlite.gz"
 
 _RUN_ID = "20260925_SL00377_0008_ASC2267726-SC3"
 _RESOLVED_BCL_DIR = f"/sequencing/{_RUN_ID}"
@@ -39,18 +45,15 @@ class _RaisingParser:
 
 
 def _build_amplicon_preflight(tmp_path: Path, *, populate_accessions: bool = True) -> Path:
-    """Build a real kl-run-preflight SQLite from the pinned amplicon_v1 fixture.
+    """Materialize the committed migrated preflight SQLite under tmp_path.
 
-    Mirrors conftest's `build_case5_preflight`: parse the legacy sheet with
-    run_preflight's own loader (so the seam is exercised against the true schema and
-    the real `get_amplicon_sample_info`), then populate the biosample + bioproject
-    accessions the reader REQUIRES (left NULL by the fixture; set upstream in
-    production) via plain sqlite.
+    Decompresses the stored preflight DB (the artifact Qiita-MIINT consumes) rather
+    than migrating a classic prep template at test time, then populates the
+    biosample + bioproject accessions the reader REQUIRES (left NULL by the fixture;
+    set upstream in production) via plain sqlite.
     """
-    from run_preflight.legacy.api import migrate_legacy_csv_to_db_file
-
     db = tmp_path / "amplicon_v1.db"
-    migrate_legacy_csv_to_db_file(str(_AMPLICON_V1_CSV), str(db))
+    db.write_bytes(gzip.decompress(_AMPLICON_V1_SQLITE_GZ.read_bytes()))
     if populate_accessions:
         conn = sqlite3.connect(db)
         conn.execute("UPDATE input_sample SET biosample_accession = 'BIO_' || sample_name")

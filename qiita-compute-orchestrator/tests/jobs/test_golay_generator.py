@@ -9,7 +9,6 @@ locally, also assert the exhaustive match for errors<=3.
 
 from __future__ import annotations
 
-import csv
 import math
 from pathlib import Path
 
@@ -24,9 +23,9 @@ from qiita_compute_orchestrator.jobs.golay_demux import (
 
 # A committed deterministic subset of the canonical table: all 4096 codewords
 # plus strided samples of correctable neighbours (errors 1-3) and
-# non-correctable 12-mers (errors >3). Small enough to commit, so the
-# match-the-canonical-table assertion runs in CI, not just on a dev checkout.
-_GOLDEN_SUBSET = Path(__file__).resolve().parent / "data" / "golay_golden_subset.csv"
+# non-correctable 12-mers (errors >3). Gzipped (it ships in CI) and read via
+# duckdb, whose CSV reader handles the compression natively.
+_GOLDEN_SUBSET = Path(__file__).resolve().parent / "data" / "golay_golden_subset.csv.gz"
 
 # The full 16.7M-row table (every 12-mer), if a dev checkout has it — used only
 # by the optional exhaustive test, skipped in CI where it is absent.
@@ -89,19 +88,25 @@ def test_matches_canonical_golden_subset():
     same corrected codeword and error count, and every non-correctable (errors>3)
     sample is absent from the cloud (the decoder must not over-correct). Always
     runs — this is the load-bearing "matches prior implementations" assertion."""
+    import duckdb  # noqa: PLC0415
+
     # raw -> (corrected, errors); unique for errors≤3 (min distance 8).
     gen = {raw: (corrected, errors) for raw, corrected, errors in _golay_cloud_rows(3)}
 
+    # duckdb's CSV reader decompresses the .gz natively.
+    with duckdb.connect(":memory:") as conn:
+        golden = conn.execute(
+            "SELECT raw, corrected, errors FROM read_csv(?)", [str(_GOLDEN_SUBSET)]
+        ).fetchall()
+
     correctable = noncorrectable = 0
-    with _GOLDEN_SUBSET.open(newline="") as fh:
-        for row in csv.DictReader(fh):
-            raw, corrected, errors = row["raw"], row["corrected"], int(row["errors"])
-            if errors <= 3:
-                assert gen.get(raw) == (corrected, errors), raw
-                correctable += 1
-            else:
-                assert raw not in gen, raw
-                noncorrectable += 1
+    for raw, corrected, errors in golden:
+        if errors <= 3:
+            assert gen.get(raw) == (corrected, errors), raw
+            correctable += 1
+        else:
+            assert raw not in gen, raw
+            noncorrectable += 1
     # guard against an empty/mis-generated fixture silently passing.
     assert correctable >= 4096  # at least all codewords
     assert noncorrectable > 0
