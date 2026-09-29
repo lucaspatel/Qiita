@@ -8,6 +8,13 @@ over an ASGI transport for the two CO->CP callbacks the steps make):
                R1/R2 FASTQ) into per-sample reads, mints a `qiita.sequence_range`
                per prep_sample (CO->CP callback), and register-files loads the
                reads into the DuckLake `read` table.
+
+The shipped golay-demux workflow runs bcl-convert (a container step) before the
+demux, which LocalBackend cannot dispatch. So — exactly as test_read_mask_e2e
+substitutes host_filter's output — this drives a trimmed golay-demux (the native
+tail: golay_demux -> register-files) against a synthesized `convert_dir` holding
+the Undetermined I1/R1/R2 FASTQs bcl_convert would have written. bcl-convert
+itself runs only under SLURM in production.
   amplicon     streams the pool's reads back from `read` at runtime (denoise
                issues a pool-scoped read-block DoGet ticket via a CO->CP
                callback), materializes the seeded SortMeRNA reference to a FASTA,
@@ -31,9 +38,9 @@ counts asserted below are reproducible without a Linux/SLURM stack.
 
 from __future__ import annotations
 
-import gzip
 import json
 import secrets
+import shutil
 import uuid
 from pathlib import Path
 
@@ -84,14 +91,75 @@ def _parse_fasta(path: Path) -> list[str]:
     return seqs
 
 
-async def _sync_workflow(postgres_pool, tmp_dir: Path, name: str) -> None:
-    """Materialize workflows/<name>/1.0.0.yaml under a temp tree so the loader's
-    directory walk picks it up, and sync it into qiita.action."""
+# The native tail of the shipped golay-demux workflow (golay_demux ->
+# register-files) with the two bcl-convert container steps dropped and
+# convert_dir promoted to a context input, so it runs under LocalBackend. The
+# shipped 4-step YAML's validity is covered by test_actions_loader; here we only
+# need to exercise the demux + ingest + register chain the container feeds.
+_GOLAY_DEMUX_E2E_YAML = """\
+action_id: golay-demux
+version: 1.0.0
+target_kind: sequenced_pool
+description: >
+  Test-only trimmed golay-demux (native tail) driven against a synthesized
+  bcl_convert convert_dir. Not the shipped workflow.
+scopes: []
+audience:
+  service: false
+  human_roles: [wet_lab_admin, system_admin]
+context_schema:
+  type: object
+  required: [convert_dir, barcode_map]
+  properties:
+    convert_dir:
+      type: string
+      minLength: 1
+      pattern: "^/"
+    barcode_map:
+      type: array
+      minItems: 1
+      items:
+        type: object
+        required: [prep_sample_idx, barcode, barcodes_are_rc]
+        properties:
+          prep_sample_idx: {type: integer, minimum: 1}
+          barcode: {type: string, minLength: 1}
+          barcodes_are_rc: {type: boolean}
+    golay_error_threshold:
+      type: number
+      minimum: 0
+      default: 1.5
+steps:
+  - step: golay_demux
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.golay_demux
+    inputs: [convert_dir, barcode_map, reads_staging_root]
+    params: {golay_error_threshold: golay_error_threshold}
+    outputs: [read_staging_dir]
+    baseline_resources:
+      cpu: 8
+      mem_gb: 32
+      walltime: PT4H
+  - action: register-files
+    inputs: [read_staging_dir]
+    outputs: []
+action_ceiling:
+  cpu: 8
+  mem_gb: 56
+  walltime: PT8H
+"""
+
+
+async def _sync_workflow_yaml(
+    postgres_pool, tmp_dir: Path, name: str, content: str
+) -> None:
+    """Write `content` as workflows/<name>/1.0.0.yaml under a temp tree and sync it
+    into qiita.action."""
     from qiita_control_plane.actions import load_actions, sync_actions
 
     dest = tmp_dir / "workflows" / name
     dest.mkdir(parents=True)
-    (dest / "1.0.0.yaml").write_text((_WORKFLOWS / name / "1.0.0.yaml").read_text())
+    (dest / "1.0.0.yaml").write_text(content)
     actions = load_actions(tmp_dir / "workflows")
     async with postgres_pool.acquire() as conn:
         await sync_actions(conn, actions)
@@ -99,9 +167,17 @@ async def _sync_workflow(postgres_pool, tmp_dir: Path, name: str) -> None:
 
 @pytest.fixture
 async def synced_amplicon_actions(postgres_pool, tmp_path):
-    """Sync golay-demux + amplicon into qiita.action; clean both up after."""
-    await _sync_workflow(postgres_pool, tmp_path / "golay", "golay-demux")
-    await _sync_workflow(postgres_pool, tmp_path / "amp", "amplicon")
+    """Sync the trimmed golay-demux (native tail) + the real amplicon workflow into
+    qiita.action; clean both up after."""
+    await _sync_workflow_yaml(
+        postgres_pool, tmp_path / "golay", "golay-demux", _GOLAY_DEMUX_E2E_YAML
+    )
+    await _sync_workflow_yaml(
+        postgres_pool,
+        tmp_path / "amp",
+        "amplicon",
+        (_WORKFLOWS / "amplicon" / "1.0.0.yaml").read_text(),
+    )
     yield
     for action_id in ("golay-demux", "amplicon"):
         await postgres_pool.execute(
@@ -290,9 +366,18 @@ def co_cp_bridge(
     _settings_ctx.reset(ctx_token)
 
 
-def _gunzip(src: Path, dst: Path) -> Path:
-    dst.write_bytes(gzip.decompress(src.read_bytes()))
-    return dst
+def _build_convert_dir(dest: Path) -> Path:
+    """Synthesize bcl_convert's output: the pool's Undetermined I1/R1/R2 FASTQs
+    under `dest`, named as bcl-convert writes them. golay_demux's `_find_undetermined`
+    globs these; read_fastx reads .gz directly, so no decompression is needed."""
+    dest.mkdir(parents=True, exist_ok=True)
+    for tag, src in (
+        ("I1", "I1.fastq.gz"),
+        ("R1", "R1.fastq.gz"),
+        ("R2", "R2.fastq.gz"),
+    ):
+        shutil.copy(_FIXTURE / src, dest / f"Undetermined_S0_L001_{tag}_001.fastq.gz")
+    return dest
 
 
 async def _run(
@@ -338,11 +423,9 @@ async def test_golay_demux_then_amplicon(
     pool_idx = seeded_pool["pool_idx"]
     prep_idxs = [p for _, p, _ in seeded_pool["samples"]]
 
-    # Stage the multiplexed FASTQ as plain files (read_fastx reads either, but
-    # the workflow's context pattern is just an absolute path).
-    i1 = _gunzip(_FIXTURE / "I1.fastq.gz", tmp_path / "I1.fastq")
-    r1 = _gunzip(_FIXTURE / "R1.fastq.gz", tmp_path / "R1.fastq")
-    r2 = _gunzip(_FIXTURE / "R2.fastq.gz", tmp_path / "R2.fastq")
+    # Synthesize bcl_convert's Undetermined I1/R1/R2 output (the container step
+    # LocalBackend can't run) so the trimmed golay-demux consumes a real convert_dir.
+    convert_dir = _build_convert_dir(tmp_path / "convert")
 
     barcode_map = [
         {"prep_sample_idx": prep_idx, "barcode": barcode, "barcodes_are_rc": True}
@@ -357,9 +440,7 @@ async def test_golay_demux_then_amplicon(
         pool_idx=pool_idx,
         owner=owner,
         action_context={
-            "index_reads_path": str(i1),
-            "forward_reads_path": str(r1),
-            "reverse_reads_path": str(r2),
+            "convert_dir": str(convert_dir),
             "barcode_map": barcode_map,
         },
     )
