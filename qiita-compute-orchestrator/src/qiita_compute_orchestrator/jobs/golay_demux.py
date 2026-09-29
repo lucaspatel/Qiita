@@ -1,6 +1,7 @@
 """Golay-barcode demux of a pool's multiplexed 16S run into the DuckLake `read`
-table — the analogue of bcl-convert+ingest_reads for runs that arrive as one
-multiplexed FASTQ set (R1 + R2 + I1) rather than a per-sample BCL demux.
+table — the amplicon analogue of ingest_reads. It runs after bcl_convert, which
+sent every read to Undetermined (the dummy no-index sheet) and emitted the Golay
+I1 index, and reads that convert_dir's I1/R1/R2 FASTQs directly.
 
 Two halves: demux (build the Golay cloud, pair I1 against R1/R2 by record order with
 I1 reverse-complemented, assign each read to its prep_sample) and ingest (mint a
@@ -126,9 +127,9 @@ def _build_golay_cloud(conn, max_errors: int) -> None:
 class Inputs(BaseModel):
     """input contract for golay_demux.
 
-    index_reads_path: multiplexed I1 barcode FASTQ (12-nt Golay codes).
-    forward_reads_path: multiplexed R1 FASTQ (paired to I1 by record order).
-    reverse_reads_path: multiplexed R2 FASTQ (optional; kept as sequence2/qual2).
+    convert_dir: the bcl_convert step's output dir, holding the pool's Undetermined
+        I1/R1/R2 FASTQs (no per-sample demux happened upstream — the dummy sheet
+        sent everything to Undetermined and emitted the Golay I1 index).
     barcode_map: runner-staged roster (prep_sample_idx, barcode, barcodes_are_rc);
         the RC flag is per-sample provenance.
     golay_error_threshold: max Golay errors to accept a match (EMP: 1.5). the
@@ -136,9 +137,7 @@ class Inputs(BaseModel):
     reads_staging_root: scratch root for the durable per-sample copies.
     """
 
-    index_reads_path: Path
-    forward_reads_path: Path
-    reverse_reads_path: Path | None = None
+    convert_dir: Path
     barcode_map: Path
     golay_error_threshold: float = 1.5
     reads_staging_root: Path
@@ -147,17 +146,58 @@ class Inputs(BaseModel):
     work_ticket_idx: int
 
 
-def _run_demux(inputs: Inputs, demuxed_out: Path, duckdb_tmp: Path, *, memory_gb: int) -> None:
+class _UndeterminedReads(BaseModel):
+    """The I1/R1/R2 FASTQs bcl_convert wrote for the pool's Undetermined reads."""
+
+    index_reads_path: Path
+    forward_reads_path: Path
+    reverse_reads_path: Path | None = None
+
+
+def _find_undetermined(convert_dir: Path) -> _UndeterminedReads:
+    """Locate the Undetermined I1/R1/R2 FASTQs in a bcl_convert output dir.
+
+    Requires exactly one I1 and one R1 (single-lane MiSeq Rapid 16S); a multi-lane
+    run would need per-lane concatenation, which is not supported here, so it fails
+    loud rather than silently reading one lane. R2 is optional but, if present,
+    must also be single.
+    """
+
+    def one(tag: str, *, required: bool) -> Path | None:
+        hits = sorted(convert_dir.glob(f"Undetermined_S*_{tag}_*.fastq.gz"))
+        if len(hits) == 1:
+            return hits[0]
+        if not hits and not required:
+            return None
+        raise ValueError(
+            f"expected exactly one Undetermined {tag} FASTQ in {convert_dir}, found {len(hits)}"
+        )
+
+    return _UndeterminedReads(
+        index_reads_path=one("I1", required=True),
+        forward_reads_path=one("R1", required=True),
+        reverse_reads_path=one("R2", required=False),
+    )
+
+
+def _run_demux(
+    inputs: Inputs,
+    reads: _UndeterminedReads,
+    demuxed_out: Path,
+    duckdb_tmp: Path,
+    *,
+    memory_gb: int,
+) -> None:
     """demux the FASTQ to an intermediate parquet keyed by prep_sample_idx.
     paths are inlined (sanitised); DuckDB rejects bound params in CREATE VIEW/SET."""
-    i1 = validate_parquet_path(inputs.index_reads_path)
-    r1 = validate_parquet_path(inputs.forward_reads_path)
+    i1 = validate_parquet_path(reads.index_reads_path)
+    r1 = validate_parquet_path(reads.forward_reads_path)
     bc = validate_parquet_path(inputs.barcode_map)
     out = validate_parquet_path(demuxed_out)
     threshold = float(inputs.golay_error_threshold)
     fr_clause = f"read_fastx('{r1}')"
-    if inputs.reverse_reads_path is not None:
-        r2 = validate_parquet_path(inputs.reverse_reads_path.resolve())
+    if reads.reverse_reads_path is not None:
+        r2 = validate_parquet_path(reads.reverse_reads_path.resolve())
         fr_clause = f"read_fastx('{r1}', sequence2 := '{r2}')"
 
     with open_miint_conn() as conn:
@@ -235,13 +275,17 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     """demux the pool's FASTQ and ingest per-sample reads. returns
     {"read_staging_dir": workspace}; StepNoData when no read matches a barcode."""
     workspace = workspace.resolve()
-    inputs.index_reads_path = inputs.index_reads_path.resolve()
-    inputs.forward_reads_path = inputs.forward_reads_path.resolve()
+    inputs.convert_dir = inputs.convert_dir.resolve()
     inputs.barcode_map = inputs.barcode_map.resolve()
-    required = [inputs.index_reads_path, inputs.forward_reads_path, inputs.barcode_map]
-    if inputs.reverse_reads_path is not None:
-        inputs.reverse_reads_path = inputs.reverse_reads_path.resolve()
-        required.append(inputs.reverse_reads_path)
+    if not inputs.convert_dir.is_dir():
+        raise FileNotFoundError(f"golay_demux convert_dir not found: {inputs.convert_dir}")
+    reads = _find_undetermined(inputs.convert_dir)
+    reads.index_reads_path = reads.index_reads_path.resolve()
+    reads.forward_reads_path = reads.forward_reads_path.resolve()
+    required = [reads.index_reads_path, reads.forward_reads_path, inputs.barcode_map]
+    if reads.reverse_reads_path is not None:
+        reads.reverse_reads_path = reads.reverse_reads_path.resolve()
+        required.append(reads.reverse_reads_path)
     for p in required:
         if not p.exists():
             raise FileNotFoundError(f"golay_demux input not found: {p}")
@@ -256,7 +300,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         # StepNoData and any mid-loop failure, so failed attempts don't strand it.
         demuxed = workspace / "_demuxed.parquet"
         try:
-            _run_demux(inputs, demuxed, duckdb_tmp, memory_gb=memory_gb)
+            _run_demux(inputs, reads, demuxed, duckdb_tmp, memory_gb=memory_gb)
             counts = _sample_counts(demuxed, duckdb_tmp, memory_gb=memory_gb)
             if not counts:
                 raise StepNoData(

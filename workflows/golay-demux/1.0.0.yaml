@@ -3,30 +3,26 @@ version: 1.0.0
 target_kind: sequenced_pool
 
 description: >
-  Golay-barcode demultiplex a pool's multiplexed 16S run (EMP-style: one R1
-  forward FASTQ + one I1 barcode FASTQ, plus R2) into per-sample reads in the
-  DuckLake `read` table — the analogue of bcl-convert for runs that arrive
-  already converted-but-multiplexed.
+  Convert and Golay-barcode demultiplex a sequenced_pool's Illumina 16S run into
+  per-sample reads in the DuckLake `read` table. EMP 16S has no per-sample
+  Illumina indices — the per-sample identity is a Golay barcode carried IN the
+  index read (I1) — so this runs bcl-convert with a no-index dummy sample sheet
+  (every read to Undetermined, the Golay I1 emitted as a FASTQ), then demuxes on
+  the Golay barcode.
 
-  There is NO bcl-convert step in this workflow: an EMP 16S run's per-sample
-  identity is a Golay barcode carried IN the reads (I1), not an Illumina
-  sample-sheet index, so BCL->FASTQ conversion happens upstream (at the core /
-  a plain bcl2fastq run with no per-sample indices) and yields ONE multiplexed
-  Undetermined I1/R1/R2 set. This step's input IS that already-converted set;
-  it does the demux the instrument could not. (Contrast: bcl-convert demuxes by
-  index in-workflow; PacBio arrives per-barcode BAM, already demuxed.)
-
-  The `golay_demux` step pairs I1 against R1/R2 by record order (I1 is submitted
-  RC to the prep), assigns each read to the prep_sample whose barcode its
-  corrected index matches (Golay error-correction cloud), mints a sequence_idx
-  range per sample, and writes the sorted read.parquet; a register-files step
-  loads it into `read`. Downstream: read-mask, then amplicon.
+  bcl_convert_prep (amplicon mode) builds the dummy sheet from RunInfo.xml and
+  reads the instrument model; bcl_convert produces the Undetermined I1/R1/R2 set;
+  golay_demux pairs I1 against R1/R2 by record order (I1 is submitted RC to the
+  prep), assigns each read to the prep_sample whose barcode its corrected index
+  matches (Golay error-correction cloud), mints a sequence_idx range per sample,
+  and writes the sorted read.parquet; register-files loads it into `read`.
+  Downstream: read-mask, then amplicon.
 
   The per-sample barcode roster (`barcode_map`, each entry carrying its
   `barcodes_are_rc` provenance flag) is embedded in action_context and
-  materialized by the runner (the orchestrator has no DB access). The multiplexed
-  FASTQ are compute-node-visible host paths; the Golay [24,12,8] decode cloud is
-  generated in-job (no vendored table / fixed path).
+  materialized by the runner (the orchestrator has no DB access). `bcl_input_dir`
+  is resolved from the submitted run id server-side; the Golay [24,12,8] decode
+  cloud is generated in-job (no vendored table / fixed path).
 
 scopes: []
 
@@ -36,24 +32,19 @@ audience:
 
 context_schema:
   type: object
-  required: [index_reads_path, forward_reads_path, barcode_map]
+  required: [bcl_input_dir, amplicon, barcode_map]
   properties:
-    # multiplexed I1 barcode FASTQ (12-nt Golay codes; longer indexes sliced to 12).
-    index_reads_path:
+    # Absolute host path to the Illumina BCL run folder, resolved from the
+    # submitted run id (submit-golay-demux -> /run-folder/inspect). The
+    # orchestrator binds it into the bcl_convert container.
+    bcl_input_dir:
       type: string
       minLength: 1
       pattern: "^/"
-    # multiplexed R1 forward FASTQ, paired to I1 by record order.
-    forward_reads_path:
-      type: string
-      minLength: 1
-      pattern: "^/"
-    # multiplexed R2 FASTQ (optional; carried as sequence2/qual2 — EMP includes it).
-    reverse_reads_path:
-      type: string
-      minLength: 1
-      pattern: "^/"
-    # (the Golay decode cloud is generated in-job; no table path here.)
+    # Selects bcl_convert_prep's dummy-sheet path. Always true here.
+    amplicon:
+      type: boolean
+      const: true
     # per-sample roster; the runner materializes it to a parquet.
     # barcodes_are_rc is per-sample provenance.
     barcode_map:
@@ -74,13 +65,51 @@ context_schema:
       default: 1.5
 
 steps:
+  - step: bcl_convert_prep
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.bcl_convert_prep
+    # bcl_input_dir flows through from action_context; amplicon selects the
+    # dummy-sheet path. sequenced_pool_idx / sequencing_run_idx are
+    # framework-injected (unused by the amplicon path).
+    inputs: [bcl_input_dir]
+    params: {amplicon: amplicon}
+    outputs: [samplesheet, instrument_model]
+    baseline_resources:
+      cpu: 2
+      mem_gb: 4
+      walltime: PT10M
+
+  - step: bcl_convert
+    step_type: singleton
+    container: bcl-convert-4.5.4.sif
+    entrypoint: /opt/qiita/entrypoint.sh
+    inputs: [samplesheet, bcl_input_dir]
+    outputs: [convert_dir]
+    baseline_resources:
+      # MiSeq-class flowcells; the runner reads instrument_model.txt and picks
+      # the matching profile, clamped against action_ceiling. A model lacking a
+      # profile fails-fast at dispatch naming the missing key.
+      from_step_output: instrument_model
+      profiles:
+        "Illumina MiSeq":
+          cpu: 8
+          mem_gb: 32
+          walltime: PT2H
+        "Illumina MiSeq i100":
+          cpu: 8
+          mem_gb: 32
+          walltime: PT2H
+        "Illumina MiSeq i100 Plus":
+          cpu: 8
+          mem_gb: 32
+          walltime: PT2H
+
   # demux + per-sample ingest in one job. barcode_map and reads_staging_root are
-  # runner-resolved; the FASTQ paths are plain values. cloud generated in-job.
+  # runner-resolved; convert_dir is the bcl_convert output. cloud generated in-job.
   - step: golay_demux
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.golay_demux
-    inputs: [index_reads_path, forward_reads_path, barcode_map, reads_staging_root]
-    optional_inputs: [reverse_reads_path]
+    inputs: [convert_dir, barcode_map, reads_staging_root]
     params: {golay_error_threshold: golay_error_threshold}
     outputs: [read_staging_dir]
     baseline_resources:

@@ -6,11 +6,12 @@
 > (`workflows/golay-demux/1.0.0.yaml`, `workflows/amplicon/1.0.0.yaml`) — this
 > runbook is the operator/analyst playbook, not the contract.
 
-**For:** whoever processes an EMP-style 16S run — Golay-barcoded, arriving as one
-multiplexed FASTQ set (R1 + I1, optionally R2) rather than per-sample BCL demux.
-Two workflows run in sequence: `golay-demux` (ingest → `read`) then `amplicon`
-(denoise → ASV `feature_idx` + counts). Auth and the general CLI flow are not
-repeated here — see [`user-cli-quickstart.md`](user-cli-quickstart.md).
+**For:** whoever processes an EMP-style 16S run — Golay-barcoded, with no
+per-sample Illumina indices (the per-sample identity is a Golay barcode in the
+index read). Two workflows run in sequence: `golay-demux` (bcl-convert with a
+no-index dummy sheet, then Golay demux → `read`) then `amplicon` (denoise → ASV
+`feature_idx` + counts). Auth and the general CLI flow are not repeated here —
+see [`getting-started.md`](getting-started.md).
 
 ## Prerequisites
 
@@ -25,14 +26,19 @@ repeated here — see [`user-cli-quickstart.md`](user-cli-quickstart.md).
 ## Where to run it
 
 - _(TODO)_ The `qiita` console script in the deployed venv (as in the PacBio
-  runbook); the multiplexed FASTQ are compute-node-visible host paths.
+  runbook). The submitter names a run id, not a path — the run folder is resolved
+  server-side against `PATH_INGEST_ROOTS`.
 
 ## Submit golay-demux (ingest)
 
-- _(TODO)_ context: `index_reads_path`, `forward_reads_path`, optional
-  `reverse_reads_path`, and the per-sample `barcode_map` roster submitted in
-  action_context (the runner materializes it to a parquet; the orchestrator has
-  no DB access). Loads per-sample reads into `read`.
+- _(TODO)_ `qiita submit-golay-demux --instrument-run-id <run id> --preflight-blob
+  <sqlite> --prep-protocol-idx <n>`. The CP resolves the run folder from the run
+  id and reads the instrument identity from its RunInfo.xml. bcl-convert runs with
+  a no-index dummy sheet (every read to Undetermined, the Golay I1 emitted), then
+  `golay_demux` demultiplexes on the Golay barcode. The per-sample `barcode_map`
+  roster is built from the preflight's `amplicon_sample` rows and submitted in
+  action_context (the runner materializes it to a parquet; the orchestrator has no
+  DB access). Loads per-sample reads into `read`.
 
 ## Submit amplicon (denoise)
 

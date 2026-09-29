@@ -1,18 +1,16 @@
 """submit-golay-demux — the amplicon (Rapid 16S) analogue of submit-bcl-convert.
 
-16S EMP data enters Qiita as a multiplexed set of FASTQ (an I1 Golay index +
-R1 [+ R2]) that still needs demultiplexing — unlike a PacBio run (per-barcode
-uBAM, already demuxed off the instrument) or a bcl-convert Illumina run
-(demuxed by sample-sheet index). So this command hands the whole pool to ONE
-pool-scoped `golay-demux` work ticket, mirroring submit-bcl-convert's
-run -> pool -> per-sample roster -> ticket shape.
+The submitter names a run id; the control plane resolves it to the BCL run
+folder (POST /run-folder/inspect) and reads the instrument identity from its
+RunInfo.xml, just like submit-bcl-convert. The whole pool goes to ONE
+pool-scoped `golay-demux` work ticket, which converts with a no-index dummy sheet
+(every read to Undetermined, the Golay I1 emitted) and demuxes on the Golay
+barcode.
 
 The per-sample Golay roster (`barcode_map`) rides in action_context, built from
 the preflight's `get_amplicon_sample_info`, so the demux job assigns each read to
-a prep_sample without DB access. The run identity (external run id + instrument
-model) comes from the preflight's `processing_run` row — the preflight is the
-single source of truth for intake, and golay-demux has no run folder to read it
-from (bcl-convert/pacbio do).
+a prep_sample without DB access. The preflight supplies only the roster and the
+sample accessions; the run identity comes from the run folder.
 """
 
 from __future__ import annotations
@@ -33,6 +31,7 @@ from qiita_common.models import (
 )
 
 from .. import _common
+from ._helpers import _resolve_run_folder
 from .pool import _provision_run_pool_roster
 
 # Pinned to the workflow YAML the operator's deploy syncs into qiita.action; keep
@@ -62,40 +61,10 @@ class _AmpliconPreflightRow(NamedTuple):
     secondary_project_accessions: list[str]
 
 
-class _RunInfo(NamedTuple):
-    instrument_run_id: str | None
-    instrument_model: str | None
-
-
-def _read_run_info(conn: sqlite3.Connection) -> _RunInfo:
-    """The run's external id + instrument model from the preflight's processing_run.
-
-    golay-demux has no run folder to read a run id from (bcl-convert reads it from
-    the BCL folder, pacbio from the run folder), so the preflight is the default
-    source — the preflight is the single source of truth for intake. Either value
-    may be NULL; the caller resolves against its `--instrument-run-id` /
-    `--instrument-model` overrides and fails loud if no run id is available from
-    either source.
-    """
-    from run_preflight.db import get_single_run_idx  # noqa: PLC0415
-
-    run_idx = get_single_run_idx(conn)
-    row = conn.execute(
-        "SELECT external_run_id, instrument_type FROM processing_run WHERE run_idx = ?",
-        (run_idx,),
-    ).fetchone()
-    if row is None:
-        return _RunInfo(instrument_run_id=None, instrument_model=None)
-    return _RunInfo(
-        instrument_run_id=str(row[0]) if row[0] else None,
-        instrument_model=row[1] or None,
-    )
-
-
 def _read_amplicon_preflight_rows(
     preflight_blob: Path, parser: argparse.ArgumentParser
-) -> tuple[list[_AmpliconPreflightRow], _RunInfo]:
-    """One `_AmpliconPreflightRow` per amplicon_sample, plus the run identity.
+) -> list[_AmpliconPreflightRow]:
+    """One `_AmpliconPreflightRow` per amplicon_sample.
 
     Operator-actionable errors (not a SQLite, empty sample set, a missing barcode,
     or a missing biosample/primary-project accession) raise via parser.error so the
@@ -113,7 +82,6 @@ def _read_amplicon_preflight_rows(
         parser.error(f"--preflight-blob {preflight_blob}: not a readable SQLite file: {exc}")
     try:
         infos = get_amplicon_sample_info(conn)
-        run_info = _read_run_info(conn)
     except (sqlite3.DatabaseError, ValueError) as exc:
         parser.error(
             f"--preflight-blob {preflight_blob}: preflight query failed ({exc});"
@@ -157,23 +125,7 @@ def _read_amplicon_preflight_rows(
                 secondary_project_accessions=list(info.secondary_bioproject_accessions),
             )
         )
-    return parsed, run_info
-
-
-def _validate_fastq_arg(
-    parser: argparse.ArgumentParser, name: str, value: Path | None, *, required: bool
-) -> Path | None:
-    """A demux FASTQ path must be absolute and exist (the compute node reads it at
-    the same absolute path — bind mounts expose host paths, they do not copy)."""
-    if value is None:
-        if required:
-            parser.error(f"{name} is required")
-        return None
-    if not value.is_absolute():
-        parser.error(f"{name} must be absolute, got {value}")
-    if not value.is_file():
-        parser.error(f"{name} {value} is not a regular file")
-    return value
+    return parsed
 
 
 def _handle_submit_golay_demux(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -189,51 +141,42 @@ def _handle_submit_golay_demux(args: argparse.Namespace, parser: argparse.Argume
 
     Steps 1-3 (accession resolution, create-missing roster, fail-fast on an
     unresolved accession) are the shared `_provision_run_pool_roster` gesture,
-    identical to submit-bcl-convert; only the demux input (FASTQ vs a BCL folder)
-    and the roster (Golay barcode_map vs a bcl-convert sample_map) differ.
+    identical to submit-bcl-convert; only the roster (Golay barcode_map vs a
+    bcl-convert sample_map) differs. The run folder is resolved from the run id
+    server-side, exactly as submit-bcl-convert resolves its BCL folder.
     """
-    index_reads = _validate_fastq_arg(
-        parser, "--index-reads-path", args.index_reads_path, required=True
-    )
-    forward_reads = _validate_fastq_arg(
-        parser, "--forward-reads-path", args.forward_reads_path, required=True
-    )
-    reverse_reads = _validate_fastq_arg(
-        parser, "--reverse-reads-path", args.reverse_reads_path, required=False
-    )
-
     if not args.preflight_blob.is_file():
         parser.error(f"--preflight-blob {args.preflight_blob} is not a regular file")
     blob_bytes = args.preflight_blob.read_bytes()
     if not blob_bytes:
         parser.error(f"--preflight-blob {args.preflight_blob} is empty")
 
-    # Open the preflight locally and pull the per-sample rows + run identity before
-    # any network call. Errors here are operator-actionable (parser.error, exit 2).
-    preflight_rows, run_info = _read_amplicon_preflight_rows(args.preflight_blob, parser)
+    # Open the preflight locally and pull the per-sample rows before any network
+    # call. Errors here are operator-actionable (parser.error, exit 2).
+    preflight_rows = _read_amplicon_preflight_rows(args.preflight_blob, parser)
 
-    # Run identity: the preflight's processing_run is the default source; the CLI
-    # flags override it (and cover a preflight whose external_run_id is NULL). A run
-    # id is required — a blank one would mint an unidentifiable sequencing_run.
-    instrument_run_id = args.instrument_run_id or run_info.instrument_run_id
-    instrument_model = args.instrument_model or run_info.instrument_model
-    if not instrument_run_id:
-        parser.error(
-            f"--preflight-blob {args.preflight_blob}: processing_run carries no"
-            " external_run_id; pass --instrument-run-id or populate the run id upstream"
-        )
-
-    run_body = SequencingRunCreateRequest(
-        instrument_run_id=instrument_run_id,
-        platform=Platform.ILLUMINA,
-        instrument_model=instrument_model,
-    ).model_dump(exclude_unset=True, mode="json")
     pool_body = SequencedPoolCreateRequest(
         run_preflight_blob=base64.b64encode(blob_bytes).decode("ascii"),
         run_preflight_filename=args.preflight_blob.name,
     ).model_dump(exclude_unset=True, mode="json")
 
     def _run(token: str) -> dict[str, Any]:
+        # Resolve the run folder from its run id on the control plane, and read the
+        # instrument identity from its RunInfo.xml — the same server-side read
+        # submit-bcl-convert does, so the gesture needs no cluster mount and the
+        # submitter never handles a host path.
+        inspected = _resolve_run_folder(
+            args.base_url, token, args.instrument_run_id, Platform.ILLUMINA
+        )
+        assert inspected.illumina is not None  # platform=illumina always populates it
+        instrument_run_id = inspected.illumina.instrument_run_id
+        instrument_model = inspected.illumina.instrument_model
+        run_body = SequencingRunCreateRequest(
+            instrument_run_id=instrument_run_id,
+            platform=Platform.ILLUMINA,
+            instrument_model=instrument_model,
+        ).model_dump(exclude_unset=True, mode="json")
+
         # Shared run -> pool -> roster provisioning (create-missing; fails fast on an
         # unresolved accession). Amplicon keys the pool-item-id on prepped_sample_idx.
         provision = _provision_run_pool_roster(
@@ -276,12 +219,13 @@ def _handle_submit_golay_demux(args: argparse.Namespace, parser: argparse.Argume
         ]
 
         action_context: dict[str, Any] = {
-            "index_reads_path": str(index_reads),
-            "forward_reads_path": str(forward_reads),
+            # The normalized form the inspect gate resolved from the run id, not a
+            # value the submitter typed. amplicon selects bcl_convert_prep's
+            # dummy-sheet path.
+            "bcl_input_dir": inspected.path,
+            "amplicon": True,
             "barcode_map": barcode_map,
         }
-        if reverse_reads is not None:
-            action_context["reverse_reads_path"] = str(reverse_reads)
 
         ticket_body = WorkTicketCreateRequest(
             action_id=_GOLAY_DEMUX_ACTION_ID,

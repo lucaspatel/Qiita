@@ -6,7 +6,7 @@ Two surfaces, pure-unit (no Postgres):
     SQLite built from the pinned good_amplicon_v1 fixture.
   * `_handle_submit_golay_demux` — the full submit flow, HTTP mocked, asserting the
     run/pool/sample setup and the ONE pool-scoped golay-demux ticket, including the
-    barcode_map + FASTQ paths carried in action_context.
+    barcode_map and the CP-resolved bcl_input_dir carried in action_context.
 """
 
 from __future__ import annotations
@@ -22,6 +22,9 @@ from qiita_control_plane.cli.user import main
 from qiita_control_plane.cli.user.amplicon import _read_amplicon_preflight_rows
 
 _AMPLICON_V1_CSV = Path(__file__).parent / "data" / "good_amplicon_v1.txt"
+
+_RUN_ID = "20260925_SL00377_0008_ASC2267726-SC3"
+_RESOLVED_BCL_DIR = f"/sequencing/{_RUN_ID}"
 
 
 class _RaisingParser:
@@ -64,7 +67,7 @@ def _build_amplicon_preflight(tmp_path: Path, *, populate_accessions: bool = Tru
 
 def test_read_amplicon_preflight_rows_v1(tmp_path):
     db = _build_amplicon_preflight(tmp_path)
-    rows, run_info = _read_amplicon_preflight_rows(db, _RaisingParser())
+    rows = _read_amplicon_preflight_rows(db, _RaisingParser())
 
     assert len(rows) == 181
     # Every row carries a Golay barcode + its orientation flag, keyed to a resolved
@@ -75,11 +78,6 @@ def test_read_amplicon_preflight_rows_v1(tmp_path):
     assert all(r.primary_project_accession.startswith("PRJNA") for r in rows)
     # prepped_sample_idx is the unique pool-item key.
     assert len({r.prepped_sample_idx for r in rows}) == len(rows)
-
-    # The v1 fixture leaves external_run_id NULL but records the instrument model,
-    # so the reader surfaces (None, model) and the caller must supply the run id.
-    assert run_info.instrument_run_id is None
-    assert run_info.instrument_model == "Illumina MiSeq"
 
 
 def test_read_amplicon_preflight_rows_fails_on_missing_accession(tmp_path):
@@ -104,8 +102,9 @@ def test_read_amplicon_preflight_rows_rejects_non_sqlite(tmp_path):
 
 def _stub_submit_flow(monkeypatch, captured: dict) -> None:
     """Route each POST/GET of the submit flow to a canned response, recording every
-    request. Accession lookups resolve every requested accession to a deterministic
-    idx; the pool roster starts empty so every sample is created."""
+    request. /run-folder/inspect resolves the run id to a bcl_input_dir + instrument
+    facts; accession lookups resolve everything; the pool roster starts empty so
+    every sample is created."""
     captured["requests"] = []
     counter = {"sample": 0}
 
@@ -117,6 +116,18 @@ def _stub_submit_flow(monkeypatch, captured: dict) -> None:
 
         if url.endswith("/auth/whoami"):
             return resp(200, {"kind": "human", "principal_idx": 7})
+        if url.endswith("/run-folder/inspect"):
+            return resp(
+                200,
+                {
+                    "path": _RESOLVED_BCL_DIR,
+                    "platform": "illumina",
+                    "illumina": {
+                        "instrument_run_id": _RUN_ID,
+                        "instrument_model": "Illumina MiSeq i100",
+                    },
+                },
+            )
         if url.endswith("/lookup-by-accession"):  # biosample or study
             accs = (json or {}).get("accessions", [])
             return resp(200, {"resolved": {a: 1000 + i for i, a in enumerate(accs)}, "missing": []})
@@ -138,16 +149,8 @@ def _stub_submit_flow(monkeypatch, captured: dict) -> None:
     monkeypatch.setenv("QIITA_TOKEN", "qk_test")
 
 
-def _fastq_set(tmp_path: Path) -> tuple[Path, Path, Path]:
-    i1, r1, r2 = tmp_path / "I1.fastq", tmp_path / "R1.fastq", tmp_path / "R2.fastq"
-    for p in (i1, r1, r2):
-        p.write_text("")
-    return i1, r1, r2
-
-
 def test_submit_golay_demux_builds_barcode_map_and_one_ticket(monkeypatch, tmp_path):
     db = _build_amplicon_preflight(tmp_path)
-    i1, r1, r2 = _fastq_set(tmp_path)
 
     captured: dict = {}
     _stub_submit_flow(monkeypatch, captured)
@@ -157,16 +160,10 @@ def test_submit_golay_demux_builds_barcode_map_and_one_ticket(monkeypatch, tmp_p
             "--base-url",
             "https://q.example.test",
             "submit-golay-demux",
-            "--index-reads-path",
-            str(i1),
-            "--forward-reads-path",
-            str(r1),
-            "--reverse-reads-path",
-            str(r2),
+            "--instrument-run-id",
+            _RUN_ID,
             "--preflight-blob",
             str(db),
-            "--instrument-run-id",
-            "M05314_260101",
             "--prep-protocol-idx",
             "5",
         ]
@@ -181,9 +178,10 @@ def test_submit_golay_demux_builds_barcode_map_and_one_ticket(monkeypatch, tmp_p
     # Pool-scoped: exactly ONE golay-demux ticket for the whole pool.
     assert len(ticket_posts) == 1
     ctx = ticket_posts[0]["json"]["action_context"]
-    assert ctx["index_reads_path"] == str(i1)
-    assert ctx["forward_reads_path"] == str(r1)
-    assert ctx["reverse_reads_path"] == str(r2)
+    # The CP-resolved run folder (from /run-folder/inspect), not a submitter path.
+    assert ctx["bcl_input_dir"] == _RESOLVED_BCL_DIR
+    assert ctx["amplicon"] is True
+    assert "index_reads_path" not in ctx  # the run-id flow carries no FASTQ paths
 
     barcode_map = ctx["barcode_map"]
     assert len(barcode_map) == 181
@@ -193,53 +191,21 @@ def test_submit_golay_demux_builds_barcode_map_and_one_ticket(monkeypatch, tmp_p
     assert all(e["prep_sample_idx"] >= 101 for e in barcode_map)
     assert all(e["barcode"] for e in barcode_map)
 
-    # The run row used the operator-supplied id (the v1 preflight's external_run_id
-    # is NULL) and the model read from the preflight.
+    # The run row used the id + model the CP read from RunInfo.xml via inspect.
     run_posts = [
         r
         for r in captured["requests"]
         if r["method"] == "POST" and r["url"].rstrip("/").endswith("/sequencing-run")
     ]
     assert len(run_posts) == 1
-    assert run_posts[0]["json"]["instrument_run_id"] == "M05314_260101"
-    assert run_posts[0]["json"]["instrument_model"] == "Illumina MiSeq"
+    assert run_posts[0]["json"]["instrument_run_id"] == _RUN_ID
+    assert run_posts[0]["json"]["instrument_model"] == "Illumina MiSeq i100"
 
 
-def test_submit_golay_demux_omits_reverse_when_absent(monkeypatch, tmp_path):
+def test_submit_golay_demux_requires_run_id(monkeypatch, tmp_path):
+    """--instrument-run-id is required; without it argparse exits 2 before any
+    network call (there is no run folder to resolve otherwise)."""
     db = _build_amplicon_preflight(tmp_path)
-    i1, r1, _ = _fastq_set(tmp_path)
-
-    captured: dict = {}
-    _stub_submit_flow(monkeypatch, captured)
-
-    rc = main(
-        [
-            "--base-url",
-            "https://q.example.test",
-            "submit-golay-demux",
-            "--index-reads-path",
-            str(i1),
-            "--forward-reads-path",
-            str(r1),
-            "--preflight-blob",
-            str(db),
-            "--instrument-run-id",
-            "M05314_260101",
-            "--prep-protocol-idx",
-            "5",
-        ]
-    )
-    assert rc == 0
-    ticket = next(r for r in captured["requests"] if r["url"].endswith("/work-ticket"))
-    assert "reverse_reads_path" not in ticket["json"]["action_context"]
-
-
-def test_submit_golay_demux_requires_run_id_when_preflight_null(monkeypatch, tmp_path):
-    """The v1 preflight has a NULL external_run_id; without --instrument-run-id the
-    submit fails BEFORE any network call (a blank run id would mint an
-    unidentifiable sequencing_run)."""
-    db = _build_amplicon_preflight(tmp_path)
-    i1, r1, _ = _fastq_set(tmp_path)
 
     captured: dict = {}
     _stub_submit_flow(monkeypatch, captured)
@@ -250,40 +216,11 @@ def test_submit_golay_demux_requires_run_id_when_preflight_null(monkeypatch, tmp
                 "--base-url",
                 "https://q.example.test",
                 "submit-golay-demux",
-                "--index-reads-path",
-                str(i1),
-                "--forward-reads-path",
-                str(r1),
                 "--preflight-blob",
                 str(db),
                 "--prep-protocol-idx",
                 "5",
             ]
         )
-    assert ei.value.code == 2  # argparse parser.error exit code
-    assert captured["requests"] == []
-
-
-def test_submit_golay_demux_rejects_relative_fastq_path(monkeypatch, tmp_path):
-    db = _build_amplicon_preflight(tmp_path)
-    captured: dict = {}
-    _stub_submit_flow(monkeypatch, captured)
-
-    with pytest.raises(SystemExit) as ei:
-        main(
-            [
-                "--base-url",
-                "https://q.example.test",
-                "submit-golay-demux",
-                "--index-reads-path",
-                "relative/I1.fastq",
-                "--forward-reads-path",
-                str(tmp_path / "R1.fastq"),
-                "--preflight-blob",
-                str(db),
-                "--prep-protocol-idx",
-                "5",
-            ]
-        )
-    assert ei.value.code == 2
+    assert ei.value.code == 2  # argparse required-arg exit code
     assert captured["requests"] == []

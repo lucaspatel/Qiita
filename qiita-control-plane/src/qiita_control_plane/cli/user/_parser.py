@@ -1864,46 +1864,26 @@ def _build_parser() -> argparse.ArgumentParser:
             "Bundled operator gesture for the golay-demux workflow (Rapid 16S):"
             " mint (or reuse) a sequencing-run row, attach a sequenced-pool with"
             " the preflight blob, and submit ONE pool-scoped golay-demux ticket"
-            " over the multiplexed FASTQ."
+            " over the run resolved from --instrument-run-id."
         ),
         description=(
-            "Submit a golay-demux work-ticket end-to-end. 16S EMP data arrives as a"
-            " multiplexed FASTQ set (I1 Golay index + R1 [+ R2]) that still needs"
-            " demultiplexing, so — unlike bcl-convert (demuxed by sample-sheet index)"
-            " or PacBio (per-barcode uBAM) — the whole pool goes to one demux ticket."
-            " The per-sample Golay barcode_map is read from the preflight's"
-            " amplicon_sample rows and carried in action_context. Run + pool are"
-            " find-or-create and the per-sample roster is create-missing, so a re-run"
-            " after a partial failure converges without operator cleanup."
+            "Submit a golay-demux work-ticket end-to-end. The run folder is resolved"
+            " from --instrument-run-id server-side; the ticket converts it with a"
+            " no-index dummy sheet (every read to Undetermined, the Golay I1 emitted)"
+            " and demuxes on the Golay barcode. The per-sample Golay barcode_map is"
+            " read from the preflight's amplicon_sample rows and carried in"
+            " action_context. Run + pool are find-or-create and the per-sample roster"
+            " is create-missing, so a re-run after a partial failure converges without"
+            " operator cleanup."
         ),
     )
     p_submit_golay.add_argument(
-        "--index-reads-path",
-        type=Path,
+        "--instrument-run-id",
         required=True,
         help=(
-            "Absolute path to the multiplexed I1 barcode FASTQ (12-nt Golay indexes)."
-            " Passed through as action_context.index_reads_path; the compute node"
-            " reads it at the same absolute path."
-        ),
-    )
-    p_submit_golay.add_argument(
-        "--forward-reads-path",
-        type=Path,
-        required=True,
-        help=(
-            "Absolute path to the multiplexed R1 forward FASTQ, paired to I1 by"
-            " record order. Passed through as action_context.forward_reads_path."
-        ),
-    )
-    p_submit_golay.add_argument(
-        "--reverse-reads-path",
-        type=Path,
-        default=None,
-        help=(
-            "Optional absolute path to the multiplexed R2 FASTQ (EMP includes it;"
-            " carried as sequence2/qual2). Passed as action_context.reverse_reads_path"
-            " when set."
+            "The sequencing run id (the BCL run-folder name / RunInfo.xml <Run Id>)."
+            " The control plane resolves it to the run folder and reads the instrument"
+            " identity from RunInfo.xml; the submitter never names a host path."
         ),
     )
     p_submit_golay.add_argument(
@@ -1915,23 +1895,6 @@ def _build_parser() -> argparse.ArgumentParser:
             " (refuses empty), builds the Golay barcode_map from its amplicon_sample"
             " rows, and attaches the blob to the sequenced-pool row. Same"
             " content-addressed pool find-or-create as submit-bcl-convert."
-        ),
-    )
-    p_submit_golay.add_argument(
-        "--instrument-run-id",
-        default=None,
-        help=(
-            "Override the sequencing-run identifier. Defaults to the preflight's"
-            " processing_run.external_run_id (the single source of truth); pass this"
-            " only to override, or when that column is NULL."
-        ),
-    )
-    p_submit_golay.add_argument(
-        "--instrument-model",
-        default=None,
-        help=(
-            "Override the instrument model recorded on the sequencing-run row."
-            " Defaults to the preflight's processing_run.instrument_type."
         ),
     )
     p_submit_golay.add_argument(

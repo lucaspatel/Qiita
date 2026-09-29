@@ -347,9 +347,9 @@ def test_every_mint_features_entry_binds_manifest():
 
 def test_load_actions_loads_on_disk_golay_demux_yaml():
     """`workflows/golay-demux/1.0.0.yaml` loads with the ingest shape:
-    sequenced_pool-scoped; context REQUIRES index_reads_path + forward_reads_path +
-    barcode_map (no golay_table_path — the decode cloud is generated in-job); the
-    step chain is golay_demux (module) → register-files."""
+    sequenced_pool-scoped; context REQUIRES bcl_input_dir + amplicon + barcode_map
+    (no golay_table_path — the decode cloud is generated in-job); the step chain is
+    bcl_convert_prep → bcl_convert → golay_demux → register-files."""
     from pathlib import Path
 
     from qiita_common.models import ScopeTargetKind
@@ -364,19 +364,25 @@ def test_load_actions_loads_on_disk_golay_demux_yaml():
     assert golay.target_kind == ScopeTargetKind.SEQUENCED_POOL
     assert golay.version == "1.0.0"
     assert golay.context_schema["required"] == [
-        "index_reads_path",
-        "forward_reads_path",
+        "bcl_input_dir",
+        "amplicon",
         "barcode_map",
     ]
     # The vendored golay table is gone — the cloud is generated in-job.
     assert "golay_table_path" not in golay.context_schema["properties"]
 
-    assert [s.name for s in golay.steps] == ["golay_demux", "register-files"]
+    # bcl-convert (dummy no-index sheet) is now in-workflow, then the demux.
+    assert [s.name for s in golay.steps] == [
+        "bcl_convert_prep",
+        "bcl_convert",
+        "golay_demux",
+        "register-files",
+    ]
 
     demux = next(s for s in golay.steps if s.name == "golay_demux")
     assert demux.module == "qiita_compute_orchestrator.jobs.golay_demux"
     assert "golay_table_path" not in demux.inputs
-    assert demux.optional_inputs == ["reverse_reads_path"]
+    assert "convert_dir" in demux.inputs
 
 
 def test_load_actions_loads_on_disk_host_reference_add_yaml():
