@@ -27,19 +27,12 @@ from qiita_common.actions import (
 )
 from qiita_common.models import (
     NON_TERMINAL_WORK_TICKET_STATES,
-    MaskSampleState,
     Platform,
     WorkTicketState,
 )
 
-from . import gate_state_literal
-
-# Bound rather than typed as SQL literals, so a rename of the declared Literal
-# lights up this module at import instead of silently matching no rows. Same
-# shape as `mask_definition`'s leading binds.
-_GATE_COMPLETED = gate_state_literal("completed", MaskSampleState)
-_GATE_INVALIDATED = gate_state_literal("invalidated", MaskSampleState)
-_GATE_PENDING = gate_state_literal("pending", MaskSampleState)
+from . import INT4_MASK, require_transaction
+from .block import MASK_SAMPLE_COMPLETED, MASK_SAMPLE_INVALIDATED, MASK_SAMPLE_PENDING
 
 
 class PayloadMismatch(Exception):
@@ -59,6 +52,56 @@ class PayloadMismatch(Exception):
         self.field = field
         self.existing_value = existing_value
         self.supplied_value = supplied_value
+
+
+# pg_advisory_xact_lock(class, key) class for sequencing_run pool writes vs the
+# download-roster read; allocated in repositories/__init__'s registry, distinct
+# from fanout_dispatch's.
+POOL_RESOLVE_LOCK_CLASS = 0x0E4A_0001
+
+# Default wait on POOL_RESOLVE_LOCK_CLASS for background waiters (the
+# registration composer, the runner's roster read) that hold no HTTP client
+# open. Deliberately chosen, not inherited: get_pool's 10s command_timeout
+# would bound the wait instead, and the registration side holds the lock for
+# its whole study transaction (~27ms per run measured, so 10s crosses at a
+# few hundred runs) — a size at which every roster read fails on first
+# attempt. A waiter that times out raises TimeoutError: the runner classifies
+# that as transient (FAILED/RETRIABLE, healed by a `/run` redrive) and
+# registration folds it into the accession's failure. Same reasoning as
+# actions/library.py's SET LOCAL lock_timeout. 90s covers thousands of runs
+# at the measured rate. A caller holding an HTTP client's own wait budget
+# passes its own `timeout` instead of inheriting this one.
+POOL_LOCK_WAIT_TIMEOUT_S = 90.0
+
+
+async def lock_sequencing_run(
+    conn: asyncpg.Connection, *, sequencing_run_idx: int, timeout: float | None = None
+) -> None:
+    """Take the sequencing_run pool-write advisory lock (held to transaction commit).
+
+    Three holders take this key: `ena_import.registration` from pool
+    resolution until its runs commit, `routes.sequenced_sample`'s native
+    insert around its own write, and `runner._read_ingest._stage_ena_run_roster`
+    across the roster read it does once at dispatch. Whichever of the first
+    two lands first, the roster read waits behind it and so either sees a
+    covering download ticket and is kept out of that pool, or commits before
+    the read starts and is picked up by it: a run or a native sample can no
+    longer land in a pool whose ticket has already read the roster.
+
+    Requires a wrapping transaction — in autocommit the lock is released with
+    the statement, silently protecting nothing. Waits at most `timeout`
+    seconds for a competing holder; `timeout=None` resolves to
+    `POOL_LOCK_WAIT_TIMEOUT_S`, read here rather than defaulted on the
+    signature so a caller that leaves it unset always sees the current
+    value."""
+    require_transaction(conn)
+    wait_timeout = POOL_LOCK_WAIT_TIMEOUT_S if timeout is None else timeout
+    await conn.execute(
+        "SELECT pg_advisory_xact_lock($1, $2)",
+        POOL_RESOLVE_LOCK_CLASS,
+        sequencing_run_idx & INT4_MASK,
+        timeout=wait_timeout,
+    )
 
 
 async def insert_sequencing_run(
@@ -314,7 +357,10 @@ async def insert_sequenced_pool(
     that reuses an existing filename within the run trips that index (not the
     content index this ON CONFLICT targets) and is surfaced as a PayloadMismatch
     409 by design — two distinct pools in a run must differ in both content and
-    filename, so the operator renames. (Same content + same filename is the
+    filename. The server cannot tell a second pool that happens to share a filename
+    from the same pool resubmitted with changed bytes, so the 409 names the remedy
+    for each: rename for the first, resubmit the original bytes for the second.
+    (Same content + same filename is the
     idempotent-retry case: the content ON CONFLICT reuses the row, so the
     filename collision never surfaces. This relies on Postgres evaluating the
     ON CONFLICT arbiter — the content index — before inserting into any
@@ -353,9 +399,10 @@ async def insert_sequenced_pool(
         if exc.constraint_name == "sequenced_pool_one_per_run_and_filename":
             raise PayloadMismatch(
                 "run_preflight_filename",
-                f"<a different-content pool already uses filename "
-                f"{run_preflight_filename!r} in this run; rename this preflight "
-                f"to mint a separate pool>",
+                f"<a pool in this run already uses filename "
+                f"{run_preflight_filename!r} with different contents. Resubmitting "
+                f"that same pool: submit the file exactly as it was first submitted. "
+                f"A separate pool: give this pre-flight file a different name>",
                 run_preflight_filename,
             ) from exc
         raise
@@ -774,11 +821,11 @@ async def fetch_sequenced_pool_completion(
         list(NON_TERMINAL_WORK_TICKET_STATES),
         WorkTicketState.NO_DATA.value,
         WorkTicketState.FAILED.value,
-        _GATE_COMPLETED,
-        _GATE_INVALIDATED,
+        MASK_SAMPLE_COMPLETED,
+        MASK_SAMPLE_INVALIDATED,
         WorkTicketState.COMPLETED.value,
         WorkTicketState.CANCELLED.value,
-        _GATE_PENDING,
+        MASK_SAMPLE_PENDING,
     )
 
 

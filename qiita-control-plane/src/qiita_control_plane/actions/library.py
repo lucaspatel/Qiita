@@ -63,11 +63,14 @@ from ..miint import duckdb_connect
 from ..repositories.assembly import (
     ASSEMBLY_GENOME_MAP_PAIRS_SQL,
     ASSEMBLY_GENOME_MAP_ROWS_SQL,
+    ASSEMBLY_MEMBERSHIP_ROWS_SQL,
     assembly_genome_source_id,
     insert_assembly_membership_rows,
     upsert_assembly_sample_completed,
 )
 from ..repositories.block import (
+    MASK_SAMPLE_COMPLETED,
+    MASK_SAMPLE_INVALIDATED,
     MaskSampleInvalidated,
     fetch_block_members,
     finalize_alignment_sample,
@@ -85,6 +88,11 @@ from ..repositories.reference_membership import (
     GENOME_MAP_PAIRS_SQL,
     GENOME_MAP_ROWS_SQL,
     count_reference_shards,
+)
+from ..repositories.syndna_read_count import (
+    fetch_mask_syndna_reference,
+    fetch_syndna_inserts,
+    replace_syndna_read_counts,
 )
 from ..shard_planner import _SHARD_COUNT, LineageItem, tile_by_lineage
 from .reference import IllegalStatusTransition, transition_reference_status
@@ -532,7 +540,7 @@ async def mint_features(
     # holds the feature_map temp table and the final COPY. Separate so the
     # open manifest reader and the per-batch INSERTs don't contend on one
     # connection's single in-flight query. `temp_directory` lets write_conn
-    # spill the temp table to the (ephemeral) workspace under memory pressure
+    # spill the temp table to the per-attempt workspace under memory pressure
     # rather than growing unbounded in the CP's RAM.
     read_conn = duckdb_connect()
     write_conn = duckdb_connect()
@@ -1465,6 +1473,37 @@ async def assembly_genome_map_parquet(
     )
 
 
+# The membership Parquet's columns, in `ASSEMBLY_MEMBERSHIP_ROWS_SQL`'s order.
+ASSEMBLY_MEMBERSHIP_PARQUET_SCHEMA = pa.schema(
+    [
+        ("feature_idx", pa.int64()),
+        ("kind", pa.string()),
+        ("bin_id", pa.string()),
+        ("raw_name", pa.string()),
+        ("circularity", pa.string()),
+        ("depth", pa.float64()),
+        ("mult", pa.float64()),
+    ]
+)
+
+
+async def assembly_membership_parquet(
+    pool: asyncpg.Pool, *, prep_sample_idx: int, processing_idx: int
+) -> bytes:
+    """One assembly run's membership rows as a Parquet body, uncapped — built the
+    way `_genome_map_parquet_body` builds a map, for the reasons it gives."""
+    sink = pa.BufferOutputStream()
+    await _export_query_to_parquet(
+        pool,
+        sql=ASSEMBLY_MEMBERSHIP_ROWS_SQL,
+        params=(prep_sample_idx, processing_idx),
+        schema=ASSEMBLY_MEMBERSHIP_PARQUET_SCHEMA,
+        sink=sink,
+        compression=PARQUET_COMPRESSION,
+    )
+    return sink.getvalue().to_pybytes()
+
+
 async def export_assembly_member_genome(
     pool: asyncpg.Pool,
     *,
@@ -2101,6 +2140,81 @@ async def persist_read_metrics(
     return ss_idx
 
 
+def syndna_read_counts(alignment_path: Path, *, prep_sample_idx: int) -> dict[int, int]:
+    """Count the reads aligned to each SynDNA insert in the read-mask `syndna` step's
+    alignment output: `parent_feature_idx` → number of distinct `sequence_idx`.
+
+    The file is the step's mapped-primary alignment, ungated — the identity and
+    aligned-fraction cut decides which reads the MASK calls spike-in, not which reads
+    this count includes (`jobs/syndna.py` writes both). An insert no read hit is
+    absent here; the caller zero-fills against the reference.
+
+    Raises when a row belongs to another sample: the file is one ticket's output, so a
+    foreign `prep_sample_idx` means the wrong file was handed in.
+    """
+    path_sql = validate_parquet_path(alignment_path)
+    with duckdb_connect() as duck:
+        foreign = duck.execute(
+            f"SELECT DISTINCT prep_sample_idx FROM read_parquet('{path_sql}')"
+            " WHERE prep_sample_idx IS DISTINCT FROM ?",
+            [prep_sample_idx],
+        ).fetchall()
+        if foreign:
+            raise ValueError(
+                f"{alignment_path} holds rows for prep_sample_idx"
+                f" {sorted(r[0] for r in foreign)}, expected only {prep_sample_idx}"
+            )
+        rows = duck.execute(
+            "SELECT parent_feature_idx, count(DISTINCT sequence_idx)"
+            f" FROM read_parquet('{path_sql}') GROUP BY parent_feature_idx"
+        ).fetchall()
+    return {int(feature_idx): int(n) for feature_idx, n in rows}
+
+
+async def persist_syndna_read_count(
+    pool: asyncpg.Pool,
+    *,
+    mask_idx: int,
+    prep_sample_idx: int,
+    alignment_path: Path,
+) -> int:
+    """Write this sample's per-insert SynDNA read counts under `mask_idx` into
+    `qiita.syndna_read_count`, one row per insert of the mask's SynDNA reference
+    (zeros included); return the number of rows written.
+
+    The reference comes from the mask's own params, not the ticket's action_context,
+    so the admin backfill — which has only the mask and the file — resolves it the
+    same way.
+
+    Raises, writing nothing, when the mask has no SynDNA reference, the reference has
+    no members, or the alignment names a feature outside the reference: each means
+    the counts would not be the ones the mask describes.
+    """
+    if not alignment_path.exists():
+        raise FileNotFoundError(f"syndna alignment parquet not found: {alignment_path}")
+    mask = await fetch_mask_syndna_reference(pool, mask_idx)
+    if mask is None or mask["reference_idx"] is None:
+        raise ValueError(f"mask {mask_idx} has no SynDNA reference; nothing to count against")
+    reference_idx = mask["reference_idx"]
+    inserts = [r["feature_idx"] for r in await fetch_syndna_inserts(pool, reference_idx)]
+    if not inserts:
+        raise ValueError(f"SynDNA reference {reference_idx} has no members")
+    counted = syndna_read_counts(alignment_path, prep_sample_idx=prep_sample_idx)
+    outside = sorted(set(counted) - set(inserts))
+    if outside:
+        raise ValueError(
+            f"{alignment_path} aligns reads to feature_idx {outside[:5]}, which are not"
+            f" members of SynDNA reference {reference_idx}"
+        )
+    async with pool.acquire() as conn, conn.transaction():
+        return await replace_syndna_read_counts(
+            conn,
+            mask_idx=mask_idx,
+            prep_sample_idx=prep_sample_idx,
+            counts={f: counted.get(f, 0) for f in inserts},
+        )
+
+
 async def persist_qc_report(
     pool: asyncpg.Pool,
     prep_sample_idx: int,
@@ -2388,6 +2502,53 @@ async def sync_reference_exclusion_data(
     if not results:
         return 0
     return json.loads(results[0].body.to_pybytes()).get("feature_count", 0)
+
+
+# An UPDATE rewrites every DuckLake data file it touches, and this one covers a
+# whole reference's phylogeny rows — the trees it has to cover run to a few hundred
+# thousand nodes. This is a bound, not a measurement: nothing has been timed at that
+# size. A timeout surfaces as a 502 the caller may re-issue, which is safe because
+# the second call re-reads the counts before writing.
+_MINT_PHYLOGENY_EDGE_ID_DO_ACTION_TIMEOUT_S = 300.0
+
+
+async def mint_phylogeny_edge_id_data(
+    *,
+    reference_idx: int,
+    signing_key: bytes,
+    data_plane_url: str,
+) -> dict[str, int]:
+    """Give one reference's phylogeny rows the edge numbering placement joins on.
+
+    Why the column can be NULL and what depends on it: see "Edge numbering
+    (`edge_id`)" in `docs/architecture/reference-data.md`.
+
+    Signs a ``mint_phylogeny_edge_id`` DoAction. The data plane mints only when the
+    reference's whole tree carries NULL, so a partly numbered tree comes back
+    untouched rather than half-written. Returns its counts verbatim —
+    ``reference_idx``, ``phylogeny_rows``, ``already_numbered_rows``,
+    ``minted_rows``; the caller decides which combinations are errors. Raises
+    pyarrow.flight.FlightError on transport / data-plane failure, and RuntimeError
+    when the data plane answers with no result body."""
+    results = await run_signed_flight_call(
+        lambda: sign_action(
+            action="mint_phylogeny_edge_id",
+            payload={"reference_idx": reference_idx},
+            secret=signing_key,
+        ),
+        lambda token: _do_action(
+            "mint_phylogeny_edge_id",
+            data_plane_url,
+            token,
+            _MINT_PHYLOGENY_EDGE_ID_DO_ACTION_TIMEOUT_S,
+        ),
+    )
+    if not results:
+        raise RuntimeError(
+            f"mint_phylogeny_edge_id for reference {reference_idx} returned no result"
+            " body, so what it changed is unknown"
+        )
+    return json.loads(results[0].body.to_pybytes())
 
 
 async def sync_reference_exclusion(
@@ -2766,11 +2927,11 @@ async def reconcile_block(
                     f"prep_sample={prep_sample_idx}); it must be materialized PENDING "
                     "at plan time before any block runs"
                 )
-            if state == "completed":
+            if state == MASK_SAMPLE_COMPLETED:
                 # Already finalized (idempotent re-run, or a concurrent block
                 # finalizer won this sample's race) — nothing to do.
                 continue
-            if state == "invalidated":
+            if state == MASK_SAMPLE_INVALIDATED:
                 # The pair was withdrawn. Skipped BEFORE _finalize_sample_metrics,
                 # which writes this sample's counts onto sequenced_sample: those
                 # counts would describe a pass-set no consumer may read. The
@@ -3079,6 +3240,7 @@ LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.PLAN_SHARDS: plan_shards,
     LibraryPrimitive.FINALIZE_SHARD: finalize_shard,
     LibraryPrimitive.PERSIST_READ_METRICS: persist_read_metrics,
+    LibraryPrimitive.PERSIST_SYNDNA_READ_COUNT: persist_syndna_read_count,
     LibraryPrimitive.PERSIST_QC_REPORT: persist_qc_report,
     LibraryPrimitive.DELETE_READ_MASK_BLOCK: delete_read_mask_block,
     LibraryPrimitive.RECONCILE_BLOCK: reconcile_block,

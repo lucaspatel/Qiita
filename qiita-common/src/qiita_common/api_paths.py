@@ -85,6 +85,11 @@ PATH_REFERENCE_GENOME_MAP = "/{reference_idx}/genome-map"
 # path with one behaviour is what the api_paths triple can express. Param path,
 # 3 segments, no literal shadow.
 PATH_REFERENCE_GENOME_MAP_PARQUET = "/{reference_idx}/genome-map/parquet"
+# Operator maintenance: give one reference's phylogeny rows the edge numbering
+# placements join on, for a tree loaded before the loader minted it. A verb segment
+# (like /revoke-all-tokens) because it is an action on the tree, not a sub-resource
+# to read. Param path, 3 segments, no literal shadow.
+PATH_REFERENCE_PHYLOGENY_MINT_EDGE_ID = "/{reference_idx}/phylogeny/mint-edge-id"
 
 URL_REFERENCE_PREFIX = f"{API_PREFIX}{PATH_REFERENCE_PREFIX}"
 URL_REFERENCE_BY_IDX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_BY_IDX}"
@@ -98,6 +103,9 @@ URL_REFERENCE_EXCLUSION_BY_IDX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSI
 URL_REFERENCE_GENOME_MEMBER = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_GENOME_MEMBER}"
 URL_REFERENCE_GENOME_MAP = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_GENOME_MAP}"
 URL_REFERENCE_GENOME_MAP_PARQUET = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_GENOME_MAP_PARQUET}"
+URL_REFERENCE_PHYLOGENY_MINT_EDGE_ID = (
+    f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_PHYLOGENY_MINT_EDGE_ID}"
+)
 
 # =============================================================================
 # /host-filter-profile/*
@@ -161,6 +169,10 @@ class LibraryPrimitive(StrEnum):
     # See qiita_control_plane.actions.library.finalize_shard.
     FINALIZE_SHARD = "finalize-shard"
     PERSIST_READ_METRICS = "persist-read-metrics"
+    # Read-mask: the per-insert SynDNA read counts from the `syndna` step's
+    # alignment, into qiita.syndna_read_count. See
+    # qiita_control_plane.actions.library.persist_syndna_read_count.
+    PERSIST_SYNDNA_READ_COUNT = "persist-syndna-read-count"
     PERSIST_QC_REPORT = "persist-qc-report"
     # Block-compute: idempotent block replace. Runs immediately BEFORE
     # register-files in the bulk-block read-mask workflow — deletes this block's
@@ -448,6 +460,9 @@ PATH_MASK_DEFINITION_STATUS = "/{mask_idx}/status"
 # sample. Distinct from the route above: config lifecycle and run lifecycle are
 # different questions (see qiita_common.models.MaskDefinitionStatus).
 PATH_MASK_DEFINITION_SAMPLE_STATUS = "/{mask_idx}/sample-status"
+# GET the per-insert SynDNA read counts of the selected prep_samples under the mask.
+# Who may read it is on the route (routes/read_masked.py).
+PATH_MASK_DEFINITION_SYNDNA_READ_COUNT = "/{mask_idx}/syndna-read-count"
 
 URL_MASK_DEFINITION_PREFIX = f"{API_PREFIX}{PATH_MASK_DEFINITION_PREFIX}"
 URL_MASK_DEFINITION_BY_IDX = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_BY_IDX}"
@@ -455,6 +470,9 @@ URL_MASK_DEFINITION_PREP_SAMPLE = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFIN
 URL_MASK_DEFINITION_STATUS = f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_STATUS}"
 URL_MASK_DEFINITION_SAMPLE_STATUS = (
     f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_SAMPLE_STATUS}"
+)
+URL_MASK_DEFINITION_SYNDNA_READ_COUNT = (
+    f"{URL_MASK_DEFINITION_PREFIX}{PATH_MASK_DEFINITION_SYNDNA_READ_COUNT}"
 )
 
 # =============================================================================
@@ -547,10 +565,11 @@ URL_READ_DOGET = f"{URL_READ_PREFIX}{PATH_READ_DOGET}"
 # =============================================================================
 # /assembly/* — one assembly run's contigs, and its feature -> genome map
 # =============================================================================
-# The two DoGet routes sign the same ticket for the same data plane surfaces
-# (`assembled_sequence` / `assembled_sequence_chunks`), scoped to ONE assembly
-# run — a `(prep_sample_idx, processing_idx)` pair — and differ only in who may
-# ask and how the pair is authorized. The split mirrors /alignment's exactly, for
+# The two DoGet routes sign the same ticket for the data plane surfaces
+# (`assembled_sequence` / `assembled_sequence_chunks`, and on the human route
+# `bin_quality`), scoped to ONE assembly run — a `(prep_sample_idx,
+# processing_idx)` pair — and differ in who may ask and how the pair is
+# authorized. The split mirrors /alignment's exactly, for
 # the reason Scope.ALIGNMENT_DOGET states there.
 #
 #   PATH_ASSEMBLY_DOGET      service-account-only (Scope.TICKET_DOGET). The job
@@ -566,7 +585,13 @@ URL_READ_DOGET = f"{URL_READ_PREFIX}{PATH_READ_DOGET}"
 #
 # PATH_ASSEMBLY_GENOME_MAP is not a ticket at all — `genome_idx` exists only in
 # Postgres, so it is a control-plane read, the assembly twin of
-# PATH_REFERENCE_GENOME_MAP.
+# PATH_REFERENCE_GENOME_MAP. PATH_ASSEMBLY_MEMBERSHIP is its sibling over every
+# kind, carrying the assembler's per-contig attributes instead of the genome.
+#
+# PATH_ASSEMBLY_PREP_SAMPLE is the export roster: the samples assembled under one
+# run that the caller may READ, at the tier the reads above check. The
+# /processing roster answers a different question (which samples the caller may
+# submit against) at a higher tier.
 
 PATH_ASSEMBLY_PREFIX = "/assembly"
 PATH_ASSEMBLY_DOGET = "/ticket/doget"
@@ -575,12 +600,18 @@ PATH_ASSEMBLY_GENOME_MAP = "/{prep_sample_idx}/{processing_idx}/genome-map"
 # The Parquet form, uncapped — the de novo twin of
 # PATH_REFERENCE_GENOME_MAP_PARQUET, which carries why it is a segment.
 PATH_ASSEMBLY_GENOME_MAP_PARQUET = "/{prep_sample_idx}/{processing_idx}/genome-map/parquet"
+PATH_ASSEMBLY_MEMBERSHIP = "/{prep_sample_idx}/{processing_idx}/membership"
+PATH_ASSEMBLY_MEMBERSHIP_PARQUET = "/{prep_sample_idx}/{processing_idx}/membership/parquet"
+PATH_ASSEMBLY_PREP_SAMPLE = "/{processing_idx}/prep-sample"
 
 URL_ASSEMBLY_PREFIX = f"{API_PREFIX}{PATH_ASSEMBLY_PREFIX}"
 URL_ASSEMBLY_DOGET = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_DOGET}"
 URL_ASSEMBLY_RUN_DOGET = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_RUN_DOGET}"
 URL_ASSEMBLY_GENOME_MAP = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_GENOME_MAP}"
 URL_ASSEMBLY_GENOME_MAP_PARQUET = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_GENOME_MAP_PARQUET}"
+URL_ASSEMBLY_MEMBERSHIP = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_MEMBERSHIP}"
+URL_ASSEMBLY_MEMBERSHIP_PARQUET = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_MEMBERSHIP_PARQUET}"
+URL_ASSEMBLY_PREP_SAMPLE = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_PREP_SAMPLE}"
 
 
 # =============================================================================
@@ -704,10 +735,16 @@ PATH_STUDY_BY_IDX = "/{study_idx}"
 # (ena_study_accession or bioproject_accession; default bioproject); same
 # body-vs-querystring rationale as the biosample lookup variants.
 PATH_STUDY_LOOKUP_BY_ACCESSION = "/lookup-by-accession"
+# Per-study access rows (qiita.study_access): list/grant against the study,
+# change-tier/revoke against one grantee's row.
+PATH_STUDY_ACCESS = "/{study_idx}/access"
+PATH_STUDY_ACCESS_BY_PRINCIPAL = "/{study_idx}/access/{principal_idx}"
 
 URL_STUDY_PREFIX = f"{API_PREFIX}{PATH_STUDY_PREFIX}"
 URL_STUDY_BY_IDX = f"{URL_STUDY_PREFIX}{PATH_STUDY_BY_IDX}"
 URL_STUDY_LOOKUP_BY_ACCESSION = f"{URL_STUDY_PREFIX}{PATH_STUDY_LOOKUP_BY_ACCESSION}"
+URL_STUDY_ACCESS = f"{URL_STUDY_PREFIX}{PATH_STUDY_ACCESS}"
+URL_STUDY_ACCESS_BY_PRINCIPAL = f"{URL_STUDY_PREFIX}{PATH_STUDY_ACCESS_BY_PRINCIPAL}"
 
 
 # =============================================================================

@@ -23,7 +23,17 @@ _None yet._
 
 ### 3. Migrations
 
-_None yet._
+- `[operator]` `make migrate` applies `20260929000000_sample_field_widen_fn.sql`, `20260929000001_unique_in_study_propagation_lock.sql` and `20260929000002_metadata_field_contract_error_detail.sql` (all three create or replace functions; no data change). (#628)
+
+- **[operator] Between `make migrate` and the bucket-4 restart, a study-field edit that
+  declares a field unique answers 500 (#628).** `20260929000001_unique_in_study_propagation_lock.sql`
+  makes the propagation refuse a caller that has set no `lock_timeout`, and the control plane
+  still running at that point does not set one — only the build this deploy installs does. The
+  window is the gap between the two steps, and nothing has to be done about it beyond not
+  reporting the 500 as a regression: `PATCH /api/v1/study/{S}/biosample-field/{F}` (and its
+  prep-sample twin) carrying `unique_in_study: true` recovers on the restart, with no partial
+  state left behind. That file and `20260929000000_sample_field_widen_fn.sql` only create or
+  replace functions, so neither adds a lock window on the metadata tables to size.
 
 ### 4. Deploy
 
@@ -31,19 +41,7 @@ _None yet._
 
 ### 5. Verify
 
-- `[admin]` `sudo make verify-deploy QIITA_HOSTNAME=<fqdn>` now carries two ENA egress rows —
-  grep its output for both (#584):
-  - `ena-reachability` — the control-plane host HEADs `https://www.ebi.ac.uk`. Red means
-    outbound HTTPS to the archive is blocked from this host, so **every** ENA import fails at
-    metadata resolve. Hatch: `SKIP_ENA_REACHABILITY=1` (this row only).
-  - `probe/ena-from-compute` — a SLURM compute node HEADs `www.ebi.ac.uk` and
-    `ftp.sra.ebi.ac.uk`. Red means every import's read-download step fails. No per-row hatch;
-    it rides the SLURM probe job, so `SKIP_SLURM_PROBE=1` drops it along with every other
-    `probe/*` row.
-
-  These replace the manual "confirm outbound HTTPS to the ENA archives" host-setup step this
-  deploy's predecessor carried by hand. Green proves egress only: the fetch itself runs through
-  DuckDB httpfs, so a proxy or CA problem confined to httpfs still surfaces at the first import.
+_None yet._
 
 ### 6. After the deploy verifies green
 
@@ -51,7 +49,19 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- **A hand-written `UPDATE ... SET unique_in_study = true`, or a hand-written
+  `SELECT qiita.widen_study_field_to_text(...)`, now fails unless the session sets
+  `lock_timeout` first (#628).** Both lock the metadata table against concurrent writers
+  and refuse an unbounded wait for it, which would queue every metadata write until
+  someone noticed. Run `SET LOCAL lock_timeout = '3s';` in the same transaction. The
+  deployed API path sets it for itself; the bucket-3 note covers the window before the
+  restart in which the running one does not.
+
+- **The study-field edit route accepts a new body key, `data_type` (#628).** Its only
+  permitted value is `text`, which redeclares the field and carries its stored values
+  into `value_text`. No client has to change, and the route's access bar is unchanged;
+  clients that reject unknown response keys are unaffected, since the response shape
+  already carried `data_type`.
 
 ## Deployed history
 

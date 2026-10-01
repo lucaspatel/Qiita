@@ -6,14 +6,18 @@ before the first import on a new deploy — several boundaries here are hard lim
 not "not implemented yet."
 
 Auth and the general CLI/API flow are **not** repeated here — see
-[`user-cli-quickstart.md`](user-cli-quickstart.md). This runbook covers only what is
+[`getting-started.md`](getting-started.md), step 0. This runbook covers only what is
 specific to importing from ENA.
 
 ## What an import does
 
 A single admin-facing call kicks off a **batch**: a list of INSDC study accessions
 (`PRJNA…`, `PRJEB…`, `PRJDB…`, `ERP…`, `SRP…`, `DRP…`). Each accession in the batch is
-processed independently, with bounded concurrency, in three phases:
+processed independently, with bounded concurrency, in three phases. That bound is shared
+by every batch running in the control plane at once, first come first served: a later
+batch's accessions are not admitted until every accession of every batch submitted before
+it has itself been admitted, so a busy batch can make a newly submitted one wait for it
+to clear the gate first.
 
 1. **Resolve** — the study's header, run list, and per-sample attributes are pulled
    from ENA (via the `duckdb-miint` `read_ena` / `read_ena_attributes` table
@@ -26,12 +30,38 @@ processed independently, with bounded concurrency, in three phases:
    runs go into a `sequenced_pool` on it — a multi-platform study yields more than one
    pool. Each run's ENA sample attributes are harmonized onto its biosample's metadata
    the first time that biosample is created (a re-import or a cross-study reuse does
-   not re-harmonize).
+   not re-harmonize). Each run also keeps ENA's four deposited `library_*` values as
+   study-local `ena library strategy` / `ena library source` /
+   `ena library selection` / `ena library layout` metadata on its prep_sample — new
+   imports only, since runs imported before that writer existed are not backfilled,
+   and a field ENA left blank writes no row.
 3. **Submit** — one `download-ena-study` work ticket per pool holding the study's
    runs, scoped to that `sequenced_pool`. A pool whose ticket is in flight or finished
    reuses it; one with no ticket, or whose ticket failed or was cancelled, gets a new
    one. This is the ticket that actually pulls read bytes; registration itself never
    touches read data.
+
+That gate ends at submit. The background dispatch each submitted ticket starts runs
+past it under its own process-wide bound: at most **8** dispatch tasks run at once
+(`_DISPATCH_CONCURRENCY` in `qiita-control-plane/src/qiita_control_plane/dispatch.py`,
+download workflows included), so a large import queues its downloads rather than
+pressuring the control plane's connection pool. A ticket past the cap dispatches as
+soon as a slot frees — nothing fails while it waits — and logs `queued behind the
+dispatch cap` at INFO when it starts waiting, `dispatched after waiting` when it gets
+one. The queue is a single FIFO shared by every dispatch path: ENA downloads, user-
+submitted tickets, a redrive through `POST /work-ticket/{idx}/run`, and a restart's
+re-attach all wait on the same 8 slots, so eight hours-long downloads can hold a user
+ticket until one finishes. Raising the cap is a joint decision with the connection
+pool and `FANOUT_MAX_INFLIGHT` — the sizing note on the constant says what it is
+weighed against.
+
+A download ticket's roster read also waits at most 90 s
+(`POOL_LOCK_WAIT_TIMEOUT_S`) for an in-flight registration of the same
+sequencing_run to commit, so a study of many hundreds of runs cannot fail the
+read by holding that lock past the pool's default 10 s statement budget. A
+download ticket that still fails there is FAILED/RETRIABLE: let the import
+finish, then redrive it with `POST /work-ticket/{idx}/run` — the re-read only
+adds runs.
 
 ### Re-importing, and studies we created ourselves
 
@@ -41,7 +71,10 @@ and only the new ones are added. A download ticket reads its pool's run list onc
 it starts, so new runs never join a pool whose download is in flight or finished — they
 go into a new pool with its own ticket, and the accession reports `done` only once every
 pool's download has. A re-import is also how to retry a failed or cancelled download.
-Nothing schedules this — it is an operator gesture.
+Nothing schedules this — it is an operator gesture. A native `POST .../sequenced-sample`
+add to a pool whose download has already read (or is reading) its roster is refused the
+same way, 409: create a new `sequenced_pool` on the run and submit its own
+`download-ena-study` ticket instead.
 
 An import will only add to a study **an import created**. A study Qiita created
 natively and later deposited to ENA carries a `bioproject_accession` too, so
@@ -51,10 +84,19 @@ anything is written. Deleting a batch (which cascades its items) discards the re
 that the import created the study, so a later re-import of that accession is refused
 as well.
 
+A study matched by either the incoming `bioproject_accession` or `ena_study_accession`
+is reused, and is still subject to the import-created guard above. If the pair
+identifies two different studies, or contradicts the accession the one study it
+resolves to has on file, the accession fails instead of picking a winner. The stored
+failure text is the raw contradiction, e.g. `bioproject_accession='PRJNA1',
+ena_study_accession='ERP1': study 42 has bioproject_accession 'PRJNA2'` — it does not
+say the import was refused. Fix the accession passed to the import, or the study's
+recorded value, then re-import.
+
 A failure in any one accession — an unmappable platform, a resolver error, a database
 conflict — is recorded on that accession alone; it never aborts the batch or its
-sibling accessions. Poll the batch's own status endpoint to see each accession's state
-and, on failure, the reason.
+sibling accessions. Poll with `qiita ena-import-status IDX` to see each accession's
+state and, on failure, the reason.
 
 ### REST surface
 
@@ -73,6 +115,22 @@ A control-plane restart re-drives every accession still `pending`, `resolving` o
 `registered`, unless the batch's submitter has since been disabled or retired: those
 accessions fail with that reason instead, and a re-import by an active admin picks
 them up.
+
+`qiita submit-ena-import ACCESSION [ACCESSION ...]` (or `--from-file FILE`, one accession
+per line — blank lines and whole-line `#` comments are skipped, but a line may not
+carry a trailing comment or more than one accession) drives the batch endpoints above.
+It validates every accession locally before submitting — one bad shape refuses the
+whole call — then by default polls to terminal with `--poll-interval-seconds` (default
+2s) between polls up to `--timeout-seconds` (default 86400s); `--no-watch` returns
+right after submit. A transient failure while polling — a dropped connection or a 5xx —
+is retried until the timeout instead of failing the watch; any other HTTP error is
+fatal. Exit codes: `0` every item reached `done`; `1` an item ended `failed`, the watch
+timed out (naming each still-pending accession and its last known state), an HTTP
+error, or no token was found; `2` bad input (a malformed accession, a bad `--from-file`
+line, an out-of-range flag); `130` Ctrl-C, naming the batch to poll if the POST had
+already succeeded. `qiita ena-import-status IDX` reads a batch's current state and
+always exits `0` once the read itself succeeds. See the REST bullets above for the
+state set and what each field means.
 
 The actual read download runs as the `download-ena-study` workflow
 (`workflows/download-ena-study/1.0.0.yaml`), the same `qiita ticket status` /
@@ -164,4 +222,4 @@ covers, what a green one does *not* prove, and which hatch skips which are in
 
 An unresolvable accession (malformed, or one ENA does not recognize) fails loud with
 an actionable message rather than resolving to a silent empty result — see
-`ena_import.accession` for the accepted prefix sets per accession kind.
+`qiita_common.ena_accession` for the accepted prefix sets per accession kind.

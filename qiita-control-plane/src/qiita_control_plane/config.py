@@ -9,6 +9,7 @@ from pathlib import Path
 from qiita_common.config import require_env
 
 from .fanout_dispatch import DEFAULT_FANOUT_MAX_INFLIGHT
+from .workspace import WORK_TICKET_SUBDIR
 
 # Local@domain.tld shape check for CONTACT_EMAIL. Deliberately loose —
 # the real test is whether mail reaches the address. See from_env().
@@ -49,7 +50,9 @@ _DEFAULT_CP_TO_CO_TOKEN_PATH = Path("/etc/qiita/cp-to-co.token")
 # so a 1000-shard build can't open ~1000 concurrent data-plane streams (the WOL3
 # incident). The default (mirrors the operator throttle that recovered reference
 # 16) lives in fanout_dispatch as the single source of truth; tune per deploy via
-# FANOUT_MAX_INFLIGHT once the data plane's headroom is known.
+# FANOUT_MAX_INFLIGHT once the data plane's headroom is known. A cohort gains
+# nothing above `dispatch._DISPATCH_CONCURRENCY` (8): its children dispatch
+# through the same shared process-wide slots, so they queue instead.
 _DEFAULT_FANOUT_MAX_INFLIGHT = DEFAULT_FANOUT_MAX_INFLIGHT
 
 
@@ -334,7 +337,7 @@ class Settings:
         scratch = Path(scratch_raw)
         if not scratch.is_absolute():
             raise RuntimeError(f"PATH_SCRATCH must be an absolute path, got {scratch_raw!r}")
-        ws_root = scratch / "ticket"
+        ws_root = scratch / WORK_TICKET_SUBDIR
         upload_root = scratch / "staging"
 
         # Colon-separated roots a submitter may name a host path under.

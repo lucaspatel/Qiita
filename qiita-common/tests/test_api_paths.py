@@ -21,8 +21,8 @@ def test_compute_upload_staging_path_matches_rust_layout():
     ``qiita-data-plane/src/flight_service.rs``. If you change one,
     change the other in the same commit; both sides will move together
     or not at all."""
-    assert compute_upload_staging_path(Path("/scratch/ephemeral/staging"), 42) == Path(
-        "/scratch/ephemeral/staging/uploads/42/upload.parquet"
+    assert compute_upload_staging_path(Path("/scratch/staging"), 42) == Path(
+        "/scratch/staging/uploads/42/upload.parquet"
     )
 
 
@@ -65,6 +65,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "URL_REFERENCE_EXCLUSION_BY_IDX",
         "PATH_REFERENCE_PREFIX",
         "PATH_REFERENCE_EXCLUSION_BY_IDX",
+    ),
+    (
+        "URL_REFERENCE_PHYLOGENY_MINT_EDGE_ID",
+        "PATH_REFERENCE_PREFIX",
+        "PATH_REFERENCE_PHYLOGENY_MINT_EDGE_ID",
     ),
     (
         "URL_REFERENCE_GENOME_MEMBER",
@@ -186,6 +191,12 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "URL_STUDY_LOOKUP_BY_ACCESSION",
         "PATH_STUDY_PREFIX",
         "PATH_STUDY_LOOKUP_BY_ACCESSION",
+    ),
+    ("URL_STUDY_ACCESS", "PATH_STUDY_PREFIX", "PATH_STUDY_ACCESS"),
+    (
+        "URL_STUDY_ACCESS_BY_PRINCIPAL",
+        "PATH_STUDY_PREFIX",
+        "PATH_STUDY_ACCESS_BY_PRINCIPAL",
     ),
     # /run-folder
     (
@@ -407,6 +418,13 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_ASSEMBLY_PREFIX",
         "PATH_ASSEMBLY_GENOME_MAP_PARQUET",
     ),
+    ("URL_ASSEMBLY_MEMBERSHIP", "PATH_ASSEMBLY_PREFIX", "PATH_ASSEMBLY_MEMBERSHIP"),
+    (
+        "URL_ASSEMBLY_MEMBERSHIP_PARQUET",
+        "PATH_ASSEMBLY_PREFIX",
+        "PATH_ASSEMBLY_MEMBERSHIP_PARQUET",
+    ),
+    ("URL_ASSEMBLY_PREP_SAMPLE", "PATH_ASSEMBLY_PREFIX", "PATH_ASSEMBLY_PREP_SAMPLE"),
     # /mask-definition
     (
         "URL_MASK_DEFINITION_BY_IDX",
@@ -427,6 +445,11 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "URL_MASK_DEFINITION_SAMPLE_STATUS",
         "PATH_MASK_DEFINITION_PREFIX",
         "PATH_MASK_DEFINITION_SAMPLE_STATUS",
+    ),
+    (
+        "URL_MASK_DEFINITION_SYNDNA_READ_COUNT",
+        "PATH_MASK_DEFINITION_PREFIX",
+        "PATH_MASK_DEFINITION_SYNDNA_READ_COUNT",
     ),
     # /processing (assembly run identity + its lifecycle)
     (

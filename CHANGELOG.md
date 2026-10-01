@@ -21,6 +21,130 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **A study-local sample field can be widened to text, taking its stored values
+  with it (#628).** A field minted as numeric, boolean, or date could not be redeclared once
+  values existed: the field-contract check runs when a metadata row is written, not when
+  a definition changes, so a bare flip would leave every stored value in a column the
+  declaration no longer names and reads would return NULL for all of them. The new
+  `qiita.widen_study_field_to_text` declares the field text and moves its values into
+  `value_text` in one transaction, rendering each in the form the write path stores so a
+  widened value re-parses unchanged -- including a date of `9999-12-31` or `0001-01-01`,
+  which the client library encodes as the infinite bounds and which the plain date
+  rendering answers NULL for. It serves both sample stacks. What it refuses is what
+  can never be done -- a field whose type belongs to the global registry, and terminology,
+  which has no text form -- each tagged in the error DETAIL, and the refusal names the
+  type it refused rather than describing the one type that reaches it today; a field
+  already text is a no-op returning zero rather than a conflict. Uniqueness enforcement passes from the
+  numeric or date partial index to the text one and still holds, since distinct values
+  render to distinct text. A move locks the metadata table against concurrent writers,
+  without which a write already in flight would land in the column the declaration is
+  about to stop naming -- unreadable, with nothing raised -- and it refuses to run for a
+  caller that has not bounded its wait for that lock. Neither the no-op nor a refusal
+  takes the lock. `PATCH /api/v1/study/{study_idx}/biosample-field/{study_field_idx}` and its
+  prep-sample twin reach it: the edit body now accepts `data_type`, whose only permitted
+  value is `text`, so narrowing stays inexpressible and is refused before the route runs.
+  The access bar is the one the route already had -- study admin, or `wet_lab_admin`.
+  Widening runs before a `unique_in_study` sent in the same body, so a field that becomes
+  text is judged eligible as text rather than as the closed value set it left. A field
+  whose values sit on published samples, or on samples whose link to the study has been
+  retired, cannot be widened at all, and the answer says which.
+- **`qiita submit-ena-import` / `qiita ena-import-status` submit and watch a batch ENA
+  study import from the CLI (#629).** `submit-ena-import ACCESSION [ACCESSION ...]` (or
+  `--from-file`, one accession per line — a whole-line `#` comment only; a trailing
+  comment or more than one accession on a line is refused, naming the line number)
+  validates every accession locally, `POST`s `/ena-import-batch`, and by default polls
+  to terminal with bounded `--poll-interval-seconds` / `--timeout-seconds` flags —
+  printing each item's state change and exiting `1` if any item ends `failed` or the
+  watch times out (naming every still-pending accession and its last known state); a
+  transient error while polling is retried until the deadline instead of failing the
+  watch. `--no-watch` returns right after submit; Ctrl-C exits `130`, naming the batch
+  to poll if it had already been created. `ena-import-status IDX` reads a batch's
+  current state. Both require wet_lab_admin or system_admin, matching the routes' own
+  gate.
+
+- **A study reader can export per-prep_sample SynDNA insert read counts as BIOM or Parquet
+  (#621).** The read-mask workflow's new `persist-syndna-read-count` action (gated on
+  `syndna_enabled`, appended after `finalize-mask-sample`) reduces the `syndna` step's
+  alignment output to the number of reads with a mapped primary alignment to each
+  insert — ungated, the quantity classic Qiita publishes as `syndna.biom`, not the
+  gated `spikein_read_count_r1r2` — and writes one row per insert of the mask's SynDNA
+  reference, zeros included, to the new `qiita.syndna_read_count`.
+  `GET /mask-definition/{mask_idx}/syndna-read-count` serves a selection by study,
+  pool and/or prep_samples, all-or-nothing at `Tier.VIEWER` on every linked study
+  (wet_lab_admin+ bypass), refusing a mask without SynDNA and any selected prep_sample not
+  completed or not counted. `qiita mask syndna-read-count` writes it as BIOM (default)
+  or `--format parquet`, each prep_sample's `sample_id` is its biosample accession (`--prefix-pool` for
+  `<sequenced_pool_idx>_<accession>`; a shared name is refused) and inserts by the
+  taxonomy's species rank over a reference DoGet or, with `--feature-names accession`,
+  the recorded FASTA header. `qiita-admin backfill syndna-read-count` writes the counts for prep_samples masked
+  earlier from the `syndna` step output left in each ticket's scratch workspace,
+  listing those whose file is gone.
+- **A viewer can export an assembly run's LCGs and MAGs as FASTA with their metadata
+  (#620).** `qiita assembly export --processing-idx N` with one of `--prep-sample-idx`,
+  `--sequenced-pool-idx` or `--study-idx` writes one gzipped FASTA per genome, named
+  `<biosample accession>_<bin_id>`, plus `genomes.tsv` (length, contig and circular
+  counts, GC, length-weighted depth, CheckM completeness/contamination/strain
+  heterogeneity/lineage; GC is computed in plain SQL because miint has no composition
+  scalar, duckdb-miint#282) and `contigs.tsv` (header, genome, length and the assembler's
+  `raw_name`, `circularity`, `depth`, `mult`). Filters: `--kind` (default LCG and MAG),
+  `--min-bp`/`--max-bp`, `--min-completeness`/`--max-contamination`. It refuses and
+  writes nothing on a pending or invalidated prep_sample, a prep_sample whose biosample
+  has no accession, a genome name repeated in one export, a run whose Postgres membership and streamed
+  contigs differ, or a record whose reassembled length is not its
+  `sequence_length_bp`. Three reads back it: `GET
+  /assembly/{prep_sample_idx}/{processing_idx}/membership[/parquet]` (every kind, with
+  the assembler's per-contig attributes), `GET /assembly/{processing_idx}/prep-sample`
+  (the prep_samples the caller may read, at `Tier.VIEWER`; the `/processing` roster narrows
+  at `Tier.ADMIN`), and `bin_quality` on the human run mint `POST
+  /assembly/{prep_sample_idx}/{processing_idx}/ticket/doget`, which it was previously
+  absent from. The service-account mint still does not sign `bin_quality`.
+
+- **Study access can be listed, granted, changed and revoked through the API and CLI
+  (#614).** `GET/POST /study/{study_idx}/access` and `PATCH/DELETE
+  /study/{study_idx}/access/{principal_idx}`, with `qiita study access
+  list|grant|set-tier|revoke`, replace the operator `INSERT INTO qiita.study_access`.
+  A grant names the grantee by the email on their account, which must have logged in
+  once. `wet_lab_admin`+ manages any row; a study admin grants any tier and revokes
+  member/viewer rows; a member grants and revokes member/viewer; a viewer manages
+  nothing (`auth/study_access_policy.py`). Lists need `study:read`, changes
+  `study:write`. Each grant, tier change and revoke records an `auth_event`, so a
+  revoke leaves a record after the row is deleted (#579).
+
+- **A reference tree carries the edge numbering a placement joins back on (#581).**
+  `read_newick` fills `edge_id` only from jplace `{N}` decorations, so a backbone
+  loaded from an undecorated Newick carried NULL on every node. `krepp_index_create`
+  carries an `edge_id` through the build and `place_krepp` returns it verbatim as
+  `edge_num`, so the numbering we supply is the one that comes back — supply none and
+  the index numbers its own edges, after which `tree_resolve_placement` errors on
+  every row and a hand-written join returns nothing. The build reports `status='ok'`
+  either way (duckdb-miint#272). `reference_load` now mints `edge_id = node_index` when a tree
+  decorates no node, and leaves a tree that decorates any node exactly as it came, so
+  a partially decorated tree never ends up with two numberings in one column. For a
+  reference already in the lake, `POST /reference/{reference_idx}/phylogeny/mint-edge-id`
+  (`reference:write`, the scope that loads a reference) does the same through a new
+  `mint_phylogeny_edge_id` DoAction — one DuckLake `UPDATE` in one transaction, scoped
+  to one reference and issued only when every one of that tree's rows is NULL. A
+  partly numbered tree is a `409` rather than a completed mint, a reference with no
+  phylogeny is a `409` rather than an ambiguous zero, and a tree that already carries
+  its numbering mints nothing, so the call is safe to repeat. The DuckLake semantics
+  this rests on — an `UPDATE` reporting the rows it actually changed, touching only the
+  named reference, and changing nothing on a second run — are pinned by an
+  `integration`-gated data-plane test against a real catalog.
+
+- **ENA import preserves every deposited `library_*` field as prep_sample metadata
+  (#599).** `register_ena_study` now writes `library_strategy`, `library_source`,
+  `library_selection`, and `library_layout` onto each run's prep_sample as the
+  study-local TEXT fields `ena library strategy`, `ena library source`,
+  `ena library selection`, and `ena library layout` — whitespace-trimmed, otherwise
+  exactly as deposited (no case normalization), so what ENA deposited survives
+  independently of the `prep_protocol` mapping, which consumes only strategy/source
+  and is slated for replacement. The four fields are resolved and vetted once per
+  study before any run is written, so a pre-existing field at one of those names that
+  is non-text, unique within the study, or globally linked fails the whole accession
+  loudly instead of run by run. A field ENA left blank writes no row. **New imports
+  only:** runs imported before this change are not backfilled, so a re-import of an
+  older study leaves those runs' slots empty.
+
 - **Deploy proves outbound HTTPS to the ENA archives, so a blocked host fails the deploy
   instead of every import (#584).** `deploy/verify.sh` gains an `ena-reachability` check
   (hatch `SKIP_ENA_REACHABILITY`, which covers that row only) that HEADs `www.ebi.ac.uk` as
@@ -105,7 +229,6 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   identifier through a different field, or in a different study, is untouched. Owner-id
   fields minted before this rule are brought up to it by migration, which aborts rather
   than picking a winner when a field's existing values cannot satisfy the policy.
-
 - **The genome map is served as Parquet from a sibling route, so a large reference
   is no longer unbuildable (#550).** `GET /reference/{idx}/genome-map` caps at 250,000
   entries and 413s above it; both genome-bearing references on the deploy are past
@@ -982,6 +1105,21 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   moves to `qiita_common.assembly_constants`, the contract layer both Python services
   depend on, and the Postgres and DuckLake `assembly_membership` comments name it instead of
   enumerating members (a comment-only migration).
+
+- **A getting-started runbook for bringing a run in (#461).** `docs/runbooks/getting-started.md`
+  walks the path the bundled ingest gestures actually require: create the study with a
+  `bioproject_accession`, create its biosamples with `biosample_accession`s, build the
+  kl-run-preflight file outside Qiita naming both, then `submit-bcl-convert` or
+  `submit-pacbio-ingest`. That order is forced: `_provision_run_pool_roster` resolves every
+  pre-flight row against existing Qiita rows keyed on those two accessions and exits without
+  side effects when either lookup misses, so a study minted without an accession cannot be
+  reached from a sheet at all. No runbook stated that prerequisite. Pool identity is the
+  SHA-256 of the pre-flight's bytes, so a retry converges only if it submits the same file;
+  the runbook says to keep it unchanged. The 409 a same-name, different-bytes re-submit gets
+  (`sequenced_pool_one_per_run_and_filename`) told the caller to rename the pre-flight, which
+  is right for two distinct pools colliding on a name and wrong for one pool whose file was
+  edited after it was submitted, where renaming mints a second pool that only a system_admin
+  can remove. The server cannot tell the two apart, so the 409 now names both remedies.
 
 - **A published feature table's rows can now be labelled without our identifiers (#448).**
   `POST /exported-feature` mints the public handle for a feature-axis entity, the way
@@ -1866,6 +2004,118 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **Native sequenced-sample import now locks its sequencing run and refuses pools whose download roster is already staged** — the POST route takes #602's sequencing_run advisory lock around the insert and 409s (covering a queued download ticket too) when the pool's latest download-ena-study ticket has already read its run roster, naming the run and telling the caller to add the sample to a new pool instead. The lock wait is bounded at 5s, well under the CLI's own HTTP timeout, and a wait that exhausts it answers 503 with Retry-After rather than an unbounded hang (#627).
+
+- **The `reference_load` tests pin the host RAM they assume (#616).** Off SLURM,
+  `load`'s DuckDB limit is detected RAM minus its 8-thread headroom (#606), which is
+  1 GB on the 7 GB macOS runner, and `read_jplace` asks DuckDB 1.5.4 for about
+  1.8 GiB even for a 327-byte file (its macro passes `maximum_object_size=1000000000`
+  to `read_json`), so
+  `test_placements_lifted_writer_maps_fragment_to_feature_idx` failed with an
+  out-of-memory error on macOS CI. Under SLURM, where production runs `load` with
+  `mem_gb: 32`, the limit is 26 GB and nothing changes.
+
+- **A native job's DuckDB memory cap is bounded by the RAM the host actually has (#606).**
+  Off SLURM there was no ceiling: `resolve_duckdb_memory_gb` returned the job's
+  literal unchanged, so the `load` step handed DuckDB a 31 GB `memory_limit` on
+  any box — three `make test-system` runs on a 32 GB host died (DuckDB OOM,
+  docker idle-shutdown, host kill). The off-SLURM branch now treats the literal
+  as a ceiling — `min(fallback, detected_ram_gb() - headroom(threads) -
+  reserve_gb)` — where `detected_ram_gb()` takes the tightest limit across this
+  process's own cgroup (resolved from `/proc/self/cgroup`) and every ancestor up
+  to the mount root (cgroup v2 `memory.max`, v1 `memory.limit_in_bytes`), else
+  physical memory from sysconf. The same bound now reaches the per-slot
+  read-staging caps (`ingest_reads` / `ingest_ena_reads`) and the rype/routing
+  budgets; `host_filter` and `fastq_to_parquet` keep their small fixed caps by
+  documented design. A host at or above `fallback + headroom + reserve` is
+  unchanged, detection failure keeps the literal, and SLURM behavior is
+  untouched. The host is no longer OOM-killed, but GG2's `load` still exceeds
+  the reduced cap on a 32 GB machine — that remainder is tracked in #612.
+
+- **`qiita submit-pacbio-ingest` no longer re-queues prep_samples whose reads already
+  loaded (#461).** A re-run gave every such prep_sample a fresh `bam-to-parquet` ticket,
+  which then failed at read numbering; the runbooks told users to expect those failures.
+  The fan-out now looks up a COMPLETED `bam-to-parquet` ticket for each reused
+  prep_sample and reports it as `skipped`, naming that ticket.
+
+- **Work-ticket dispatch now has its own process-wide concurrency bound, so a burst of ticket submits can no longer starve the connection pool through dispatch alone (#598).**
+  `_STUDY_CONCURRENCY` releases its permit at submit, but the fire-and-forget
+  `schedule_dispatch` that submit starts keeps running, and acquiring connections, for
+  as long as the workflow does; `fanout_max_inflight` only caps fan-out cohorts, and an
+  ENA `download-ena-study` ticket is not one. Dispatch now runs under its own
+  semaphore, `_DISPATCH_CONCURRENCY` (8, sized against `PRODUCTION_POOL_MAX_SIZE` the
+  way `_STUDY_CONCURRENCY` is). A task holds its slot for its whole workflow, an
+  hours-long download poll included, so this also caps in-flight workflows
+  process-wide: tickets past the limit dispatch when a slot frees instead of all at
+  once, and log the wait at INFO while they queue.
+
+- **ENA import: close the race where a run added after its pool's download ticket read
+  the roster was never downloaded (#602)** — `register_ena_study` now holds the
+  sequencing_run pool-write advisory lock from pool resolution until its run inserts
+  commit (one transaction, savepoints per run), and the runner's dispatch-time roster
+  read (`_stage_ena_run_roster`) takes the same lock, so a roster read either waits
+  for the in-flight registration or the registration sees the covering ticket and
+  keeps its runs out of that pool. One transaction also makes a study
+  **all-or-nothing per attempt**: a failure or shutdown mid-study discards every run
+  it had written so far — recoverable, because `reconcile_inflight_batches`
+  re-registers idempotently — where runs used to bank one COMMIT at a time.
+- **Feature table: a de novo genome's pooled breadth of coverage counts other prep_samples' reads on contigs they also assembled, and both scopes call miint's coverage macros (#586).**
+  With a de novo arm, pooled coverage joined the contig→genome map on the prep_sample as
+  well as the contig, so a de novo genome saw only the reads of the prep_sample that
+  assembled it and pooled breadth equalled per-sample breadth. The de novo arm now calls
+  `genome_coverage` like the reference arm: a contig two cohort prep_samples assembled
+  gives both prep_samples' covered bases to each one's genome, so a combined table built
+  with pooled scope and a threshold above 0 can keep de novo genomes it used to drop.
+  Each de novo placement still counts only toward its own prep_sample's genome. The
+  pooled merge does not reconcile orientation: when a later assembly run stores a shared
+  contig as its reverse complement, prep_samples aligned before it keep positions on the
+  other axis, and that contig's pooled breadth can come out too high or too low
+  (`survivor_table_sql` in `qiita_common.analytic.coverage`).
+  `estimate_feature_table` always uses pooled, and `qiita feature-table build` defaults
+  to it. Per-sample coverage calls `genome_coverage_per_sample` on both arms in place of
+  Qiita's own copy of the arithmetic, with the same results. `qiita feature-table build
+  --coverage-scope per-sample` therefore needs a miint build that has
+  `genome_coverage_per_sample` (duckdb-miint#220, merged 2026-08-18). The client installs
+  miint once and never refreshes it, so a cache filled from an older build fails on the
+  missing function until the cached extension file is deleted and the next run
+  re-installs it; its path is the `install_path` that `duckdb_extensions()` reports for
+  `miint`.
+- **ENA import: a study findable only by its secondary accession (`ena_study_accession`) is now reused instead of failing with an opaque error, and a pair that resolves to a contradicting study now fails loud instead of reusing the wrong one (#590).**
+  `get_or_create_study_by_ena_accessions` looked up an existing study by
+  `bioproject_accession` only. A study recorded with an `ena_study_accession` but no
+  `bioproject_accession` was invisible to that lookup: re-importing it hit the
+  `ena_study_accession` unique constraint on create, then the same bioproject-only
+  refetch missed again and raised an opaque `PostgresError`. The find-or-create now
+  resolves an existing study by either accession, and raises a new
+  `EnaStudyAccessionConflictError` when the incoming pair identifies two different
+  studies, or contradicts the one study it does resolve to.
+  **Behavior change on already-deployed data:** a study whose two recorded accessions
+  contradict an incoming import's pair now fails that import item instead of silently
+  reusing the study.
+- **`ingest_ena_reads`'s md5-mismatch failure reason says how to tell a corrupted download from a digest ENA itself publishes wrong, instead of blaming "data corruption" (#591).**
+  The old wording named one cause among several and pointed at a re-queue a permanent
+  failure never reaches. The message now tells the operator to compare the run's
+  `fastq_md5` in the ENA Portal API against the value in the error: equal means ENA's own
+  file disagrees with its digest and a re-import fails identically, different means the
+  download was corrupted and a re-import retries it. The classification stays `BAD_INPUT`,
+  now as a stated choice rather than a claim about retries — miint raises the same error
+  for both causes ([duckdb-miint#274](https://github.com/the-miint/duckdb-miint/issues/274)),
+  and #595 tracks revisiting it.
+- **The `miint-sequence-split`, `miint-host-filter-fns`, `miint-infer-trim`, and `miint-gpl-boundary` compute-readiness probes now report contract drift under `python -O` / `PYTHONOPTIMIZE`, where they previously reported ok (#592).**
+  Each probe signaled the contract drift it exists to catch with a bare `assert`,
+  which `python -O` (or `PYTHONOPTIMIZE` set anywhere in the SLURM job env) strips —
+  the probe then exited 0 and printed nothing on exactly the drift it was checking
+  for. Each now raises `RuntimeError` from an explicit `if`, independent of the
+  interpreter's optimize level.
+- **ENA import: the batch concurrency bound is process-wide instead of per-batch, so several batches submitted together no longer starve the connection pool (#593).**
+  `_run_batch` built its own `asyncio.Semaphore(_STUDY_CONCURRENCY)` per call, so N
+  concurrently-scheduled batches could together claim up to N × `_STUDY_CONCURRENCY`
+  connections -- enough to take every connection the pool has, leaving unrelated
+  callers queued behind them. `schedule_ena_import_batch` now reads one semaphore off
+  `app.state`, shared first-come-first-served by every in-flight batch;
+  `_STUDY_CONCURRENCY` stays 4. The bound covers resolve, register, and ticket submit;
+  the fire-and-forget `schedule_dispatch` each submitted ticket starts still runs
+  outside it.
 - **Reference load: a genome map is checked against the reference FASTA before anything is minted, so a map whose read_ids match no FASTA sequence fails and a partial match logs what went unmatched (#577).**
   `_associate_genomes` INNER-JOINed the genome map onto the manifest's `read_id`, silently
   dropping every map row whose `read_id` isn't a FASTA sequence ID. `mint-features` now
@@ -2627,6 +2877,12 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   a different tie-break stores a different strand and casing with every hash assertion
   unmoved. One happy-path fixture is no longer a reverse-complement palindrome, so its
   `_hash` comparison exercises the fold instead of the identity.
+
+- **`submit-bcl-convert --help` named a pre-flight column that does not exist (#461).** The
+  `--prep-protocol-idx` help told operators the per-row `study_idx` "comes out of the file"
+  via `project.qiita_id`. The pinned kl-run-preflight schema has no such column; the study is
+  resolved from `project.bioproject_accession` through `/study/lookup-by-accession`. The help
+  now says that, and drops the speculation about a future pre-flight column.
 
 - **A sequence two loads both produced was stored twice, and reassembled twice as long
   (#457).** `feature_idx` is minted from the canonical sequence hash, so identical bytes
@@ -3652,6 +3908,71 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
+- **Declaring a sample field unique within its study no longer lets a concurrent write
+  slip past the new policy (#628).** The propagation that mirrors the policy onto the
+  field's stored values read only what was committed, so a metadata write already in
+  flight landed carrying the old policy -- outside the uniqueness indexes, and staying
+  there until that row was written again. The propagation now locks the metadata table
+  against concurrent writers while it tightens a field, so such a write either commits
+  first and is judged by the new policy, or waits and reads it. The lock is bounded: the
+  PATCH gives up after three seconds and answers 503 rather than stalling every metadata
+  write in the system, and the propagation refuses to run at all for a caller that has
+  set no bound. Relaxing a field's policy is unchanged, taking no lock. An edit claims
+  the field's own row in the weakest mode that excludes another edit of it, which leaves
+  a write inserting a value through that field free to proceed rather than queueing
+  behind the edit; the two can therefore no longer be found waiting on each other, and a
+  value stored while a widen is in flight is carried into text by that widen instead of
+  costing one of the two transactions. A wait that runs out still answers 503 with a
+  Retry-After hint rather than failing unclassified -- the study-field edit routes, the
+  metadata-write routes, and the biosample and sequenced-sample import routes alike. The
+  bound covers the edit's read of the field's own row as well, so an edit held off by
+  another edit of the same field answers 503 too rather than the unclassified 500 it gave
+  before. A metadata write whose field is widened after the write has chosen its value
+  column but before the row lands is refused with 409 naming the redeclaration, where it
+  previously failed unclassified: the rejection the database raises for a value column
+  that does not match its field's type now carries a structured DETAIL identifying it, so
+  a route tells it from the other rejections sharing its SQLSTATE instead of reading every
+  untagged one as a publication lock.
+- **INSDC accession validation moved into `qiita-common` (#629).** `EnaAccessionKind`,
+  `InvalidEnaAccessionError`, `detect_accession_kind`, and `validate_study_accession` now
+  live in `qiita_common.ena_accession`, not `qiita_control_plane.ena_import.accession` —
+  the CLI's accession checks (`qiita submit-ena-import`) need them without importing the
+  control plane. `qiita_control_plane.ena_import` still re-exports the first three.
+  `qiita_common.models.ena_import` also gained `TERMINAL_BATCH_ITEM_STATES`, named beside
+  `BatchItemState` the way `TERMINAL_WORK_TICKET_STATES` sits beside `WorkTicketState`.
+
+- **CLAUDE.md: read DuckLake data through the catalog, never `read_parquet` over its files
+  (#611).** Ad-hoc scripts that globbed a table's Parquet read files the catalog does not
+  consider live — superseded `assembled_sequence_chunks` and `read_mask` runs left on disk —
+  and deduplicating did not recover the catalog's answer where the runs differed (#596).
+  CLAUDE.md now carries the rule — jobs and services read through the data plane, ad-hoc
+  inspection (one-off scripts included) through `make lake-shell`'s read-only attach — and
+  points at `docs/architecture/cross-cutting.md`, whose snapshot-visibility reason now
+  covers that case and points at `scripts/lake-gc.sh` for how such files arise. The
+  neighbouring bullet on file protection said jobs write final outputs straight into
+  `/data/parquet/<table>/` and that the data plane checks mode 440 before registering; it
+  now says that jobs write into their per-ticket workspace, the
+  orchestrator checks the mode (`slurm/verify.py`), and the data plane moves each file
+  into `PATH_PERSISTENT/ducklake/<table>/` when it registers it. The same claims are
+  corrected in `processing.md` (sequence diagram, orchestrator section, step-output
+  paths), `storage.md` (layout, same-filesystem note) and `overview.md`. Step logs are
+  documented where the orchestrator writes them (`<attempt>/logs/`, not an archive under
+  `PATH_PERSISTENT/logs/`), reference source staging as `PATH_SCRATCH/references/staging/`,
+  and the 45-day `/scratch/ephemeral/` retention is removed: no such directory or sweep
+  exists, and `PATH_SCRATCH/ticket/` and `PATH_SCRATCH/staging/` are not reclaimed.
+  `processing.md`'s upload flow now matches the code: the client marks an upload done
+  (`POST /upload/{idx}/done`) and a work ticket names it later; the data plane does not
+  call back and there is no `UPLOADED` ticket state. The per-attempt workspace is no
+  longer called ephemeral in docs and code comments, and `assemble.sh`'s comment no
+  longer cites the 45-day retention (this rebuilds the `assemble` SIF at the next deploy).
+
+- **The ENA ingestion path names the `biosample_global_field` display names it writes as
+  constants instead of literals (#589).** `collection date`, the three geographic-location
+  fields, `depth`, and `host taxon id` are now `BIOSAMPLE_DISPLAY_*` in
+  `qiita_common.models.biosample`, re-exported from `qiita_common.models`.
+  `attribute_mapping.py` and `harmonization.py` emit them; the normalized-tag lookup keys
+  in `attribute_mapping.py` are unaffected. No behavior change.
+
 - **`align/1.0.0`'s memory ceiling is 128 GB, above the `align_sharded` step's
   unchanged 64 GB baseline (#560).** With the ceiling equal to the baseline, OOM
   escalation had no larger size to grow to, so the step's first OOM failed its ticket
@@ -4082,6 +4403,62 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   header's first token. Producer-chosen either way, and two headers in one file can share a
   first token, which is why the key scopes `bin_id` rather than treating it as globally
   unique or as one contig per row. None of that is recoverable from the bare `TEXT` column.
+
+- **The messages a user hits at the terminal say what happened, not how we store it (#461).**
+  The 409 for re-submitting a finished pool, the `submit-bcl-convert --force` help, and the
+  read-loading failures a `qiita ticket status` reports asked the reader to know about the lake,
+  DuckLake's lack of uniqueness, and `ON DELETE CASCADE` in order to act. They now name what
+  happened to the reader's data and which command to run, keeping the identifiers, roles,
+  recovery commands and — since `failure_reason` is an ops-triage surface as much as a user
+  one — the detail that says which call failed. The `force` explanation now lives in
+  `qiita_common.work_ticket_constants` and is consumed by the CLI flags, the 409 body and
+  the wire model's field description, because four copies had to be edited to fix it once.
+  The user CLI's help and descriptions name objects by kind — `biosample`, `prep_sample`
+  or `sequenced_sample`, never a bare "sample" — outside external terms (ENA's sample
+  accession, the pre-flight's sample sheet and sample table), as do the error bodies and
+  failure reasons this PR touches; control-plane code that is generic over both kinds keeps
+  "sample".
+
+- **`--force`, the read-numbering refusals and the retry advice name a remedy their reader
+  can act on (#461).** A forced re-run of a `sequenced_pool` action stores the pool's reads a
+  second time: its read-storage step short-circuits on the durable per-prep_sample staging
+  copy (`compute_reads_staging_path`, keyed on `prep_sample_idx` alone) before the mint, and
+  `register_files` replaces only rows the *same* ticket registered, so the forced ticket's
+  registration appends. The `--force` help, the 409 that offers it and the `force` field's
+  description say so. Where these named a
+  recovery, it is now one the reader can run or request: `qiita delete-sequenced-pool
+  --force`, with the account it needs (`sequenced_pool:delete` is system_admin only, and the
+  COMPLETED ticket blocks the delete unless forced), through one `POOL_REMOVAL_RECOVERY`
+  constant — there is no prep_sample delete. A read-numbering refusal over a range another
+  ticket reserved no longer says the reads are loaded when that ticket failed or was
+  cancelled — it may have stored them or not — and names `qiita ticket run` for that
+  ticket first, ahead of the pool delete for a deliberate re-load; over a ticket still in
+  flight it names `qiita ticket status` for that ticket; and it says the reads are loaded
+  only when that ticket COMPLETED. `/run` admits exactly `REDRIVABLE_WORK_TICKET_STATES`
+  plus PENDING, the set the refusal reads to decide whether to offer a redrive. The
+  runbooks now say to re-drive a failed job rather than re-run the submit, which queues a new
+  ticket. A pure-unit Rust test pins that `read` is absent from `REPLACE_KEY_TABLES`, the
+  table-level half of the `--force` claim. `fastq-to-parquet-retry-recovery.md` quotes the
+  current failure reasons.
+
+- **The user-facing runbooks are written for the lab, not for us (#461).** `getting-started.md`
+  and `pacbio-ingest.md` are what a person with samples reads, so no longer explain themselves
+  in route paths, guard-function names, column constraints and HTTP status codes. What a reader
+  has to *do* differently is unchanged and every mechanism that changes an outcome is still
+  stated — in terms of what they will see. Identifiers they type or read back (CLI flags, ticket
+  states, pre-flight column names, `skipped`) stay verbatim.
+
+- **`user-cli-quickstart.md` is removed; `getting-started.md` is the quickstart and the landing
+  page points at it (#461).** The old page walked one prep_sample in by hand, which nobody
+  should do on a live system; its only remaining use was the post-deploy smoke, so that recipe
+  now lives in `first-deploy.md` §11, written for the operator (a path-fed `qiita ticket
+  submit`). Its login, profile, study and biosample steps are owned by `getting-started.md`.
+  `qiita submit-reads` is unchanged and is documented by its `--help` and the `docs/auth.md`
+  command table. `pacbio-ingest.md` drops where-to-run-the-CLI, the pre-flight writability trap
+  and the `--force` rule, keeping only what has no Illumina counterpart; the accession snippet
+  uses `load_db_file` / `save_db_file`. The `study_access` grant mechanism moves to
+  `docs/auth.md`, which owns the auth surface, and the runbooks point at it rather than
+  spelling out the INSERT.
 
 - **A feature-table build now reads its reference before it streams anything (#448).** The
   reference's name and version are only needed by the manifest, written last, so the read that
@@ -4583,6 +4960,10 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 
 ### Removed
+
+- **`qiita submit-pacbio-ingest --force` (#461).** The refusal `force` waives is scoped to
+  `sequenced_pool` actions, and PacBio ingest submits prep_sample-scoped tickets, so the flag
+  changed nothing but requiring wet_lab_admin. Passing it is now an argument error.
 
 - **The single-end rype projections are gone (#478).** `align_sharded._ROUTING_QUERY` and
   `host_filter._RYPE_QUERY` narrowed the classify relation to `sequence1` so miint would not

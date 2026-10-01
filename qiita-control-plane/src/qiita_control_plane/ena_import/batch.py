@@ -8,9 +8,8 @@ this module's own tracked set `app.state.running_ena_import_batches` (mirroring
 `register_ena_study` + `submit_work_ticket_core` directly, not a
 `ComputeBackendClient` workflow run).
 
-The task (`_run_batch`) processes every item with bounded concurrency
-(`_STUDY_CONCURRENCY`) -- staying well under miint's ENAClient outbound rate
-limit and bounding concurrent DB writers. Each item (`_process_one_study`): resolve
+The task (`_run_batch`) processes every item under the process-wide bound
+`_STUDY_CONCURRENCY`. Each item (`_process_one_study`): resolve
 (blocking calls under `asyncio.to_thread`) -> `register_ena_study` -> one
 `download-ena-study` ticket per pool holding the study's runs, reused when one
 already covers the pool and otherwise submitted in-process through
@@ -35,6 +34,7 @@ from typing import Any
 
 import asyncpg
 from fastapi import FastAPI, HTTPException, status
+from qiita_common.ena_accession import validate_study_accession
 from qiita_common.models import WorkTicketState
 from qiita_common.models.ena_import import (
     BatchImportItem,
@@ -58,25 +58,36 @@ from ..repositories.ena_import_batch import (
     update_ena_import_batch_item_study_created,
 )
 from ..repositories.study import get_or_create_study_by_ena_accessions
-from .accession import validate_study_accession
 from .miint_resolver import MiintEnaResolver
 from .registration import (
     EnaRunRegistrationStatus,
     EnaStudyRegistrationResult,
     download_ticket_covers_pool,
     fetch_download_pool_states,
+    fetch_pool_download_ticket,
     register_ena_study,
 )
 from .submit import build_download_ena_study_ticket
 
 _log = logging.getLogger(__name__)
 
-# Bounded concurrency for resolve+register. Deliberately small: it keeps one batch
-# from opening many concurrent ENA connections and DB writers at once, and stays
-# comfortably under miint's ENAClient outbound rate limit. The exact request rate
-# is miint's to set and is not measured here, so this is a conservative constant,
-# not a value derived from that limit.
+# Process-wide bound on concurrent resolve+register, shared by every in-flight
+# batch. Each permit holds at most one pool connection, so this must stay well
+# below db.get_pool's max_size or the batch driver alone can starve every other
+# caller of a connection. It also bounds the ENA request rate: miint's docs
+# (https://the-miint.github.io/duckdb-miint/insdc_ena/) say only "rate-limited
+# to ~3 requests/second", with no stated scope -- duckdb-miint#276 asks miint to
+# document whether that cap is per ENAClient instance (today's per-query client
+# construction would then let N concurrent studies reach ~3N req/s) or global.
+# The dispatch each item's submit fires runs outside this permit, under
+# dispatch's own process-wide cap — see dispatch._DISPATCH_CONCURRENCY.
 _STUDY_CONCURRENCY = 4
+
+
+def build_ena_import_study_semaphore() -> asyncio.Semaphore:
+    """The process-wide permit pool `schedule_ena_import_batch` binds every batch to."""
+    return asyncio.Semaphore(_STUDY_CONCURRENCY)
+
 
 # Terminal-success work-ticket states: an item's download is `done` only when
 # every one of its tickets is explicitly one of these. Anything else (running,
@@ -316,6 +327,10 @@ async def _process_one_study(
                 if not pool_state["has_sequenced_sample"]:
                     continue
                 if download_ticket_covers_pool(pool_state["work_ticket_state"]):
+                    # Safe to reuse either way: a pool already covered when we
+                    # resolved excluded our runs from it entirely, and one
+                    # covered after our resolve read under the same lock and
+                    # therefore sees every run we registered.
                     ticket_idx = pool_state["work_ticket_idx"]
                 else:
                     body = build_download_ena_study_ticket(
@@ -333,7 +348,7 @@ async def _process_one_study(
                             raise
                         # A concurrent batch submitted this pool's ticket after our read.
                         ticket_idx = await _covering_download_ticket_idx(
-                            pool, sequencing_run_idx, pool_state["sequenced_pool_idx"]
+                            pool, pool_state["sequenced_pool_idx"]
                         )
                         if ticket_idx is None:
                             raise
@@ -361,14 +376,10 @@ async def _process_one_study(
         await _set_item_state(pool, item.idx, BatchItemState.FAILED, failure_reason=str(exc))
 
 
-async def _covering_download_ticket_idx(
-    pool: asyncpg.Pool, sequencing_run_idx: int, sequenced_pool_idx: int
-) -> int | None:
-    for pool_state in await fetch_download_pool_states(pool, sequencing_run_idx):
-        if pool_state["sequenced_pool_idx"] == sequenced_pool_idx and download_ticket_covers_pool(
-            pool_state["work_ticket_state"]
-        ):
-            return pool_state["work_ticket_idx"]
+async def _covering_download_ticket_idx(pool: asyncpg.Pool, sequenced_pool_idx: int) -> int | None:
+    ticket = await fetch_pool_download_ticket(pool, sequenced_pool_idx=sequenced_pool_idx)
+    if ticket is not None and download_ticket_covers_pool(ticket["work_ticket_state"]):
+        return ticket["work_ticket_idx"]
     return None
 
 
@@ -378,10 +389,10 @@ async def _run_batch(
     *,
     items: list[BatchImportItemHandle],
     principal: HumanUser,
+    semaphore: asyncio.Semaphore,
 ) -> None:
-    """Process every item with bounded concurrency. Never raises -- each
-    item's own try/except in `_process_one_study` absorbs its failure."""
-    semaphore = asyncio.Semaphore(_STUDY_CONCURRENCY)
+    """Process every item against the process-wide `semaphore`. Never raises --
+    each item's own try/except in `_process_one_study` absorbs its failure."""
 
     async def _bounded(item: BatchImportItemHandle) -> None:
         async with semaphore:
@@ -403,13 +414,19 @@ def schedule_ena_import_batch(
 ) -> asyncio.Task:
     """Fire-and-forget the batch's resolve+register+submit background task on
     this module's own tracked set (see module docstring for why it's separate
-    from `dispatch.py`'s)."""
+    from `dispatch.py`'s).
+
+    Reads `app.state.ena_import_study_semaphore` synchronously, before the task
+    is created, so a missing semaphore raises here rather than inside the task.
+    """
+    semaphore = app.state.ena_import_study_semaphore
     task = asyncio.create_task(
         _run_batch(
             app,
             app.state.pool,
             items=items,
             principal=principal,
+            semaphore=semaphore,
         ),
         name="ena_import_batch",
     )
@@ -428,8 +445,8 @@ async def reconcile_inflight_batches(app: FastAPI) -> int:
     strand the item forever. Re-driving is safe: `register_ena_study` is
     idempotent, and the submit loop reuses any download ticket a prior run
     already created rather than re-submitting. Items are grouped by batch so each
-    shares one task + semaphore, same as a fresh submission. Returns the count
-    scheduled, for logging.
+    shares one task, same as a fresh submission, all bound by the same
+    process-wide semaphore. Returns the count scheduled, for logging.
     """
     pool = app.state.pool
     rows = await fetch_inflight_ena_import_batch_items(pool)

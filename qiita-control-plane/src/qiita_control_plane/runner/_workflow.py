@@ -31,6 +31,7 @@ from qiita_common.models import (
 from .. import step_progress
 from ..fanout_dispatch import DEFAULT_FANOUT_MAX_INFLIGHT
 from ..repositories.mask_definition import fetch_mask_definition_by_idx
+from ..workspace import step_attempt_dir, ticket_workspace
 from ._alignment import (
     ALIGN_MASK_IDX_BINDING,
     ASSEMBLY_PROCESSING_IDX_BINDING,
@@ -98,14 +99,13 @@ from ._processing import (
     _workflow_writes_assembly_gate,
 )
 from ._read_ingest import (
-    ENA_RUN_MAP_BINDING,
     READS_STAGING_ROOT_BINDING,
     ROUTER_PENDING_BINDING,
     SAMPLE_MAP_BINDING,
     _resolve_sample_map,
     _resolve_staged_masked_reads,
     _resolve_staged_reads,
-    _stage_ena_run_roster,
+    _stage_ena_run_roster_binding,
     _stage_shard_roster,
     _workflow_declares_input,
     _workflow_needs_staged_masked_reads,
@@ -202,7 +202,7 @@ async def run_workflow(
     bound: dict[str, Any] = dict(work_ticket["action_context"] or {})
     scope_target = _build_scope_target(work_ticket)
     max_retries: int = work_ticket["max_retries"]
-    workspace = work_ticket_workspace_root / str(work_ticket_idx)
+    workspace = ticket_workspace(work_ticket_workspace_root, work_ticket_idx)
     action: ActionDefinition | None = None
     index: int | None = None
     uploads_to_consume: list[int] = []
@@ -351,20 +351,17 @@ async def run_workflow(
             bound[READS_STAGING_ROOT_BINDING] = str(upload_staging_root)
 
         # ENA run-roster binding (download-ena-study workflow's
-        # `ingest_ena_reads` step): materialize the pool's `{prep_sample_idx,
-        # ena_run_accession}` roster from a LIVE Postgres query (unlike
-        # `sample_map`, which the CP composer embeds in action_context at
-        # submit time). Dispatched by DECLARED-INPUT NAME, not scope-kind:
-        # bcl-convert is also sequenced_pool-scoped, so keying off scope-kind
-        # would wire this resolver into its ticket too. Same inside-try
-        # placement as the resolvers above so an empty-pool / missing-
-        # accession failure lands in the outer FAILED handler.
-        if _workflow_declares_input(action.steps, ENA_RUN_MAP_BINDING):
-            bound.update(
-                await _stage_ena_run_roster(
-                    pool, scope_target["sequenced_pool_idx"], workspace=workspace
-                )
-            )
+        # `ingest_ena_reads` step): see _stage_ena_run_roster_binding for the
+        # live-read and declared-input-name rationale. Same inside-try
+        # placement as the resolvers above.
+        staged_roster = await _stage_ena_run_roster_binding(
+            pool,
+            action_steps=action.steps,
+            scope_target=scope_target,
+            workspace=workspace,
+        )
+        if staged_roster is not None:
+            bound.update(staged_roster)
 
         # Staged-read binding (read-mask workflows): `reads` is consumed by qc /
         # host_filter but produced by no step, so bind it from stored reads.
@@ -1065,7 +1062,7 @@ async def _run_entry_with_retry(
             backend_client, entry, bound, scope_target, work_ticket_idx=work_ticket_idx
         )
     while True:
-        attempt_workspace = workspace / entry.name / f"attempt-{attempt}"
+        attempt_workspace = step_attempt_dir(workspace, entry.name, attempt)
         # Only a LIVE attempt is adoptable. `attempt` restarts at 0 on every
         # invocation, so a restart-recovery resume of a step that failed at
         # attempt N and escalated to N+1 lands back on N first — and

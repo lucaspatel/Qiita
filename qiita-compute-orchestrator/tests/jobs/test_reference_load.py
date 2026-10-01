@@ -28,6 +28,23 @@ from qiita_common.chunking import reassemble_chunks_expr
 
 _REFERENCE_LOAD_LOGGER = "qiita_compute_orchestrator.jobs.reference_load"
 
+
+@pytest.fixture(autouse=True)
+def _host_ram_backs_the_load_literal(monkeypatch):
+    """Run `load` off SLURM on a host big enough for its memory literal.
+
+    Off SLURM, `resolve_duckdb_memory_gb` bounds `load`'s DuckDB limit by
+    detected RAM, and on a small runner that bound falls below what
+    `read_jplace` needs: its macro passes `maximum_object_size=1000000000` to
+    DuckDB's `read_json`
+    (https://github.com/the-miint/duckdb-miint/blob/96630a5/src/include/miint_macros.hpp),
+    which on DuckDB 1.5.4 asks for about 1.8 GiB even for a 327-byte jplace.
+    Pinning RAM keeps these tests about what `load` writes, not about the
+    machine they run on; the RAM bound has tests of its own."""
+    monkeypatch.delenv("SLURM_MEM_PER_NODE", raising=False)
+    monkeypatch.setattr("qiita_compute_orchestrator.miint.detected_ram_gb", lambda: 64)
+
+
 # Canonical test sequences shared across hash_sequences and the
 # reference-load suite. Five short sequences mean every chunk is a
 # single row, which is fine here — the multi-chunk path is covered in
@@ -516,6 +533,57 @@ def test_phylogeny_accepts_a_RAW_newick_on_the_local_path(staging_inputs, tmp_pa
             ).fetchall()
         }
     assert tips_with_fidx == set(_FEATURE_MAP.values())
+
+
+def test_phylogeny_mints_edge_id_when_the_tree_decorates_nothing(
+    staging_inputs, tree_path, tmp_path
+):
+    """An undecorated Newick leaves `edge_id` NULL on every node, and an index built
+    from such a tree numbers its own edges, which join back to nothing here. The
+    loader supplies `node_index` instead — dense and unique, and carried through a
+    placement build verbatim. See "Edge numbering" in
+    `docs/architecture/reference-data.md`."""
+    outputs = _run(_inputs(**staging_inputs, tree_path=tree_path), tmp_path / "ws")
+    pq = outputs["staging_dir"] / "reference_phylogeny.parquet"
+    with duckdb.connect(":memory:") as conn:
+        rows, nulls, differing = conn.execute(
+            "SELECT count(*),"
+            "       count(*) FILTER (WHERE edge_id IS NULL),"
+            "       count(*) FILTER (WHERE edge_id IS DISTINCT FROM node_index)"
+            f" FROM '{pq}'"
+        ).fetchone()
+    assert rows > 0
+    assert nulls == 0, "an undecorated tree must not reach the lake with NULL edge_id"
+    assert differing == 0, "the minted numbering is node_index"
+
+
+def test_phylogeny_leaves_a_partially_decorated_tree_partial(staging_inputs, tmp_path):
+    """A tree carrying jplace `{N}` decorations keeps exactly those numbers, and the
+    nodes it left undecorated stay NULL. The mint is all-or-nothing per tree: filling
+    those NULLs with `node_index` would put two numberings in one column, and nothing
+    downstream could tell which one an edge came from."""
+    raw_nwk = tmp_path / "decorated.nwk"
+    # Every node but the root is decorated; the root carries no branch length and
+    # so no `{N}`, which is what makes this tree partially decorated.
+    raw_nwk.write_text(
+        "((seq1:0.1{5},seq2:0.2{6}):0.3{7},"
+        "(seq3:0.4{8},(seq4:0.5{9},seq5:0.6{10}):0.7{11}):0.8{12});"
+    )
+
+    outputs = _run(_inputs(**staging_inputs, tree_path=raw_nwk), tmp_path / "ws")
+    pq = outputs["staging_dir"] / "reference_phylogeny.parquet"
+    with duckdb.connect(":memory:") as conn:
+        decorated = [
+            r[0]
+            for r in conn.execute(
+                f"SELECT edge_id FROM '{pq}' WHERE edge_id IS NOT NULL ORDER BY edge_id"
+            ).fetchall()
+        ]
+        (still_null,) = conn.execute(
+            f"SELECT count(*) FILTER (WHERE edge_id IS NULL) FROM '{pq}'"
+        ).fetchone()
+    assert decorated == [5, 6, 7, 8, 9, 10, 11, 12]
+    assert still_null == 1, "the undecorated root must keep its NULL, not be minted"
 
 
 @pytest.fixture

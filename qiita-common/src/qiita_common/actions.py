@@ -54,6 +54,20 @@ from qiita_common.models import (
 # belongs at the layers that actually import / dispatch.
 NATIVE_MODULE_PREFIX = "qiita_compute_orchestrator.jobs."
 
+# Filename a step writes inside its output directory, naming each declared output
+# (the producer's final act before chmod; its presence is the completion marker).
+# The orchestrator's launcher writes it and its verifier reads it; the control
+# plane reads it where it finds a step's files outside the runner (the admin
+# backfills). `workflows/_shared/manifest_writer.py` runs in containers without
+# qiita_common and keeps its own copy.
+STEP_MANIFEST_FILENAME = "manifest.json"
+
+# The two directories inside a step attempt's workspace that both components
+# name: the orchestrator creates them at submit and the control plane rebuilds
+# the paths on resume and reads the logs.
+STEP_OUTPUT_SUBDIR = "output"
+STEP_LOGS_SUBDIR = "logs"
+
 # The runner binding name the minted processing_idx travels under. A step names it
 # as the value side of a `params:` pair (`processing_idx: processing_idx` ->
 # <job>.Inputs.processing_idx), which both signals the runner to mint the run
@@ -81,7 +95,7 @@ ALIGNMENT_IDX_BINDING = "alignment_idx"
 # the strings — a key renamed in the YAML then lights up its importers
 # rather than silently drifting. The gate enforces that each such path's
 # basename is prefixed by the prep_sample's sequenced_pool_item_id (see
-# docs/runbooks/user-cli-quickstart.md).
+# `_check_fastq_filename_prefix` in the control plane's routes/work_ticket.py).
 FASTQ_PATH_CONTEXT_KEYS: tuple[str, str] = ("fastq_path", "reverse_fastq_path")
 
 

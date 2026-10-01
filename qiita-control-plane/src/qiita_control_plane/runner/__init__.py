@@ -9,10 +9,9 @@ Lives in the control plane: direct DB access for work_ticket / action /
 reference rows is legitimate here. The orchestrator is reduced to its
 SLURM-driver role behind `POST /step/*`.
 
-Workspace contract: each entry runs against a per-attempt subdir
-`<work_ticket_workspace_root>/<work_ticket_idx>/<entry-name>/attempt-<N>/`
-minted by `_run_entry_with_retry`. The nesting gives two properties at
-once — retries (and re-runs) land in fresh dirs (the verifier's "every file
+Workspace contract: each entry runs against a per-attempt subdir (layout:
+`qiita_control_plane.workspace`) minted by `_run_entry_with_retry`. The nesting
+gives two properties at once — retries (and re-runs) land in fresh dirs (the verifier's "every file
 in $output_path must be in manifest" gate stays clean), and prior attempts
 persist on disk for postmortem. An entry RE-RUN whose progress row was
 deliberately dropped (a `/run` redrive, or `update-lane` invalidating a
@@ -195,6 +194,7 @@ from ._read_ingest import (
     _resolve_staged_masked_reads,
     _resolve_staged_reads,
     _stage_ena_run_roster,
+    _stage_ena_run_roster_binding,
     _stage_shard_mapping,
     _stage_shard_roster,
     _stream_masked_reads_to_fastq,
@@ -417,6 +417,7 @@ __all__: list[str] = [
     "_workflow_needs_sharded_align_indexes",
     "ENA_RUN_MAP_BINDING",
     "_stage_ena_run_roster",
+    "_stage_ena_run_roster_binding",
     "_write_ena_run_map_parquet",
     "_write_shard_mapping_parquet",
     "asyncio",
