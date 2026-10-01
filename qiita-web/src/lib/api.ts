@@ -277,6 +277,26 @@ export type WorkTicketStepLogs = {
   stderr_truncated: boolean;
 };
 
+export type StudyAccessionField = 'bioproject_accession' | 'ena_study_accession';
+
+/** Response of POST /study/lookup-by-accession: accession → study_idx + unresolved. */
+export type StudyLookupResponse = {
+  resolved: Record<string, number>;
+  missing: string[];
+};
+
+export type AccessTier = 'public' | 'viewer' | 'member' | 'admin';
+
+/** One row of a study's access list (GET /study/{idx}/access). */
+export type StudyAccessRow = {
+  study_idx: number;
+  principal_idx: number;
+  email: string | null;
+  access_tier: AccessTier;
+  granted_by_idx: number | null;
+  granted_at: string;
+};
+
 export const api = {
   whoami: () => get<Whoami>('/auth/whoami'),
   getProfile: () => get<UserProfile>('/user/me'),
@@ -294,6 +314,14 @@ export const api = {
   prepProtocols: () => get<PrepProtocol[]>('/prep-protocol'),
   /** The study record (title/owner/accessions). Needs tier >= member. */
   studyRecord: (studyIdx: number) => get<Record<string, unknown>>(`/study/${studyIdx}`),
+  /** Resolve study accession(s) → study_idx. Needs study:read scope. */
+  lookupStudyByAccession: (accessions: string[], field: StudyAccessionField = 'bioproject_accession') =>
+    send<StudyLookupResponse>('POST', '/study/lookup-by-accession', {
+      accessions,
+      accession_field: field
+    }),
+  /** Who can see a study + at what tier. Needs member+ on the study (else 403). */
+  studyAccess: (studyIdx: number) => get<StudyAccessRow[]>(`/study/${studyIdx}/access`),
   /** Sample idx set for a study. Needs tier >= viewer. */
   sequencedIdxs: (studyIdx: number) =>
     get<IdxList>(`/study/${studyIdx}/sequenced-sample/list-idxs`),

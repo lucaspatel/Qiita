@@ -3,11 +3,16 @@
   import { goto } from '$app/navigation';
   import { auth } from '$lib/auth.svelte';
   import { getRecents, removeRecent, type RecentStudy } from '$lib/recents';
+  import { api, type StudyAccessionField } from '$lib/api';
   import PageHeading from '$lib/ui/PageHeading.svelte';
   import Card from '$lib/ui/Card.svelte';
 
   let jumpIdx = $state<number | null>(null);
   let recents = $state<RecentStudy[]>([]);
+  let accession = $state('');
+  let accField = $state<StudyAccessionField>('bioproject_accession');
+  let lookupBusy = $state(false);
+  let lookupMsg = $state('');
 
   onMount(() => {
     recents = getRecents();
@@ -15,6 +20,23 @@
 
   function open() {
     if (jumpIdx && jumpIdx > 0) goto(`/studies/${jumpIdx}`);
+  }
+
+  // Resolve an accession → study_idx and open it (POST /study/lookup-by-accession).
+  async function openByAccession() {
+    const acc = accession.trim();
+    if (!acc) return;
+    lookupBusy = true;
+    lookupMsg = '';
+    const r = await api.lookupStudyByAccession([acc], accField);
+    lookupBusy = false;
+    if (!r.ok) {
+      lookupMsg = `HTTP ${r.status} — ${r.detail}`;
+      return;
+    }
+    const idx = r.data.resolved[acc];
+    if (idx) goto(`/studies/${idx}`);
+    else lookupMsg = `No study with ${accField.replace('_accession', '')} “${acc}”.`;
   }
   function drop(idx: number) {
     removeRecent(idx);
@@ -24,7 +46,7 @@
 
 <PageHeading
   title="Studies"
-  subtitle="Qiita has no list-all-studies endpoint — open one directly by id, or pick a recent."
+  subtitle="No list-all-studies endpoint exists — open one by id or accession, or pick a recent."
 />
 
 {#if !auth.isSet}
@@ -52,6 +74,38 @@
       </div>
       <p class="mt-2 text-xs text-gray-400">
         A study you can't see returns a restricted record but may still expose sample metadata (viewer tier).
+      </p>
+    </Card>
+  </div>
+
+  <div class="mb-6">
+    <Card title="Find by accession">
+      <div class="flex flex-wrap items-end gap-2">
+        <label class="text-sm">
+          <span class="mb-1 block text-gray-500">accession</span>
+          <input
+            placeholder="e.g. PRJEB12345"
+            bind:value={accession}
+            onkeydown={(e: KeyboardEvent) => e.key === 'Enter' && openByAccession()}
+            class="w-56 rounded-md border border-gray-300 px-3 py-1.5 text-sm"
+          />
+        </label>
+        <label class="text-sm">
+          <span class="mb-1 block text-gray-500">field</span>
+          <select bind:value={accField} class="rounded-md border border-gray-300 px-2.5 py-1.5 text-sm">
+            <option value="bioproject_accession">bioproject</option>
+            <option value="ena_study_accession">ena study</option>
+          </select>
+        </label>
+        <button
+          class="rounded-md bg-teal-700 px-4 py-1.5 text-sm font-semibold text-white shadow-sm hover:bg-teal-600 disabled:opacity-50"
+          onclick={openByAccession}
+          disabled={!accession.trim() || lookupBusy}>{lookupBusy ? 'Looking up…' : 'Open'}</button
+        >
+      </div>
+      {#if lookupMsg}<p class="mt-2 text-sm text-amber-700">{lookupMsg}</p>{/if}
+      <p class="mt-2 text-xs text-gray-400">
+        Resolves a known accession to its study — Qiita has no list-all endpoint, so there's no full catalog to browse.
       </p>
     </Card>
   </div>

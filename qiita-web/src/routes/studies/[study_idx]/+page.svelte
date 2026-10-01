@@ -6,7 +6,7 @@
 <script lang="ts">
   import { page } from '$app/state';
   import { auth } from '$lib/auth.svelte';
-  import { api, type ApiResult } from '$lib/api';
+  import { api, type ApiResult, type StudyAccessRow } from '$lib/api';
   import { addRecent } from '$lib/recents';
   import PageHeading from '$lib/ui/PageHeading.svelte';
   import Card from '$lib/ui/Card.svelte';
@@ -19,6 +19,7 @@
   const studyIdx = $derived(Number(page.params.study_idx));
   let loading = $state(false);
   let record = $state<ApiResult<Record<string, unknown>> | null>(null);
+  let access = $state<ApiResult<StudyAccessRow[]> | null>(null);
   let total = $state(0);
   let samples = $state<Biosample[]>([]);
   let sampleErr = $state('');
@@ -107,7 +108,12 @@
     samples = [];
     sampleErr = '';
     pageNo = 0;
+    access = null;
     record = await api.studyRecord(i);
+    // Access list (member+ only) loads alongside — never blocks sample loading.
+    api.studyAccess(i).then((r) => {
+      if (seq === loadSeq) access = r;
+    });
     const list = await api.biosampleIdxs(i);
     if (seq !== loadSeq) return;
     if (!list.ok) {
@@ -162,6 +168,45 @@
       {:else}
         <p class="text-sm text-red-700">HTTP {record.status} — {record.detail}</p>
       {/if}
+    </Card>
+  </div>
+{/if}
+
+{#if access?.ok && access.data.length}
+  {@const TIER = {
+    admin: 'bg-purple-50 text-purple-700 ring-purple-600/20',
+    member: 'bg-teal-50 text-teal-700 ring-teal-600/20',
+    viewer: 'bg-gray-50 text-gray-600 ring-gray-500/10',
+    public: 'bg-gray-50 text-gray-600 ring-gray-500/10'
+  }}
+  <div class="mb-4">
+    <Card title="Access" bodyClass="">
+      <table class="min-w-full divide-y divide-gray-200 text-sm">
+        <thead class="bg-gray-50">
+          <tr>
+            {#each ['Principal', 'Tier', 'Granted'] as h}
+              <th class="px-4 py-2 text-left text-xs font-semibold tracking-wide text-gray-500 uppercase">{h}</th>
+            {/each}
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-gray-100">
+          {#each access.data as a (a.principal_idx)}
+            <tr class="hover:bg-gray-50">
+              <td class="px-4 py-2 text-gray-800">{a.email ?? `principal ${a.principal_idx}`}</td>
+              <td class="px-4 py-2">
+                <span class="inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium capitalize ring-1 ring-inset {TIER[a.access_tier]}">{a.access_tier}</span>
+              </td>
+              <td class="px-4 py-2 text-gray-500">{new Date(a.granted_at).toLocaleDateString()}</td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    </Card>
+  </div>
+{:else if access && !access.ok && access.status === 403}
+  <div class="mb-4">
+    <Card title="Access">
+      <p class="text-sm text-gray-500">The access list is visible to members and admins of this study.</p>
     </Card>
   </div>
 {/if}
