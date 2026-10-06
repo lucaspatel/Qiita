@@ -121,6 +121,34 @@ class BiosampleImportResponse(BaseModel):
     owner_id_biosample_study_field_created: bool
 
 
+class BiosampleBulkImportRequest(BaseModel):
+    """Body for POST /api/v1/study/{study_idx}/biosample/bulk.
+
+    One `rows` entry per biosample, each the SAME shape as the single-sample
+    import — so a plate of N samples loads in one call instead of N. The wetlab
+    front door: a metadata sheet maps to one row per sample, one text cell per
+    (sample, field). The route applies the rows in ONE transaction — all succeed
+    or nothing is written — and a failing row names its index so the operator can
+    fix the sheet and resubmit. See `BiosampleImportRequest` for the per-row
+    contract (text-valued metadata keyed on a field display_name, owner id,
+    accessions, matrix_tube_id).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    rows: list[BiosampleImportRequest] = Field(min_length=1, max_length=10_000)
+
+
+class BiosampleBulkImportResponse(BaseModel):
+    """Returned by the bulk import on success: one `BiosampleImportResponse` per
+    input row, in request order (the batch is all-or-nothing, so a 2xx means every
+    row was created)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    results: list[BiosampleImportResponse]
+
+
 class OwnerBiosampleIdRow(BaseModel):
     """One row of the owner-id re-identification export.
 
