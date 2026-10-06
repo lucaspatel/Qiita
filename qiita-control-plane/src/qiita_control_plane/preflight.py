@@ -159,6 +159,55 @@ def pacbio_protocol_from_blob(blob: bytes) -> dict[str, PacbioProtocol]:
         return pacbio_protocol_by_sample_idx(conn)
 
 
+@dataclass(frozen=True, slots=True)
+class AmpliconBarcode:
+    """The per-sample amplicon demux facts the golay-demux submit needs.
+
+    The amplicon twin of `PacbioProtocol`. `barcode` is the sample's Golay index;
+    `barcodes_are_rc` is run-level in the pre-flight (inferred from the primer) but
+    carried per row so a caller holding one roster row needs no second lookup.
+    """
+
+    barcode: str
+    barcodes_are_rc: bool
+
+
+def amplicon_barcode_by_item_id(conn: sqlite3.Connection) -> dict[str, AmpliconBarcode]:
+    """Map each amplicon sample's `sequenced_pool_item_id` to its Golay barcode.
+
+    Keyed on `str(prepped_sample_idx)` because THAT is the `sequenced_pool_item_id`
+    the amplicon composer assigns (see `cli/user/amplicon.py`), so this map joins the
+    pool roster directly to resolve each sample's `prep_sample_idx` — the final
+    `{prep_sample_idx, barcode, barcodes_are_rc}` the golay-demux workflow consumes.
+    The pacbio analogue (`pacbio_protocol_by_sample_idx`) keys the same way.
+
+    Reads the SAME accessor the ingest CLI uses
+    (`cli/user/amplicon.py::_read_amplicon_preflight_rows` -> `get_amplicon_sample_info`),
+    so the roster the server builds matches what ingest validated; a parity test pins
+    the two (`tests/test_preflight.py`). This is the server-side build of a roster the
+    CLI currently hand-builds client-side and ships in `action_context`.
+
+    RAISES `ValueError` when the pre-flight's required biosample/bioproject accessions
+    are still NULL (`get_amplicon_sample_info` demands the accessioned state) — the
+    same failure the CLI surfaces — and (via `open_blob`) for an unreadable blob.
+    """
+    from run_preflight.db import get_amplicon_sample_info  # noqa: PLC0415
+
+    return {
+        str(info.sample_idx): AmpliconBarcode(
+            barcode=info.kind_row.barcode,
+            barcodes_are_rc=bool(info.kind_row.barcodes_are_rc),
+        )
+        for info in get_amplicon_sample_info(conn)
+    }
+
+
+def amplicon_barcode_from_blob(blob: bytes) -> dict[str, AmpliconBarcode]:
+    """`amplicon_barcode_by_item_id` over a stored blob."""
+    with open_blob(blob) as conn:
+        return amplicon_barcode_by_item_id(conn)
+
+
 class ControlSamples(NamedTuple):
     """The run's control (blank) samples, split by whether we can identify them.
 

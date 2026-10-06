@@ -25,12 +25,58 @@ import sqlite3
 
 import pytest
 
+from qiita_control_plane.cli.user.amplicon import _read_amplicon_preflight_rows
 from qiita_control_plane.cli.user.pacbio import _read_pacbio_preflight_rows
 from qiita_control_plane.preflight import (
     SHEET_TYPE_PACBIO_ABSQUANT,
+    amplicon_barcode_from_blob,
     is_pacbio_sheet_type,
     pacbio_protocol_from_blob,
 )
+
+
+def test_amplicon_barcode_keys_on_prepped_sample_idx(build_amplicon_preflight):
+    """`str(prepped_sample_idx)` IS the sequenced_pool_item_id the amplicon composer
+    assigns, so this map joins the pool roster directly — the amplicon twin of the
+    pacbio reader's key."""
+    roster = amplicon_barcode_from_blob(build_amplicon_preflight().read_bytes())
+    assert len(roster) == 181
+    assert all(k.isdigit() for k in roster)
+
+
+def test_amplicon_barcode_carries_barcode_and_orientation(build_amplicon_preflight):
+    roster = amplicon_barcode_from_blob(build_amplicon_preflight().read_bytes())
+    assert all(e.barcode for e in roster.values())
+    # good_amplicon_v1 is the EMP 515rcbc set → every barcode is stored reverse-complemented.
+    assert all(e.barcodes_are_rc is True for e in roster.values())
+
+
+def test_cli_and_route_amplicon_readers_agree(build_amplicon_preflight):
+    """The server reader and the ingest CLI reader must parse the SAME preflight into
+    the SAME (barcode, orientation) per prepped_sample_idx — else the roster a UI
+    submit builds would disagree with what the CLI validated."""
+    import argparse
+
+    db = build_amplicon_preflight()
+    roster = amplicon_barcode_from_blob(db.read_bytes())
+    rows = _read_amplicon_preflight_rows(db, argparse.ArgumentParser())
+    assert rows, "amplicon fixture produced no CLI rows"
+    assert {str(r.prepped_sample_idx): (r.barcode, r.barcodes_are_rc) for r in rows} == {
+        k: (e.barcode, e.barcodes_are_rc) for k, e in roster.items()
+    }
+
+
+def test_amplicon_barcode_raises_on_missing_accession(build_amplicon_preflight):
+    """`get_amplicon_sample_info` REQUIRES the accessioned state; the server reader
+    surfaces that rather than returning a partial roster."""
+    blob = build_amplicon_preflight(populate_accessions=False).read_bytes()
+    with pytest.raises(ValueError):
+        amplicon_barcode_from_blob(blob)
+
+
+def test_amplicon_barcode_raises_on_unreadable_blob():
+    with pytest.raises(ValueError):
+        amplicon_barcode_from_blob(b"this is not a sqlite file")
 
 
 def test_pacbio_protocol_keys_on_pacbio_sample_idx(build_case5_preflight):
