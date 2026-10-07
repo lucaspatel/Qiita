@@ -2,21 +2,12 @@
   // Environment picker for /profile. Also shown signed out: the fix for "no
   // token here" is often "switch to where you have one".
   import { current, envs, switchable, switchTo } from '$lib/environment';
-  import { deployment } from '$lib/deployment.svelte';
+  import { deployment, reportedName } from '$lib/deployment.svelte';
   import { hasTokenFor } from '$lib/auth.svelte';
   import Card from './Card.svelte';
 
   const d = $derived(deployment.value);
-  const reported = $derived(
-    d.status === 'named'
-      ? d.name
-      : d.status === 'unnamed'
-        ? 'unnamed'
-        : d.status === 'unknown'
-          ? `unknown (${d.detail})`
-          : '…'
-  );
-
+  const reported = $derived(reportedName(d, true));
 </script>
 
 <div id="environment">
@@ -30,6 +21,7 @@
       <ul class="divide-y divide-gray-100 rounded-md ring-1 ring-gray-200">
         {#each envs as env (env.name)}
           {@const active = env.name === current.name}
+          {@const hasToken = hasTokenFor(env.name)}
           <li class="flex items-center justify-between gap-3 px-3 py-2 text-sm">
             <div class="min-w-0">
               <p class="font-medium text-gray-900">
@@ -42,8 +34,8 @@
               {/if}
             </div>
             <div class="flex shrink-0 items-center gap-3">
-              <span class="text-xs {hasTokenFor(env.name) ? 'text-green-700' : 'text-gray-400'}"
-                >{hasTokenFor(env.name) ? 'token set' : 'no token'}</span
+              <span class="text-xs {hasToken ? 'text-green-700' : 'text-gray-400'}"
+                >{hasToken ? 'token set' : 'no token'}</span
               >
               {#if !active && switchable}
                 <button

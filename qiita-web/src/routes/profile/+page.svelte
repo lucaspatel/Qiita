@@ -67,7 +67,6 @@
 
 <PageHeading title="Profile" subtitle="Your environment, profile, and API tokens." />
 
-
 {#if !auth.isSet}
   <div class="space-y-6">
     <Card><p class="py-8 text-center text-gray-500">Log in to manage your account.</p></Card>

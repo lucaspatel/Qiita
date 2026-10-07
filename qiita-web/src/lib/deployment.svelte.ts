@@ -23,6 +23,9 @@ if (typeof window !== 'undefined') {
   });
 }
 
+/** The deployment name that gets the quiet (non-flagged) styling. */
+export const PRODUCTION_NAME = 'prod';
+
 /** The label to show: the server's name, else the dev environment's, else the host. */
 export function displayName(d: DeploymentState): string {
   if (d.status === 'named') return d.name;
@@ -31,5 +34,21 @@ export function displayName(d: DeploymentState): string {
 
 /** Production gets the quiet styling; anything else is flagged. */
 export function isProduction(d: DeploymentState): boolean {
-  return displayName(d) === 'prod';
+  return displayName(d) === PRODUCTION_NAME;
+}
+
+/** What the server reports, for the "server reports: X" caption. `detailed`
+ *  surfaces the failure detail on the unknown branch (the full /profile card);
+ *  the compact top-bar badge leaves it at "not reported". */
+export function reportedName(d: DeploymentState, detailed = false): string {
+  switch (d.status) {
+    case 'named':
+      return d.name;
+    case 'unnamed':
+      return 'unnamed';
+    case 'loading':
+      return '…';
+    case 'unknown':
+      return detailed ? `unknown (${d.detail})` : 'not reported';
+  }
 }

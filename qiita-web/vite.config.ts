@@ -35,8 +35,10 @@ function loadEnvironments(): { envs: DevEnv[]; current: string } {
     current = raw.current ?? '';
   }
   const base = process.env.QIITA_BASE?.replace(/\/+$/, '');
-  if (base && !envs.some((e) => e.origin === base)) envs.push({ name: 'custom', origin: base });
-  if (base) current = envs.find((e) => e.origin === base)!.name;
+  if (base) {
+    if (!envs.some((e) => e.origin === base)) envs.push({ name: 'custom', origin: base });
+    current = envs.find((e) => e.origin === base)!.name;
+  }
   if (envs.length === 0) envs.push({ name: 'prod', origin: DEFAULT_ORIGIN });
   if (!envs.some((e) => e.name === current)) current = envs[0].name;
   return { envs, current };

@@ -28,16 +28,18 @@
   );
   const allTerminal = $derived(!!batch && batch.items.every((i) => isTerminal(i.state)));
 
-  // Initialize on each open: a recent idx → jump to its status; else a fresh compose.
+  function reset() {
+    mode = 'compose';
+    text = '';
+    fileName = '';
+    batch = null;
+    errMsg = '';
+  }
+
+  // Reset to a fresh compose each time the modal opens.
   let wasOpen = false;
   $effect(() => {
-    if (open && !wasOpen) {
-      errMsg = '';
-      mode = 'compose';
-      text = '';
-      fileName = '';
-      batch = null;
-    }
+    if (open && !wasOpen) reset();
     wasOpen = open;
   });
 
@@ -64,10 +66,11 @@
     stamp();
   }
 
-  async function loadStatus(idx: number) {
+  async function loadStatus() {
+    if (!batch) return;
     loading = true;
     errMsg = '';
-    const r = await api.enaImportStatus(idx);
+    const r = await api.enaImportStatus(batch.ena_import_batch_idx);
     loading = false;
     if (!r.ok) {
       errMsg = `HTTP ${r.status} — ${r.detail}`;
@@ -78,13 +81,6 @@
     stamp();
   }
 
-  function newImport() {
-    mode = 'compose';
-    text = '';
-    fileName = '';
-    batch = null;
-    errMsg = '';
-  }
 </script>
 
 <Modal bind:open title="Import from ENA (INSDC)">
@@ -144,7 +140,11 @@
           class="rounded-md bg-teal-700 px-4 py-1.5 text-sm font-semibold text-white shadow-sm hover:bg-teal-600 disabled:opacity-50"
           onclick={submit}
           disabled={!canSubmit}
-          >{submitting ? 'Submitting…' : `Import ${parsed.accessions.length || ''}`.trim()}</button
+          >{submitting
+            ? 'Submitting…'
+            : parsed.accessions.length
+              ? `Import ${parsed.accessions.length}`
+              : 'Import'}</button
         >
       </div>
     </div>
@@ -167,7 +167,7 @@
         </div>
         <button
           class="rounded-md bg-white px-3 py-1.5 text-sm font-medium text-teal-700 ring-1 ring-teal-600/30 ring-inset hover:bg-teal-50 disabled:opacity-40"
-          onclick={() => batch && loadStatus(batch.ena_import_batch_idx)}
+          onclick={loadStatus}
           disabled={loading || !batch}>{loading ? 'Refreshing…' : 'Refresh'}</button
         >
       </div>
@@ -261,7 +261,7 @@
       <div class="flex justify-end gap-2 pt-1">
         <button
           class="rounded-md bg-white px-3 py-1.5 text-sm font-semibold text-gray-700 ring-1 ring-gray-300 ring-inset hover:bg-gray-50"
-          onclick={newImport}>New import</button
+          onclick={reset}>New import</button
         >
         <button
           class="rounded-md bg-teal-700 px-4 py-1.5 text-sm font-semibold text-white hover:bg-teal-600"

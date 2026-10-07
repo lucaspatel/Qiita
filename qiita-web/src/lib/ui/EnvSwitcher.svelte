@@ -3,20 +3,18 @@
   // A dot marks the environment (teal = prod, amber = anything else); the menu
   // switches environments in a dev build, and links to the full card on /profile.
   import { current, envs, switchable, switchTo } from '$lib/environment';
-  import { deployment, displayName, isProduction } from '$lib/deployment.svelte';
+  import {
+    deployment,
+    displayName,
+    isProduction,
+    reportedName,
+    PRODUCTION_NAME
+  } from '$lib/deployment.svelte';
   import { cn } from '$lib/utils';
 
   let open = $state(false);
   const d = $derived(deployment.value);
-  const reported = $derived(
-    d.status === 'named'
-      ? d.name
-      : d.status === 'unnamed'
-        ? 'unnamed'
-        : d.status === 'unknown'
-          ? 'not reported'
-          : '…'
-  );
+  const reported = $derived(reportedName(d));
   const dot = (prod: boolean) => (prod ? 'bg-teal-500' : 'bg-amber-500');
 </script>
 
@@ -53,7 +51,7 @@
           switchTo(env.name);
         }}
       >
-        <span class={cn('size-2 shrink-0 rounded-full', dot(env.name === 'prod'))}></span>
+        <span class={cn('size-2 shrink-0 rounded-full', dot(env.name === PRODUCTION_NAME))}></span>
         <span class="min-w-0 flex-1">
           <span class="block font-medium">{env.name}</span>
           <span class="block truncate font-mono text-xs text-gray-500">{env.origin}</span>

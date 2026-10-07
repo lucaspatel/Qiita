@@ -52,22 +52,30 @@ function sampleType(s: Biosample): string {
 // Lat/long column names vary across sheets ("latitude",
 // "geographic_location_latitude", "lat", …), so match by word rather than one
 // canonical key — otherwise an uploaded sheet's coordinates never reach the map.
-function geoVal(s: Biosample, kind: 'lat' | 'lon'): number | null {
-  const re = kind === 'lat' ? /\b(lat|latitude)\b/ : /\b(lon|lng|long|longitude)\b/;
+const LAT_RE = /\b(lat|latitude)\b/;
+const LON_RE = /\b(lon|lng|long|longitude)\b/;
+
+/** Resolve a sample's lat/lon in one pass over its metadata (each key is either
+ *  a latitude or a longitude key, never both), instead of two full scans. */
+function geoLatLon(s: Biosample): { lat: number | null; lon: number | null } {
+  let lat: number | null = null;
+  let lon: number | null = null;
   for (const [k, f] of Object.entries(s.global_metadata ?? {})) {
-    if (re.test(k.toLowerCase().replace(/[_-]+/g, ' '))) {
-      const n = num(f?.value);
-      if (n != null) return n;
-    }
+    const key = k.toLowerCase().replace(/[_-]+/g, ' ');
+    if (lat == null && LAT_RE.test(key)) lat = num(f?.value);
+    else if (lon == null && LON_RE.test(key)) lon = num(f?.value);
+    if (lat != null && lon != null) break;
   }
-  return null;
+  return { lat, lon };
+}
+
+/** A sample's map point, or null if it lacks either coordinate. */
+export function geoPoint(s: Biosample): GeoPoint | null {
+  const { lat, lon } = geoLatLon(s);
+  return lat != null && lon != null ? { lat, lon, type: sampleType(s), label: sampleLabel(s) } : null;
 }
 
 /** The samples' map points; samples without both coordinates are skipped. */
 export function geoPoints(samples: Biosample[]): GeoPoint[] {
-  return samples.flatMap((s) => {
-    const lat = geoVal(s, 'lat');
-    const lon = geoVal(s, 'lon');
-    return lat != null && lon != null ? [{ lat, lon, type: sampleType(s), label: sampleLabel(s) }] : [];
-  });
+  return samples.flatMap((s) => geoPoint(s) ?? []);
 }

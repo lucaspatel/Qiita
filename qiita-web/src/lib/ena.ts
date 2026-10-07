@@ -8,18 +8,21 @@
 
 export const STUDY_PREFIXES = ['PRJNA', 'PRJEB', 'PRJDB', 'ERP', 'SRP', 'DRP'] as const;
 
-const KINDS: Record<string, readonly string[]> = {
-  study: STUDY_PREFIXES,
-  sample: ['SAMN', 'SAME', 'SAMD'],
-  run: ['SRR', 'ERR', 'DRR'],
-  experiment: ['SRX', 'ERX', 'DRX']
+// Full-match patterns, mirroring ena_accession.py's `_ACCESSION_PATTERNS`: a
+// known prefix followed by digits (sample accessions may carry one letter first).
+// Prefix-only (e.g. bare `PRJEB`) is NOT a match — the server fullmatches too, so
+// a looser check here would wave through an accession the batch route then 422s.
+const KIND_PATTERNS: Record<string, RegExp> = {
+  study: new RegExp(`^(?:${STUDY_PREFIXES.join('|')})[0-9]+$`),
+  sample: /^(?:SAMN|SAME|SAMD)[A-Z]?[0-9]+$/,
+  run: /^(?:SRR|ERR|DRR)[0-9]+$/,
+  experiment: /^(?:SRX|ERX|DRX)[0-9]+$/
 };
 
 function detectKind(accession: string): string | null {
   const c = accession.trim();
   if (!c) return null;
-  for (const [kind, prefixes] of Object.entries(KINDS))
-    if (prefixes.some((p) => c.startsWith(p))) return kind;
+  for (const [kind, pattern] of Object.entries(KIND_PATTERNS)) if (pattern.test(c)) return kind;
   return null;
 }
 
@@ -30,7 +33,7 @@ export function studyAccessionError(accession: string): string | null {
   if (!c) return 'empty accession';
   const kind = detectKind(c);
   if (kind === null)
-    return `'${accession}' does not match a known INSDC accession prefix (study expects ${STUDY_PREFIXES.join('/')})`;
+    return `'${accession}' is not a known INSDC accession (study expects a ${STUDY_PREFIXES.join('/')} prefix followed by digits, e.g. PRJEB11419)`;
   if (kind !== 'study')
     return `'${accession}' is a ${kind} accession, not a study accession (expected ${STUDY_PREFIXES.join('/')})`;
   return null;

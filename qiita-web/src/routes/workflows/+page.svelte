@@ -13,10 +13,6 @@
   let isAdmin = $state(false);
   let enaOpen = $state(false);
 
-  function newEnaImport() {
-    enaOpen = true;
-  }
-
   // Gate the ENA card on the caller's role, mirroring the route's own gate.
   $effect(() => {
     if (auth.isSet) {
@@ -130,7 +126,7 @@
     {#if isAdmin}
       <Card title="Import from ENA (INSDC)">
         {#snippet actions()}
-          <button class="rounded-md bg-teal-700 px-4 py-1.5 text-sm font-semibold text-white shadow-sm hover:bg-teal-600" onclick={newEnaImport}>Import</button>
+          <button class="rounded-md bg-teal-700 px-4 py-1.5 text-sm font-semibold text-white shadow-sm hover:bg-teal-600" onclick={() => (enaOpen = true)}>Import</button>
         {/snippet}
         <p class="text-sm text-gray-600">Pull a public study into Qiita by accession — reads plus harmonized metadata.</p>
       </Card>

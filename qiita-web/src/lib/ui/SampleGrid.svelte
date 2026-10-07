@@ -7,7 +7,7 @@
   import type { Biosample } from '$lib/api';
   import { humanize } from '$lib/utils';
   import { settings } from '$lib/settings.svelte';
-  import { cellText, geoPoints, sampleLabel, type Column } from '$lib/samples';
+  import { cellText, geoPoint, sampleLabel, type Column, type GeoPoint } from '$lib/samples';
   import Card from '$lib/ui/Card.svelte';
   import GeoMap from '$lib/ui/GeoMap.svelte';
   import Modal from '$lib/ui/Modal.svelte';
@@ -70,7 +70,23 @@
   });
 
   let mapOpen = $state(false);
-  const points = $derived(geoPoints(filtered.map((r) => r.sample)));
+  // A geo point is a property of each sample, not of the filter — compute it once
+  // from `samples` so a filter keystroke does a cheap Map lookup, not a re-scan of
+  // every sample's metadata.
+  const geoByIdx = $derived.by(() => {
+    const m = new Map<number, GeoPoint>();
+    for (const s of samples) {
+      const p = geoPoint(s);
+      if (p) m.set(s.biosample_idx, p);
+    }
+    return m;
+  });
+  const points = $derived(
+    filtered.flatMap((r) => {
+      const p = geoByIdx.get(r.sample.biosample_idx);
+      return p ? [p] : [];
+    })
+  );
 </script>
 
 <Card title="Sample metadata" bodyClass="">
