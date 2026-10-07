@@ -1,5 +1,6 @@
 """Study create / patch / response models."""
 
+from enum import StrEnum
 from typing import Annotated, ClassVar
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
@@ -103,6 +104,54 @@ class StudyResponse(BaseModel):
     created_by_idx: Annotated[int, Field(gt=0)]
     created_at: AwareDatetime
     updated_at: AwareDatetime
+
+
+class StudyAccessVia(StrEnum):
+    """Why a caller can read a study, as GET /api/v1/study reports it.
+
+    Strongest reason first: `owner` (they own it), `grant` (they hold a
+    qiita.study_access row), `public` (its default_tier is public), `role`
+    (wet_lab_admin+ reads every study). No Postgres twin: derived per request.
+    """
+
+    OWNER = "owner"
+    GRANT = "grant"
+    PUBLIC = "public"
+    ROLE = "role"
+
+
+class StudySummary(BaseModel):
+    """One row of GET /api/v1/study — a study the caller may read.
+
+    `caller_tier` is the caller's own tier on the study: their
+    qiita.study_access row, or `public` when they hold none. `access_via`
+    says why they can read it, which `caller_tier` alone cannot: a
+    wet_lab_admin with no grant and a stranger on a public study both have
+    `caller_tier` public.
+    """
+
+    study_idx: Annotated[int, Field(gt=0)]
+    title: str
+    alias: str | None
+    bioproject_accession: str | None
+    ena_study_accession: str | None
+    default_tier: Tier
+    caller_tier: Tier
+    access_via: StudyAccessVia
+    updated_at: AwareDatetime
+
+
+class StudySummaryListResponse(BaseModel):
+    """GET /api/v1/study — the studies the caller may read, newest first.
+
+    `next_after_study_idx` is the cursor for the next page (pass it back as
+    `after_study_idx`), or None on the last page. A page can hold fewer than
+    `limit` rows and still not be the last: the cursor advances over every
+    study the page considered, including ones the `min_tier` filter dropped.
+    """
+
+    studies: list[StudySummary]
+    next_after_study_idx: int | None
 
 
 def _reject_public_tier(tier: Tier) -> Tier:

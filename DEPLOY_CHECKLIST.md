@@ -39,7 +39,11 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- **Viewers can now read a shared study's record.** `GET /api/v1/study/{idx}` returns
+  200 instead of 403 to a caller holding a `viewer` grant on a study whose
+  `default_tier` is `member` or `admin`. Clients that treated that 403 as "restricted"
+  will now get the record. New: `GET /api/v1/study` lists a caller's readable
+  studies. (#feat/study-list)
 
 ## Deployed history
 

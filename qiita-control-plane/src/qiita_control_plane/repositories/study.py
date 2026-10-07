@@ -490,3 +490,53 @@ async def _resolve_study_by_ena_accessions(
             detail=f"study {existing_idx} has ena_study_accession {row_ena!r}",
         )
     return row
+
+
+async def fetch_study_list_candidates(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection,
+    *,
+    principal_idx: int,
+    all_studies: bool,
+    include_ungranted_public: bool,
+    query: str | None,
+    after_study_idx: int | None,
+    limit: int,
+) -> list[asyncpg.Record]:
+    """Up to `limit` studies, newest (highest idx) first, that the caller MIGHT
+    read, each with the caller's access fields beside its summary columns.
+
+    A prefilter, not the access decision: rows come back when the caller owns
+    the study, holds any qiita.study_access row on it, or (with
+    `include_ungranted_public`) its default_tier is public; `all_studies`
+    (a role bypass) returns every study. The caller decides each row with
+    `auth.guards.caller_may_read_study_record`, so the record-read rule keeps
+    one definition; the prefilter must stay a superset of what that admits.
+    `include_ungranted_public=False` is for a caller asking only for studies
+    where their own tier reaches above public, which a study they hold no
+    grant on can never satisfy — without it, public studies would fill pages
+    only to be dropped.
+
+    `query` is a websearch-syntax full-text query over `search_vector`; it uses
+    the same 'english' configuration the generated column is built with, or
+    stemmed terms would never match. Keyset paging on idx (`after_study_idx`)
+    keeps deep pages as cheap as the first.
+    """
+    return await pool_or_conn.fetch(
+        "SELECT s.idx, s.title, s.alias, s.bioproject_accession, s.ena_study_accession,"
+        "       s.default_tier, s.owner_idx, s.updated_at, sa.access_tier"
+        " FROM qiita.study s"
+        " LEFT JOIN qiita.study_access sa"
+        "   ON sa.study_idx = s.idx AND sa.principal_idx = $1"
+        " WHERE ($2 OR s.owner_idx = $1 OR sa.access_tier IS NOT NULL"
+        "        OR ($6 AND s.default_tier = 'public'))"
+        "   AND ($3::text IS NULL OR s.search_vector @@ websearch_to_tsquery('english', $3))"
+        "   AND ($4::bigint IS NULL OR s.idx < $4)"
+        " ORDER BY s.idx DESC"
+        " LIMIT $5",
+        principal_idx,
+        all_studies,
+        query,
+        after_study_idx,
+        limit,
+        include_ungranted_public,
+    )

@@ -18,7 +18,7 @@ from typing import NamedTuple
 import asyncpg
 from fastapi import Depends, HTTPException
 from qiita_common.auth_constants import STALE_TOKEN_SCOPE_HEADER, SystemRole
-from qiita_common.models import Tier
+from qiita_common.models import StudyAccessVia, Tier
 
 from ..deps import get_db_pool
 from ..repositories.prep_sample import (
@@ -472,6 +472,58 @@ def _access_row_allows(
     return _TIER_ORDER[effective_tier] >= _TIER_ORDER[min_tier]
 
 
+def study_record_min_tier(default_tier: Tier) -> Tier:
+    """The tier needed to read a study's own record (its title, accessions,
+    description): **any grant**, or nothing at all for a public-default study.
+
+    The study's `default_tier` still governs what that tier unlocks elsewhere
+    (metadata fields fall through to it); it does not hide the record from
+    someone the study has been shared with. A viewer can already read the
+    study's samples and their metadata, so withholding its title from them
+    protected nothing and made a shared study impossible to find. Used by
+    GET /study/{idx} and the GET /study listing, so the two cannot disagree
+    about which studies a caller may see.
+    """
+    return Tier.PUBLIC if default_tier is Tier.PUBLIC else Tier.VIEWER
+
+
+def caller_may_read_study_record(
+    row: CallerStudyAccessRow,
+    *,
+    caller: Principal,
+    bypass_role: SystemRole = SystemRole.WET_LAB_ADMIN,
+    at_least: Tier | None = None,
+) -> bool:
+    """The record-read decision for one fetched row, for a route that reads
+    many rows itself (the GET /study listing): the same answer GET /study/{idx}
+    gives, i.e. `bypass_role` or `_access_row_allows` at `study_record_min_tier`.
+
+    `at_least` additionally requires the caller's own tier to reach it — "the
+    studies I am a member of" — and applies to a bypass-role caller too, since
+    it filters on their relationship to the study, not on whether they may
+    read it.
+    """
+    if at_least is not None and not _access_row_allows(row, caller=caller, min_tier=at_least):
+        return False
+    if caller.has_role_at_least(bypass_role):
+        return True
+    return _access_row_allows(row, caller=caller, min_tier=study_record_min_tier(row.default_tier))
+
+
+def study_access_via(row: CallerStudyAccessRow, *, caller: Principal) -> StudyAccessVia:
+    """Why `caller` may read this study's record — the strongest of the
+    reasons `caller_may_read_study_record` admits on, in the order it checks
+    them: ownership, a grant, a public default, then a bypass role. Call only
+    for a row that predicate admitted."""
+    if row.owner_idx == caller.principal_idx:
+        return StudyAccessVia.OWNER
+    if row.access_tier is not None:
+        return StudyAccessVia.GRANT
+    if row.default_tier is Tier.PUBLIC:
+        return StudyAccessVia.PUBLIC
+    return StudyAccessVia.ROLE
+
+
 async def filter_studies_caller_can_read(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection,
     *,
@@ -812,6 +864,7 @@ async def require_sequenced_pool_in_run(
 def require_study_access(
     min_tier: Tier | None = None,
     *,
+    resolve_min_tier: Callable[[Tier], Tier] | None = None,
     bypass_role: SystemRole = SystemRole.SYSTEM_ADMIN,
 ) -> Callable[..., None]:
     """Factory: returns a dep that gates the route on the caller's tier
@@ -830,7 +883,8 @@ def require_study_access(
     `min_tier=None` resolves the minimum to the study's own
     `default_tier` at request time (per-study policy). Pass an
     explicit `Tier` member to lock the minimum at factory call time
-    (per-route policy).
+    (per-route policy). Pass `resolve_min_tier` instead to derive the
+    minimum from the study's `default_tier` (e.g. `study_record_min_tier`).
 
     `bypass_role` defaults to `SYSTEM_ADMIN` (existing behavior). Pass
     `WET_LAB_ADMIN` for routes whose policy admits any wet_lab_admin
@@ -840,6 +894,9 @@ def require_study_access(
     `Tier.PUBLIC` by absence — meets a resolved minimum of
     `Tier.PUBLIC`, fails everything higher.
     """
+
+    if min_tier is not None and resolve_min_tier is not None:
+        raise TypeError("require_study_access takes min_tier or resolve_min_tier, not both")
 
     async def _dep(
         study_idx: int,
@@ -869,7 +926,12 @@ def require_study_access(
         # part of the decision that is this guard's own — owner bypass and the
         # tier ladder go through the shared predicate, so the route gate and the
         # body-time gates cannot drift apart.
-        resolved_min_tier = min_tier if min_tier is not None else row.default_tier
+        if min_tier is not None:
+            resolved_min_tier = min_tier
+        elif resolve_min_tier is not None:
+            resolved_min_tier = resolve_min_tier(row.default_tier)
+        else:
+            resolved_min_tier = row.default_tier
         if _access_row_allows(row, caller=p, min_tier=resolved_min_tier):
             return
         raise HTTPException(

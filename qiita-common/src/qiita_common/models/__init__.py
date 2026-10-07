@@ -322,9 +322,12 @@ from qiita_common.models.study import (
     StudyAccessGrant,
     StudyAccessResponse,
     StudyAccessTierUpdate,
+    StudyAccessVia,
     StudyCreate,
     StudyPatchRequest,
     StudyResponse,
+    StudySummary,
+    StudySummaryListResponse,
 )
 from qiita_common.models.terminology import (
     MAX_TERMINOLOGY_VERSION_LENGTH,
@@ -615,6 +618,9 @@ __all__ = [
     "StudyCreate",
     "StudyPatchRequest",
     "StudyResponse",
+    "StudyAccessVia",
+    "StudySummary",
+    "StudySummaryListResponse",
     "StudyAccessGrant",
     "StudyAccessResponse",
     "StudyAccessTierUpdate",
