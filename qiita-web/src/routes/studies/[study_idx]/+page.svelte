@@ -12,6 +12,10 @@
   import Card from '$lib/ui/Card.svelte';
   import GeoMap from '$lib/ui/GeoMap.svelte';
   import Modal from '$lib/ui/Modal.svelte';
+  import SampleUploader from '$lib/ui/SampleUploader.svelte';
+  import SampleGridDemo from '$lib/ui/SampleGridDemo.svelte';
+  import { humanize } from '$lib/utils';
+  import { settings } from '$lib/settings.svelte';
 
   const CONC = 12;
   const PAGE = 50;
@@ -26,6 +30,7 @@
   let filter = $state('');
   let pageNo = $state(0);
   let mapOpen = $state(false);
+  let addOpen = $state(false);
   let loadSeq = 0;
   let loadedFor = -1;
 
@@ -45,10 +50,24 @@
     return 'unspecified';
   }
 
+  // Lat/long column names vary across sheets ("latitude",
+  // "geographic_location_latitude", "lat", …), so match by word rather than one
+  // canonical key — otherwise an uploaded sheet's coordinates never reach the map.
+  function geoVal(s: Biosample, kind: 'lat' | 'lon'): number | null {
+    const re = kind === 'lat' ? /\b(lat|latitude)\b/ : /\b(lon|lng|long|longitude)\b/;
+    for (const [k, f] of Object.entries(s.global_metadata ?? {})) {
+      if (re.test(k.toLowerCase().replace(/[_-]+/g, ' '))) {
+        const n = num(f?.value);
+        if (n != null) return n;
+      }
+    }
+    return null;
+  }
+
   const geoPoints = $derived(
     samples.flatMap((s) => {
-      const lat = num(s.global_metadata?.geographic_location_latitude?.value);
-      const lon = num(s.global_metadata?.geographic_location_longitude?.value);
+      const lat = geoVal(s, 'lat');
+      const lon = geoVal(s, 'lon');
       return lat != null && lon != null
         ? [{ lat, lon, type: sampleType(s), label: s.biosample_accession ?? String(s.biosample_idx) }]
         : [];
@@ -120,12 +139,14 @@
       sampleErr = `samples: HTTP ${list.status} — ${list.detail}`;
       total = 0;
       loading = false;
-      addRecent({ idx: i, accessible: false, biosampleCount: null, lastOpened: Date.now() });
+      if (settings.rememberRecents)
+        addRecent({ idx: i, accessible: false, biosampleCount: null, lastOpened: Date.now() });
       return;
     }
     const idxs = list.data.idxs;
     total = idxs.length;
-    addRecent({ idx: i, accessible: true, biosampleCount: total, lastOpened: Date.now() });
+    if (settings.rememberRecents)
+      addRecent({ idx: i, accessible: true, biosampleCount: total, lastOpened: Date.now() });
     samples = idxs.map((x) => bsCache.get(x)).filter((b): b is Biosample => !!b);
     const missing = idxs.filter((x) => !bsCache.has(x));
     for (let k = 0; k < missing.length; k += CONC) {
@@ -143,7 +164,15 @@
   <a href="/studies" class="text-sm text-teal-700 hover:underline">← Studies</a>
 </div>
 
-<PageHeading title="Study {studyIdx}" subtitle="Samples and metadata." />
+<PageHeading title="Study {studyIdx}" subtitle="Samples and metadata.">
+  {#snippet actions()}
+    {#if auth.isSet}
+      <button
+        class="rounded-md bg-teal-700 px-4 py-1.5 text-sm font-semibold text-white shadow-sm hover:bg-teal-600"
+        onclick={() => (addOpen = true)}>Add samples</button>
+    {/if}
+  {/snippet}
+</PageHeading>
 
 {#if !auth.isSet}
   <Card><p class="py-8 text-center text-gray-500">Log in to view a study.</p></Card>
@@ -236,7 +265,7 @@
           <tr>
             <th class="sticky left-0 bg-gray-50 px-3 py-2 text-left text-xs font-semibold tracking-wide text-gray-500 uppercase">Accession</th>
             {#each columns as c}
-              <th class="px-3 py-2 text-left text-xs font-semibold tracking-wide whitespace-nowrap text-gray-500 uppercase">{c.label}</th>
+              <th class="px-3 py-2 text-left text-xs font-semibold tracking-wide whitespace-nowrap text-gray-500 uppercase">{settings.humanizeLabels ? humanize(c.label) : c.label}</th>
             {/each}
           </tr>
         </thead>
@@ -269,6 +298,16 @@
   </Card>
 {/if}
 
+{#if samples.length && !loading}
+  <div class="mt-4">
+    <SampleGridDemo {samples} {columns} />
+  </div>
+{/if}
+
 <Modal bind:open={mapOpen} title="Geographic distribution — {geoPoints.length} samples">
   <GeoMap points={geoPoints} />
+</Modal>
+
+<Modal bind:open={addOpen} title="Add samples to study {studyIdx}">
+  <SampleUploader studyIdx={Number(studyIdx)} onUploaded={() => load(studyIdx)} />
 </Modal>

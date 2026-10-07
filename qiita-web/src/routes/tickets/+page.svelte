@@ -4,6 +4,7 @@
   import { scopeLabel, STATE_CLASS, when } from '$lib/tickets';
   import PageHeading from '$lib/ui/PageHeading.svelte';
   import Card from '$lib/ui/Card.svelte';
+  import Select from '$lib/ui/Select.svelte';
 
   const FILTERS = ['all', 'active', 'completed', 'failed', 'no_data', 'cancelled'] as const;
   let filter = $state<(typeof FILTERS)[number]>('all');
@@ -35,14 +36,11 @@
 
 <PageHeading title="Jobs" subtitle="Work tickets you submitted — pipeline runs, newest activity first.">
   {#snippet actions()}
-    <select
-      bind:value={filter}
-      class="rounded-md border border-gray-300 px-2.5 py-1.5 text-sm capitalize"
-    >
+    <Select bind:value={filter} class="w-40 capitalize">
       {#each FILTERS as f}
         <option value={f}>{f.replace('_', ' ')}</option>
       {/each}
-    </select>
+    </Select>
     <button
       class="rounded-md bg-white px-3 py-1.5 text-sm font-medium text-teal-700 ring-1 ring-teal-600/30 ring-inset hover:bg-teal-50 disabled:opacity-40"
       onclick={load}

@@ -297,6 +297,33 @@ export type StudyAccessRow = {
   granted_at: string;
 };
 
+// --- Study create + bulk biosample import (the wetlab front door) ---
+export type StudyCreate = {
+  title: string;
+  alias?: string | null;
+  description?: string | null;
+  bioproject_accession?: string | null;
+  ena_study_accession?: string | null;
+};
+
+/** One biosample row for the bulk importer — mirrors BiosampleImportRequest. */
+export type BiosampleRow = {
+  owner_idx: number;
+  owner_biosample_id_field_name: string;
+  owner_biosample_id_value: string;
+  metadata?: Record<string, string>;
+  matrix_tube_id?: string | null;
+  metadata_checklist_name?: string | null;
+};
+
+export type BiosampleImported = {
+  biosample_idx: number;
+  owner_id_biosample_study_field_idx: number;
+  owner_id_biosample_study_field_created: boolean;
+};
+
+export type BulkImportResult = { results: BiosampleImported[] };
+
 export const api = {
   whoami: () => get<Whoami>('/auth/whoami'),
   getProfile: () => get<UserProfile>('/user/me'),
@@ -314,6 +341,11 @@ export const api = {
   prepProtocols: () => get<PrepProtocol[]>('/prep-protocol'),
   /** The study record (title/owner/accessions). Needs tier >= member. */
   studyRecord: (studyIdx: number) => get<Record<string, unknown>>(`/study/${studyIdx}`),
+  /** Create a study. Needs study:write + a complete profile. */
+  createStudy: (body: StudyCreate) => send<Record<string, unknown>>('POST', '/study', body),
+  /** Bulk-import a plate's biosamples in one all-or-nothing call. Needs ADMIN on the study. */
+  bulkImportBiosamples: (studyIdx: number, rows: BiosampleRow[]) =>
+    send<BulkImportResult>('POST', `/study/${studyIdx}/biosample/bulk`, { rows }),
   /** Resolve study accession(s) → study_idx. Needs study:read scope. */
   lookupStudyByAccession: (accessions: string[], field: StudyAccessionField = 'bioproject_accession') =>
     send<StudyLookupResponse>('POST', '/study/lookup-by-accession', {
@@ -346,5 +378,37 @@ export const api = {
     if (opts.tailLines != null) p.set('tail_lines', String(opts.tailLines));
     const qs = p.toString();
     return get<WorkTicketStepLogs>(`/work-ticket/${idx}/step/${step}/logs${qs ? `?${qs}` : ''}`);
-  }
+  },
+  /** Submit a single workflow → mints a work ticket (202) or errors (4xx) immediately. */
+  submitWorkTicket: (body: WorkTicketCreateRequest) =>
+    send<{ work_ticket_idx: number; state: WorkTicketState }>('POST', '/work-ticket', body),
+  /** Bundled "Amplicon run": upload a preflight + run id; the server provisions
+   *  from the preflight and chains golay-demux → amplicon. (Needs a server-side
+   *  preflight-ingest endpoint; demoed against the shim today.) */
+  submitAmpliconRun: (body: AmpliconRunRequest) =>
+    send<{ tickets: { work_ticket_idx: number; action_id: string; state: string }[] }>(
+      'POST',
+      '/amplicon-run',
+      body
+    )
+};
+
+/** Bundled amplicon-run submit (run id + base64 preflight + knobs). */
+export type AmpliconRunRequest = {
+  instrument_run_id: string;
+  run_preflight_blob: string; // base64
+  prep_protocol_idx: number;
+  sortmerna_reference_idx: number;
+  trim: number;
+  primer?: string;
+  orient_primer?: boolean;
+};
+
+/** Body for POST /work-ticket — mirrors WorkTicketCreateRequest. */
+export type WorkTicketCreateRequest = {
+  action_id: string;
+  action_version: string;
+  scope_target: ScopeTarget;
+  action_context?: Record<string, unknown>;
+  force?: boolean;
 };

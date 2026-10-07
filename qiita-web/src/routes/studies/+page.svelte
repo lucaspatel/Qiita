@@ -2,115 +2,127 @@
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { auth } from '$lib/auth.svelte';
-  import { getRecents, removeRecent, type RecentStudy } from '$lib/recents';
+  import { getRecents, addRecent, removeRecent, type RecentStudy } from '$lib/recents';
   import { api, type StudyAccessionField } from '$lib/api';
+  import { settings } from '$lib/settings.svelte';
   import PageHeading from '$lib/ui/PageHeading.svelte';
   import Card from '$lib/ui/Card.svelte';
+  import Modal from '$lib/ui/Modal.svelte';
+  import Select from '$lib/ui/Select.svelte';
 
-  let jumpIdx = $state<number | null>(null);
   let recents = $state<RecentStudy[]>([]);
-  let accession = $state('');
-  let accField = $state<StudyAccessionField>('bioproject_accession');
-  let lookupBusy = $state(false);
-  let lookupMsg = $state('');
+  onMount(() => (recents = getRecents()));
 
-  onMount(() => {
-    recents = getRecents();
-  });
+  // --- open a study (by idx or accession) ---
+  type OpenMode = 'idx' | StudyAccessionField;
+  let openMode = $state<OpenMode>('idx');
+  let openValue = $state('');
+  let openBusy = $state(false);
+  let openMsg = $state('');
 
-  function open() {
-    if (jumpIdx && jumpIdx > 0) goto(`/studies/${jumpIdx}`);
-  }
-
-  // Resolve an accession → study_idx and open it (POST /study/lookup-by-accession).
-  async function openByAccession() {
-    const acc = accession.trim();
-    if (!acc) return;
-    lookupBusy = true;
-    lookupMsg = '';
-    const r = await api.lookupStudyByAccession([acc], accField);
-    lookupBusy = false;
-    if (!r.ok) {
-      lookupMsg = `HTTP ${r.status} — ${r.detail}`;
+  async function openStudy() {
+    const v = openValue.trim();
+    if (!v) return;
+    openMsg = '';
+    if (openMode === 'idx') {
+      const n = Number(v);
+      if (Number.isInteger(n) && n > 0) goto(`/studies/${n}`);
+      else openMsg = 'Enter a positive study idx.';
       return;
     }
-    const idx = r.data.resolved[acc];
+    openBusy = true;
+    const r = await api.lookupStudyByAccession([v], openMode);
+    openBusy = false;
+    if (!r.ok) {
+      openMsg = `HTTP ${r.status} — ${r.detail}`;
+      return;
+    }
+    const idx = r.data.resolved[v];
     if (idx) goto(`/studies/${idx}`);
-    else lookupMsg = `No study with ${accField.replace('_accession', '')} “${acc}”.`;
+    else openMsg = `No study with ${openMode.replace('_accession', '')} “${v}”.`;
   }
+
+  // --- create a study (modal) ---
+  let createOpen = $state(false);
+  let newTitle = $state('');
+  let newBioproject = $state('');
+  let creating = $state(false);
+  let createMsg = $state('');
+
+  async function createStudy() {
+    if (!newTitle.trim()) return;
+    creating = true;
+    createMsg = '';
+    const r = await api.createStudy({
+      title: newTitle.trim(),
+      bioproject_accession: newBioproject.trim() || null
+    });
+    creating = false;
+    if (!r.ok) {
+      createMsg = `HTTP ${r.status} — ${r.detail}`;
+      return;
+    }
+    const idx = Number(r.data.study_idx);
+    if (settings.rememberRecents)
+      addRecent({ idx, accessible: true, biosampleCount: 0, lastOpened: Date.now() });
+    createOpen = false;
+    goto(`/studies/${idx}`);
+  }
+
   function drop(idx: number) {
     removeRecent(idx);
     recents = getRecents();
   }
 </script>
 
-<PageHeading
-  title="Studies"
-  subtitle="No list-all-studies endpoint exists — open one by id or accession, or pick a recent."
-/>
+<PageHeading title="Studies" subtitle="Create a study, or open one by id or accession. Load samples from a study's page.">
+  {#snippet actions()}
+    {#if auth.isSet}
+      <button
+        class="rounded-md bg-teal-700 px-4 py-1.5 text-sm font-semibold text-white shadow-sm hover:bg-teal-600"
+        onclick={() => {
+          newTitle = '';
+          newBioproject = '';
+          createMsg = '';
+          createOpen = true;
+        }}>Create study</button>
+    {/if}
+  {/snippet}
+</PageHeading>
 
 {#if !auth.isSet}
-  <Card><p class="py-8 text-center text-gray-500">Log in to open a study.</p></Card>
+  <Card><p class="py-8 text-center text-gray-500">Log in to create or open a study.</p></Card>
 {:else}
   <div class="mb-6">
-    <Card title="Jump to a study">
-      <div class="flex items-end gap-2">
-        <label class="text-sm">
-          <span class="mb-1 block text-gray-500">study idx</span>
-          <input
-            type="number"
-            min="1"
-            placeholder="e.g. 25006"
-            bind:value={jumpIdx}
-            onkeydown={(e: KeyboardEvent) => e.key === 'Enter' && open()}
-            class="w-40 rounded-md border border-gray-300 px-3 py-1.5 text-sm"
-          />
-        </label>
-        <button
-          class="rounded-md bg-teal-700 px-4 py-1.5 text-sm font-semibold text-white shadow-sm hover:bg-teal-600 disabled:opacity-50"
-          onclick={open}
-          disabled={!jumpIdx || jumpIdx <= 0}>Open</button
-        >
-      </div>
-      <p class="mt-2 text-xs text-gray-400">
-        A study you can't see returns a restricted record but may still expose sample metadata (viewer tier).
-      </p>
-    </Card>
-  </div>
-
-  <div class="mb-6">
-    <Card title="Find by accession">
+    <Card title="Open a study">
       <div class="flex flex-wrap items-end gap-2">
         <label class="text-sm">
-          <span class="mb-1 block text-gray-500">accession</span>
+          <span class="mb-1 block text-gray-500">by</span>
+          <Select bind:value={openMode} class="w-48">
+            <option value="idx">study idx</option>
+            <option value="bioproject_accession">bioproject accession</option>
+            <option value="ena_study_accession">ENA accession</option>
+          </Select>
+        </label>
+        <label class="text-sm">
+          <span class="mb-1 block text-gray-500">{openMode === 'idx' ? 'idx' : 'accession'}</span>
           <input
-            placeholder="e.g. PRJEB12345"
-            bind:value={accession}
-            onkeydown={(e: KeyboardEvent) => e.key === 'Enter' && openByAccession()}
+            bind:value={openValue}
+            placeholder={openMode === 'idx' ? 'e.g. 25006' : openMode === 'bioproject_accession' ? 'PRJNA…' : 'PRJEB…'}
+            onkeydown={(e: KeyboardEvent) => e.key === 'Enter' && openStudy()}
             class="w-56 rounded-md border border-gray-300 px-3 py-1.5 text-sm"
           />
         </label>
-        <label class="text-sm">
-          <span class="mb-1 block text-gray-500">field</span>
-          <select bind:value={accField} class="rounded-md border border-gray-300 px-2.5 py-1.5 text-sm">
-            <option value="bioproject_accession">bioproject</option>
-            <option value="ena_study_accession">ena study</option>
-          </select>
-        </label>
         <button
-          class="rounded-md bg-teal-700 px-4 py-1.5 text-sm font-semibold text-white shadow-sm hover:bg-teal-600 disabled:opacity-50"
-          onclick={openByAccession}
-          disabled={!accession.trim() || lookupBusy}>{lookupBusy ? 'Looking up…' : 'Open'}</button
-        >
+          class="rounded-md bg-white px-4 py-1.5 text-sm font-semibold text-teal-700 ring-1 ring-teal-600/30 ring-inset hover:bg-teal-50 disabled:opacity-50"
+          onclick={openStudy}
+          disabled={!openValue.trim() || openBusy}>{openBusy ? 'Opening…' : 'Open'}</button>
       </div>
-      {#if lookupMsg}<p class="mt-2 text-sm text-amber-700">{lookupMsg}</p>{/if}
-      <p class="mt-2 text-xs text-gray-400">
-        Resolves a known accession to its study — Qiita has no list-all endpoint, so there's no full catalog to browse.
-      </p>
+      {#if openMsg}<p class="mt-2 text-sm text-amber-700">{openMsg}</p>{/if}
     </Card>
   </div>
 
-  <Card title="Recently opened" bodyClass="">
+  <Card title="Recent studies" bodyClass="">
     {#if recents.length}
       <table class="min-w-full divide-y divide-gray-200 text-sm">
         <thead class="bg-gray-50">
@@ -143,7 +155,37 @@
         </tbody>
       </table>
     {:else}
-      <p class="px-4 py-8 text-center text-gray-500">No studies opened yet — jump to one above.</p>
+      <p class="px-4 py-8 text-center text-gray-500">No studies yet — create one or open one above.</p>
     {/if}
   </Card>
 {/if}
+
+<Modal bind:open={createOpen} title="Create a study">
+  <div class="space-y-3">
+    <label class="block text-sm">
+      <span class="mb-1 block text-gray-500">Title</span>
+      <input
+        bind:value={newTitle}
+        placeholder="Study title"
+        onkeydown={(e: KeyboardEvent) => e.key === 'Enter' && createStudy()}
+        class="w-full rounded-md border border-gray-300 px-3 py-1.5 text-sm"
+      />
+    </label>
+    <label class="block text-sm">
+      <span class="mb-1 block text-gray-500">Bioproject accession <span class="text-gray-400">(optional)</span></span>
+      <input
+        bind:value={newBioproject}
+        placeholder="PRJNA…"
+        class="w-full rounded-md border border-gray-300 px-3 py-1.5 text-sm"
+      />
+    </label>
+    {#if createMsg}<p class="text-sm text-amber-700">{createMsg}</p>{/if}
+    <div class="flex justify-end gap-2 pt-2">
+      <button class="rounded-md bg-white px-3 py-1.5 text-sm font-semibold text-gray-700 ring-1 ring-gray-300 ring-inset hover:bg-gray-50" onclick={() => (createOpen = false)}>Cancel</button>
+      <button
+        class="rounded-md bg-teal-700 px-4 py-1.5 text-sm font-semibold text-white shadow-sm hover:bg-teal-600 disabled:opacity-50"
+        onclick={createStudy}
+        disabled={!newTitle.trim() || creating}>{creating ? 'Creating…' : 'Create & open'}</button>
+    </div>
+  </div>
+</Modal>
