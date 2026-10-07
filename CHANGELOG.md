@@ -21,6 +21,12 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **Server-side amplicon barcode roster from a stored preflight blob (#657).**
+  `amplicon_barcode_from_blob` reads each sample's Golay barcode and
+  reverse-complement flag out of a run's preflight SQLite — the twin of the PacBio
+  `pacbio_protocol_from_blob` reader — so an amplicon ingest resolves barcodes from
+  the blob the run already carries rather than a side file. A test pins the result
+  byte-for-byte against the kl-run-preflight CLI's own reader.
 - **`qiita biosample get-by-unique-field` / `qiita biosample patch-metadata-by-unique-field`
   reach the by-unique-field surface from the CLI (#639).** Read a study's view of a
   biosample, and upsert this study's metadata on it, naming the sample by a
