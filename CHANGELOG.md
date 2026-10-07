@@ -21,6 +21,12 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **Bulk biosample import — `POST /api/v1/study/{study_idx}/biosample/bulk` (#656).**
+  Creates many biosamples in one all-or-nothing transaction: a single failing row
+  rolls the whole batch back, and the 409 names the offending row by its index and
+  `owner_biosample_id_value` so a partial import can never leave a study
+  half-populated. Each row is the single-biosample create's body and carries its
+  full validation; the request caps at 10,000 rows.
 - **`qiita biosample get-by-unique-field` / `qiita biosample patch-metadata-by-unique-field`
   reach the by-unique-field surface from the CLI (#639).** Read a study's view of a
   biosample, and upsert this study's metadata on it, naming the sample by a

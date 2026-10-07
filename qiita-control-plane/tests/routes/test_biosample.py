@@ -1,5 +1,6 @@
 """Integration tests for the biosample routes."""
 
+import re
 import secrets
 from collections.abc import Awaitable, Callable
 from datetime import date
@@ -4742,7 +4743,9 @@ async def test_lookup_biosample_in_study_by_unique_field_retired_biosample_404(c
 
     assert resp.status_code == 404, resp.text
     assert "through field" in resp.json()["detail"], resp.text
-    assert str(bs_idx) not in resp.json()["detail"], resp.text
+    # The resolved idx must not leak; match on a word boundary so an unrelated
+    # number that merely contains these digits does not false-fail the assertion.
+    assert re.search(rf"\b{bs_idx}\b", resp.json()["detail"]) is None, resp.text
 
 
 @pytest.mark.parametrize("case", STUDY_SCOPED_SAMPLE_AUTHZ_CASES)
