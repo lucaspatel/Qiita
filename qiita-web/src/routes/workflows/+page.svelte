@@ -6,6 +6,27 @@
   import Modal from '$lib/ui/Modal.svelte';
   import Select from '$lib/ui/Select.svelte';
   import DropZone from '$lib/ui/DropZone.svelte';
+  import EnaImportModal from '$lib/ui/EnaImportModal.svelte';
+  import { isAdminRole } from '$lib/roles';
+
+  // --- ENA import (admin-only; opens the batch submit/status modal) ---
+  let isAdmin = $state(false);
+  let enaOpen = $state(false);
+
+  function newEnaImport() {
+    enaOpen = true;
+  }
+
+  // Gate the ENA card on the caller's role, mirroring the route's own gate.
+  $effect(() => {
+    if (auth.isSet) {
+      api.whoami().then((r) => {
+        isAdmin = r.ok && isAdminRole(r.data.system_role);
+      });
+    } else {
+      isAdmin = false;
+    }
+  });
 
   // --- Amplicon run submit (run id + preflight → chains golay-demux → denoise) ---
   let open = $state(false);
@@ -105,6 +126,15 @@
       {/snippet}
       <p class="text-sm text-gray-600">Assemble and bin long-read (PacBio) samples into genomes.</p>
     </Card>
+
+    {#if isAdmin}
+      <Card title="Import from ENA (INSDC)">
+        {#snippet actions()}
+          <button class="rounded-md bg-teal-700 px-4 py-1.5 text-sm font-semibold text-white shadow-sm hover:bg-teal-600" onclick={newEnaImport}>Import</button>
+        {/snippet}
+        <p class="text-sm text-gray-600">Pull a public study into Qiita by accession — reads plus harmonized metadata.</p>
+      </Card>
+    {/if}
   </div>
 {/if}
 
@@ -177,3 +207,5 @@
     </div>
   {/if}
 </Modal>
+
+<EnaImportModal bind:open={enaOpen} />
