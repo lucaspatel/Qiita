@@ -1,7 +1,8 @@
 <script lang="ts">
   import { auth } from '$lib/auth.svelte';
   import { api, type WorkTicketSummary, type ApiResult, type WorkTicketListResponse } from '$lib/api';
-  import { scopeLabel, STATE_CLASS, when } from '$lib/tickets';
+  import { scopeLabel, STATE_CLASS, ticketSubject, when } from '$lib/tickets';
+  import { isAdminRole } from '$lib/roles';
   import PageHeading from '$lib/ui/PageHeading.svelte';
   import Card from '$lib/ui/Card.svelte';
   import Select from '$lib/ui/Select.svelte';
@@ -11,6 +12,10 @@
   let loading = $state(false);
   let res = $state<ApiResult<WorkTicketListResponse> | null>(null);
   let loadSeq = 0;
+  // Admins can list everyone's tickets (the server's `all=true`, wet_lab_admin+):
+  // e.g. an ENA import that reused a download ticket another admin started.
+  let me = $state<{ principal_idx: number; admin: boolean } | null>(null);
+  let everyone = $state(false);
 
   const tickets = $derived<WorkTicketSummary[]>(res?.ok ? res.data.tickets : []);
 
@@ -19,23 +24,53 @@
     loading = true;
     const q =
       filter === 'all' ? {} : filter === 'active' ? { active: true } : { state: filter };
-    const r = await api.tickets({ ...q, limit: 200 });
+    const r = await api.tickets({ ...q, all: everyone || undefined, limit: 200 });
     if (seq === loadSeq) {
       res = r;
       loading = false;
     }
   }
 
-  // (Re)load when auth arrives or the filter changes.
+  $effect(() => {
+    if (!auth.isSet) {
+      me = null;
+      everyone = false;
+      return;
+    }
+    api.whoami().then((r) => {
+      me = r.ok ? { principal_idx: r.data.principal_idx, admin: isAdminRole(r.data.system_role) } : null;
+    });
+  });
+
+  // (Re)load when auth arrives or the filter / scope changes.
   $effect(() => {
     filter;
+    everyone;
     if (auth.isSet) load();
     else res = null;
   });
 </script>
 
-<PageHeading title="Jobs" subtitle="Work tickets you submitted — pipeline runs, newest activity first.">
+<PageHeading
+  title="Jobs"
+  subtitle={everyone
+    ? "Everyone's work tickets — pipeline runs, newest activity first."
+    : 'Work tickets you submitted — pipeline runs, newest activity first.'}
+>
   {#snippet actions()}
+    {#if me?.admin}
+      <span class="inline-flex rounded-md shadow-sm ring-1 ring-gray-300 ring-inset">
+        {#each [['Mine', false], ['Everyone', true]] as [label, value]}
+          <button
+            class="px-3 py-1.5 text-sm font-medium first:rounded-l-md last:rounded-r-md {everyone ===
+            value
+              ? 'bg-teal-700 text-white'
+              : 'bg-white text-gray-700 hover:bg-gray-50'}"
+            onclick={() => (everyone = value as boolean)}>{label}</button
+          >
+        {/each}
+      </span>
+    {/if}
     <Select bind:value={filter} class="w-40 capitalize">
       {#each FILTERS as f}
         <option value={f}>{f.replace('_', ' ')}</option>
@@ -60,7 +95,7 @@
         <table class="min-w-full divide-y divide-gray-200 text-sm">
           <thead class="bg-gray-50">
             <tr>
-              {#each ['Ticket', 'Action', 'Target', 'State', 'Current step', 'Compute', 'Updated'] as h}
+              {#each ['Ticket', 'Action', 'Target', ...(everyone ? ['Submitted by'] : []), 'State', 'Current step', 'Compute', 'Updated'] as h}
                 <th class="px-3 py-2 text-left text-xs font-semibold tracking-wide whitespace-nowrap text-gray-500 uppercase">{h}</th>
               {/each}
             </tr>
@@ -74,7 +109,17 @@
                 <td class="px-3 py-2 whitespace-nowrap text-gray-700">
                   {t.action_id}<span class="text-gray-400"> @{t.action_version}</span>
                 </td>
-                <td class="px-3 py-2 whitespace-nowrap text-gray-600">{scopeLabel(t.scope_target)}</td>
+                <td class="px-3 py-2 whitespace-nowrap text-gray-600">
+                  {#if ticketSubject(t)}
+                    <span class="font-medium text-gray-800">{ticketSubject(t)}</span>
+                    <span class="block text-xs text-gray-400">{scopeLabel(t.scope_target)}</span>
+                  {:else}{scopeLabel(t.scope_target)}{/if}
+                </td>
+                {#if everyone}
+                  <td class="px-3 py-2 whitespace-nowrap text-gray-500">
+                    {t.originator_principal_idx === me?.principal_idx ? 'you' : `principal ${t.originator_principal_idx}`}
+                  </td>
+                {/if}
                 <td class="px-3 py-2">
                   <span class="inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium capitalize ring-1 ring-inset {STATE_CLASS[t.state]}">{t.state.replace('_', ' ')}</span>
                 </td>
@@ -102,7 +147,7 @@
       {/if}
     {:else}
       <p class="px-4 py-10 text-center text-gray-500">
-        {loading ? 'Loading…' : 'No jobs yet — tickets you submit will show up here.'}
+        {loading ? 'Loading…' : everyone ? 'No jobs match.' : 'No jobs yet — tickets you submit will show up here.'}
       </p>
     {/if}
   </Card>

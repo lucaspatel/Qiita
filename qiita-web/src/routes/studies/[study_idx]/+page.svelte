@@ -10,15 +10,13 @@
   import { addRecent } from '$lib/recents';
   import PageHeading from '$lib/ui/PageHeading.svelte';
   import Card from '$lib/ui/Card.svelte';
-  import GeoMap from '$lib/ui/GeoMap.svelte';
   import Modal from '$lib/ui/Modal.svelte';
   import SampleUploader from '$lib/ui/SampleUploader.svelte';
-  import SampleGridDemo from '$lib/ui/SampleGridDemo.svelte';
-  import { humanize } from '$lib/utils';
+  import SampleGrid from '$lib/ui/SampleGrid.svelte';
+  import { metadataColumns } from '$lib/samples';
   import { settings } from '$lib/settings.svelte';
 
   const CONC = 12;
-  const PAGE = 50;
 
   const studyIdx = $derived(Number(page.params.study_idx));
   let loading = $state(false);
@@ -27,90 +25,11 @@
   let total = $state(0);
   let samples = $state<Biosample[]>([]);
   let sampleErr = $state('');
-  let filter = $state('');
-  let pageNo = $state(0);
-  let mapOpen = $state(false);
   let addOpen = $state(false);
   let loadSeq = 0;
   let loadedFor = -1;
 
-  function num(v: unknown): number | null {
-    if (typeof v === 'number') return v;
-    if (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v))) return Number(v);
-    return null;
-  }
-
-  // qiita_sample_type is the controlled vocab that's reliable across studies —
-  // use only its terminology-term label; anything else is 'unspecified'.
-  function sampleType(s: Biosample): string {
-    const v = s.global_metadata?.qiita_sample_type?.value;
-    if (v && typeof v === 'object' && (v as { kind?: string }).kind === 'terminology_term') {
-      return String((v as { label?: string }).label ?? 'unspecified');
-    }
-    return 'unspecified';
-  }
-
-  // Lat/long column names vary across sheets ("latitude",
-  // "geographic_location_latitude", "lat", …), so match by word rather than one
-  // canonical key — otherwise an uploaded sheet's coordinates never reach the map.
-  function geoVal(s: Biosample, kind: 'lat' | 'lon'): number | null {
-    const re = kind === 'lat' ? /\b(lat|latitude)\b/ : /\b(lon|lng|long|longitude)\b/;
-    for (const [k, f] of Object.entries(s.global_metadata ?? {})) {
-      if (re.test(k.toLowerCase().replace(/[_-]+/g, ' '))) {
-        const n = num(f?.value);
-        if (n != null) return n;
-      }
-    }
-    return null;
-  }
-
-  const geoPoints = $derived(
-    samples.flatMap((s) => {
-      const lat = geoVal(s, 'lat');
-      const lon = geoVal(s, 'lon');
-      return lat != null && lon != null
-        ? [{ lat, lon, type: sampleType(s), label: s.biosample_accession ?? String(s.biosample_idx) }]
-        : [];
-    })
-  );
-
-  const columns = $derived.by(() => {
-    const seen = new Map<string, string>();
-    for (const s of samples)
-      for (const [k, f] of Object.entries(s.global_metadata ?? {}))
-        if (!seen.has(k)) seen.set(k, f.display_name || k);
-    return [...seen.entries()].map(([key, label]) => ({ key, label }));
-  });
-
-  function cell(s: Biosample, key: string): string {
-    const f = s.global_metadata?.[key];
-    if (!f || f.value == null) return '—';
-    const v = f.value;
-    if (typeof v === 'object') {
-      const o = v as Record<string, unknown>;
-      if (o.kind === 'missing_reason') return String(o.name ?? '(missing)');
-      if (o.kind === 'terminology_term') return String(o.label ?? o.term_id ?? '(term)');
-      return JSON.stringify(v);
-    }
-    return String(v);
-  }
-
-  const shown = $derived(
-    filter.trim()
-      ? samples.filter((s) =>
-          `${s.biosample_accession} ${columns.map((c) => cell(s, c.key)).join(' ')}`
-            .toLowerCase()
-            .includes(filter.toLowerCase())
-        )
-      : samples
-  );
-  const pageCount = $derived(Math.max(1, Math.ceil(shown.length / PAGE)));
-  const clampedPage = $derived(Math.min(pageNo, pageCount - 1));
-  const paged = $derived(shown.slice(clampedPage * PAGE, clampedPage * PAGE + PAGE));
-  $effect(() => {
-    filter;
-    pageNo = 0;
-  });
+  const columns = $derived(metadataColumns(samples));
 
   // Auto-load when the route idx (or auth) changes.
   $effect(() => {
@@ -126,7 +45,6 @@
     loading = true;
     samples = [];
     sampleErr = '';
-    pageNo = 0;
     access = null;
     record = await api.studyRecord(i);
     // Access list (member+ only) loads alongside — never blocks sample loading.
@@ -243,70 +161,8 @@
 {#if sampleErr}
   <Card><p class="py-6 text-center text-amber-800">{sampleErr}</p></Card>
 {:else if samples.length || loading}
-  <Card title="Sample metadata" bodyClass="">
-    {#snippet actions()}
-      <div class="flex items-center gap-3">
-        <input
-          placeholder="filter…"
-          class="w-56 rounded-md border border-gray-300 px-2.5 py-1 text-sm"
-          bind:value={filter}
-        />
-        <button
-          class="rounded-md bg-white px-3 py-1 text-sm font-medium text-teal-700 ring-1 ring-teal-600/30 ring-inset hover:bg-teal-50 disabled:opacity-40"
-          onclick={() => (mapOpen = true)}
-          disabled={!geoPoints.length}>Map ({geoPoints.length})</button
-        >
-      </div>
-    {/snippet}
-
-    <div class="overflow-x-auto">
-      <table class="min-w-full divide-y divide-gray-200 text-sm">
-        <thead class="bg-gray-50">
-          <tr>
-            <th class="sticky left-0 bg-gray-50 px-3 py-2 text-left text-xs font-semibold tracking-wide text-gray-500 uppercase">Accession</th>
-            {#each columns as c}
-              <th class="px-3 py-2 text-left text-xs font-semibold tracking-wide whitespace-nowrap text-gray-500 uppercase">{settings.humanizeLabels ? humanize(c.label) : c.label}</th>
-            {/each}
-          </tr>
-        </thead>
-        <tbody class="divide-y divide-gray-100">
-          {#each paged as s (s.biosample_idx)}
-            <tr class="hover:bg-gray-50">
-              <td class="sticky left-0 z-10 bg-white px-3 py-2 font-mono text-xs whitespace-nowrap text-gray-700">{s.biosample_accession ?? s.biosample_idx}</td>
-              {#each columns as c}
-                <td class="px-3 py-2 whitespace-nowrap text-gray-600">{cell(s, c.key)}</td>
-              {/each}
-            </tr>
-          {/each}
-        </tbody>
-      </table>
-    </div>
-
-    <div class="flex items-center justify-between border-t border-gray-100 px-4 py-2 text-xs text-gray-500">
-      <span>
-        {#if loading}Loading {samples.length} of {total}…{:else}
-          {shown.length ? clampedPage * PAGE + 1 : 0}–{Math.min((clampedPage + 1) * PAGE, shown.length)}
-          of {shown.length}{filter ? ` (filtered from ${samples.length})` : ''}
-        {/if}
-      </span>
-      <span class="flex items-center gap-2">
-        <button class="rounded border border-gray-300 px-2 py-0.5 hover:bg-gray-50 disabled:opacity-40" onclick={() => (pageNo = Math.max(0, clampedPage - 1))} disabled={clampedPage === 0}>Prev</button>
-        <span>Page {clampedPage + 1} / {pageCount}</span>
-        <button class="rounded border border-gray-300 px-2 py-0.5 hover:bg-gray-50 disabled:opacity-40" onclick={() => (pageNo = Math.min(pageCount - 1, clampedPage + 1))} disabled={clampedPage >= pageCount - 1}>Next</button>
-      </span>
-    </div>
-  </Card>
+  <SampleGrid {samples} {columns} {total} {loading} />
 {/if}
-
-{#if samples.length && !loading}
-  <div class="mt-4">
-    <SampleGridDemo {samples} {columns} />
-  </div>
-{/if}
-
-<Modal bind:open={mapOpen} title="Geographic distribution — {geoPoints.length} samples">
-  <GeoMap points={geoPoints} />
-</Modal>
 
 <Modal bind:open={addOpen} title="Add samples to study {studyIdx}">
   <SampleUploader studyIdx={Number(studyIdx)} onUploaded={() => load(studyIdx)} />

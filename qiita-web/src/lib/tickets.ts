@@ -1,5 +1,5 @@
 // Shared presentation helpers for work tickets (used by the list + detail views).
-import type { ScopeTarget, WorkTicketState } from './api';
+import type { ScopeTarget, WorkTicket, WorkTicketState } from './api';
 
 /** The action's scope target, one-lined off its idx fields. */
 export function scopeLabel(t: ScopeTarget): string {
@@ -17,6 +17,16 @@ export function scopeLabel(t: ScopeTarget): string {
     default:
       return JSON.stringify(t);
   }
+}
+
+/**
+ * The public accession a ticket is about, when its action context names one —
+ * e.g. a `download-ena-study` ticket's `ena_study_accession` — so a list row can
+ * say "PRJEB12345" instead of only the pool/run idxs it was scoped to.
+ */
+export function ticketSubject(t: WorkTicket): string | null {
+  const acc = t.action_context?.ena_study_accession;
+  return typeof acc === 'string' && acc ? acc : null;
 }
 
 // Lifecycle → badge colors. The three terminal outcomes read distinctly
