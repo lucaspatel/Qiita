@@ -43,7 +43,7 @@ _None yet._
   200 instead of 403 to a caller holding a `viewer` grant on a study whose
   `default_tier` is `member` or `admin`. Clients that treated that 403 as "restricted"
   will now get the record. New: `GET /api/v1/study` lists a caller's readable
-  studies. (#feat/study-list)
+  studies. (#660)
 
 ## Deployed history
 
