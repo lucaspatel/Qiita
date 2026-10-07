@@ -21,7 +21,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
-- **List the studies you can read: `GET /api/v1/study` and `qiita study list (#660).**
+- **List the studies you can read: `GET /api/v1/study` and `qiita study list` (#660).**
   Returns owned studies, studies shared with you at any tier, and public-default
   studies (every study for wet_lab_admin+), newest first, each with your
   `caller_tier` and why you can read it (`access_via`). Filters: full-text `q`,
@@ -4011,7 +4011,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
-- **A study's record is readable by anyone it is shared with, at any tie (#660).**
+- **A study's record is readable by anyone it is shared with, at any tier (#660).**
   `GET /api/v1/study/{idx}` previously required the caller's tier to reach the
   study's `default_tier` (`member` unless set), so a viewer could read a study's
   samples but got 403 on the study itself. The record now opens for any grant,
