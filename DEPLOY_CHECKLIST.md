@@ -20,6 +20,13 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   scanning `PATH_INGEST_ROOTS` for a directory whose basename matches the run id, so a run
   living under a path the roots don't cover cannot be submitted. Ensure the existing value
   includes wherever instruments copy runs. (#244)
+- `[admin]` **Optional, recommended: name the deployment.** `QIITA_DEPLOYMENT_NAME` (CP) is
+  served at `GET /api/v1/deployment` and shown by `qiita whoami` and the web UI's badge, so
+  users can tell prod from a dev stack. Unset reports `null`; a malformed value (not a
+  lowercase `[a-z0-9-]` slug, ≤32 chars) **fails CP boot**. (#feat/web-ui)
+  ```
+  sudo bash -c 'grep -q "^QIITA_DEPLOYMENT_NAME=" /etc/qiita/control-plane.env || echo "QIITA_DEPLOYMENT_NAME=prod" >> /etc/qiita/control-plane.env'   # (#feat/web-ui)
+  ```
 
 ### 2. One-time host setup
 
@@ -59,6 +66,8 @@ _None yet._
   setup, not a deploy step. `golay-demux` now runs bcl-convert (a container step) before the
   demux, so it needs `bcl-convert-4.5.4.sif` present — the same SIF the `bcl-convert` workflow
   uses, rebuilt automatically at deploy — and a compute node that can run it. (#244)
+- **Deployment name served:** `curl -s https://qiita-miint.ucsd.edu/api/v1/deployment` →
+  `{"name":"prod"}` (`{"name":null}` if bucket 1's optional var was skipped). (#feat/web-ui)
 
 ### 6. After the deploy verifies green
 

@@ -75,6 +75,26 @@ qiita whoami          # no login needed here
 The token is what identifies you, whatever Unix account you are using — so
 `sudo -u qiita env QIITA_TOKEN=… qiita …` still acts as you.
 
+### More than one site (production and a dev stack)
+
+If you use more than one Qiita, name each one instead of re-exporting
+`QIITA_CONTROL_PLANE_URL`. Each name keeps its own token, so a token from one
+site is never sent to another:
+
+```bash
+qiita env add prod https://qiita-miint.ucsd.edu --adopt-token ~/.qiita/token
+qiita env add dev http://localhost:18080      # e.g. through an SSH tunnel
+qiita --env dev login                          # or paste a token into ~/.qiita/tokens/dev
+qiita env use dev                              # the default from now on
+qiita env list
+qiita whoami                                   # stderr names the site it reached
+```
+
+`--env NAME` or `QIITA_ENV=NAME` picks one for a single command. Once you have
+named sites, `~/.qiita/token` is no longer read, and a URL that is not one of
+them needs `QIITA_TOKEN` alongside it. The full rules are in the docstring of
+`qiita-control-plane/src/qiita_control_plane/cli/_environment.py`.
+
 Most commands print their result as JSON, so you can pull out an identifier with
 `| jq -r .study_idx` and similar. A few print for reading instead of parsing —
 `qiita ticket logs` prints a job's output as-is, and so do `feature-table build`

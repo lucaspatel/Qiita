@@ -69,6 +69,7 @@ from .assembly import DEFAULT_EXPORT_KINDS, EXPORT_KINDS, _handle_assembly_expor
 from .auth import _handle_login, _handle_profile_set, _handle_whoami
 from .biosample import _handle_biosample_create
 from .ena_import import _handle_ena_import_status, _handle_submit_ena_import
+from .env import add_env_parser
 from .feature_table import DEFAULT_TABLE_FORMAT, TABLE_FORMATS, _handle_feature_table_build
 from .mask import (
     DEFAULT_FEATURE_NAME_SOURCE,
@@ -224,7 +225,11 @@ def _build_parser() -> argparse.ArgumentParser:
     _common.add_token_file_arg(p_login)
     p_login.set_defaults(handler=_handle_login)
 
-    p_whoami = sub.add_parser("whoami", help="Print the authenticated principal")
+    add_env_parser(sub)
+
+    p_whoami = sub.add_parser(
+        "whoami", help="Print the authenticated principal (and, on stderr, the target)"
+    )
     p_whoami.set_defaults(handler=_handle_whoami)
 
     p_profile = sub.add_parser("profile", help="User profile operations")

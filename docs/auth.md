@@ -459,8 +459,9 @@ End-user companion to `qiita-admin`, installed as the `qiita` console script via
 
 | Subcommand | Path | Notes |
 |---|---|---|
-| `login` | HTTP | Same LoginRocket loopback flow as `qiita-admin login`; defaults to writing the PAT to `~/.qiita/token`. |
-| `whoami` | HTTP | Calls `GET /api/v1/auth/whoami`. |
+| `login` | HTTP | Same LoginRocket loopback flow as `qiita-admin login`; writes the PAT to the resolved environment's token file (`~/.qiita/tokens/<name>`), or `~/.qiita/token` when no `~/.qiita/config.toml` exists. |
+| `whoami` | HTTP | Calls `GET /api/v1/auth/whoami`; prints the target (environment, URL, and the name `GET /api/v1/deployment` reports) on stderr. |
+| `env list` / `env add NAME URL [--use] [--adopt-token F]` / `env use NAME` / `env remove NAME` | local | Manage named environments in `~/.qiita/config.toml`, each with its own token. Every command takes `--env NAME` (or `$QIITA_ENV`). Resolution and token-pairing rules: `cli/_environment.py`. |
 | `profile set [--affiliation ... --address ... --phone ... --orcid ... --[no-]receive-processing-emails]` | HTTP | Calls `PATCH /api/v1/user/me` with only the fields the caller actually supplied (matches the server's `exclude_unset` semantics). Used to fill `affiliation`/`address`/`phone` so `qiita.user.profile_complete` flips to true. |
 | `study create --title T [--alias … --description … …]` | HTTP | Calls `POST /api/v1/study`. Caller is always the owner; the `--owner-idx` (lab-tech-on-behalf) path is intentionally not exposed. |
 | `study access list --study-idx S` | HTTP | Calls `GET /api/v1/study/{S}/access`. |

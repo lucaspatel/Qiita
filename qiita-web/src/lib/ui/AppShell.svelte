@@ -5,12 +5,12 @@
   import { onMount } from 'svelte';
   import { page } from '$app/state';
   import { auth } from '$lib/auth.svelte';
-  import { api, beginLogin, cliExchange, loginIsSeamless, type Whoami } from '$lib/api';
+  import { api, cliExchange, type Whoami } from '$lib/api';
   import { cn } from '$lib/utils';
+  import EnvSwitcher from './EnvSwitcher.svelte';
+  import LoginMenu from './LoginMenu.svelte';
 
   let { children } = $props();
-  let draft = $state('');
-  let patOpen = $state(false);
   let exchanging = $state(false);
   let loginError = $state('');
   let me = $state<Whoami | null>(null);
@@ -118,6 +118,8 @@
     >
       <span class="text-lg font-semibold text-teal-800 lg:hidden">Qiita</span>
       <div class="flex flex-1 items-center justify-end gap-x-3 text-sm">
+        <EnvSwitcher />
+        <span class="h-6 w-px bg-gray-200" aria-hidden="true"></span>
         {#if exchanging}
           <span class="text-gray-500">signing in…</span>
         {:else if auth.isSet}
@@ -168,31 +170,7 @@
             </div>
           </details>
         {:else}
-          <button
-            class="rounded-md bg-teal-700 px-3 py-1.5 font-semibold text-white shadow-sm hover:bg-teal-600"
-            onclick={() => {
-              beginLogin();
-              if (!loginIsSeamless()) patOpen = true;
-            }}>Log in with AuthRocket</button
-          >
-          <details bind:open={patOpen} class="relative">
-            <summary class="cursor-pointer list-none text-gray-500 hover:text-gray-700">PAT</summary>
-            <div
-              class="absolute right-0 z-10 mt-2 flex gap-2 rounded-md border border-gray-200 bg-white p-2 shadow-lg"
-            >
-              <input
-                type="password"
-                placeholder="qk_…"
-                class="w-48 rounded-md border border-gray-300 px-2 py-1 text-sm"
-                bind:value={draft}
-                onkeydown={(e: KeyboardEvent) => e.key === 'Enter' && auth.set(draft)}
-              />
-              <button
-                class="rounded-md bg-gray-800 px-2.5 py-1 text-sm font-medium text-white"
-                onclick={() => auth.set(draft)}>set</button
-              >
-            </div>
-          </details>
+          <LoginMenu />
         {/if}
       </div>
     </header>

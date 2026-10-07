@@ -126,6 +126,15 @@ PATH_PREP_PROTOCOL_ROOT = ""  # list against the prefix itself
 
 URL_PREP_PROTOCOL_PREFIX = f"{API_PREFIX}{PATH_PREP_PROTOCOL_PREFIX}"
 
+# =============================================================================
+# /deployment
+# =============================================================================
+
+PATH_DEPLOYMENT_PREFIX = "/deployment"
+PATH_DEPLOYMENT_ROOT = ""  # GET against the prefix itself
+
+URL_DEPLOYMENT_PREFIX = f"{API_PREFIX}{PATH_DEPLOYMENT_PREFIX}"
+
 
 # =============================================================================
 # Library primitive names

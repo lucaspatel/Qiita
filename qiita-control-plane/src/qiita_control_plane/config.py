@@ -14,6 +14,9 @@ from .workspace import WORK_TICKET_SUBDIR
 # Local@domain.tld shape check for CONTACT_EMAIL. Deliberately loose —
 # the real test is whether mail reaches the address. See from_env().
 _CONTACT_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+# A short slug ("prod", "dev", "dev-jo") — it is shown as a badge and used as a
+# client-side environment label, so no spaces, no case games, bounded length.
+_DEPLOYMENT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 
 # Field defaults for the auth-related Settings knobs. Defined once at module
 # scope so the dataclass declaration and the from_env() env-var fallback
@@ -258,6 +261,11 @@ class Settings:
     # leaves it None and the footer falls back to the static package
     # version. Never required at boot.
     build_version: str | None = None
+    # Which deployment this is ("prod", "dev"), served at GET /deployment so a
+    # client can show the server's own answer to "where am I?" rather than a
+    # label typed on the client. Optional: an unnamed deploy reports null and
+    # clients fall back to the URL. A present-but-malformed value fails boot.
+    deployment_name: str | None = None
     # reference_idx of the canonical `artifact_sequence_set` reference the QC
     # step trims adapters against. Optional in the dataclass (tests and
     # QC-less deploys don't need it); set from QIITA_DEFAULT_ADAPTER_REFERENCE_IDX.
@@ -356,6 +364,13 @@ class Settings:
                 f"CONTACT_EMAIL must be a local@domain.tld address, got {contact_email!r}"
             )
 
+        deployment_name = os.environ.get("QIITA_DEPLOYMENT_NAME") or None
+        if deployment_name is not None and not _DEPLOYMENT_NAME_RE.match(deployment_name):
+            raise RuntimeError(
+                "QIITA_DEPLOYMENT_NAME must be a lowercase slug of 1-32 [a-z0-9-]"
+                f" characters starting with [a-z0-9], got {deployment_name!r}"
+            )
+
         smtp_starttls = os.environ.get("SMTP_STARTTLS", _DEFAULT_SMTP_STARTTLS)
         if smtp_starttls not in _SMTP_STARTTLS_CHOICES:
             raise RuntimeError(
@@ -417,6 +432,7 @@ class Settings:
             contact_email=contact_email,
             build_sha=os.environ.get("BUILD_SHA") or None,
             build_version=os.environ.get("BUILD_VERSION") or None,
+            deployment_name=deployment_name,
             default_adapter_reference_idx=_parse_optional_positive_int_env(
                 "QIITA_DEFAULT_ADAPTER_REFERENCE_IDX"
             ),

@@ -1,6 +1,8 @@
 // Client-side "recently opened studies" — the API has no list-all-studies
 // endpoint, so this is how the landing shows anything at all. Stored in
-// localStorage, newest first, capped.
+// localStorage, newest first, capped. Per environment: idxs are not shared.
+import { scopedKey } from './environment';
+
 export type RecentStudy = {
   idx: number;
   accessible: boolean;
@@ -8,7 +10,7 @@ export type RecentStudy = {
   lastOpened: number;
 };
 
-const KEY = 'qiita_recent_studies';
+const KEY = scopedKey('qiita_recent_studies');
 const CAP = 30;
 
 export function getRecents(): RecentStudy[] {

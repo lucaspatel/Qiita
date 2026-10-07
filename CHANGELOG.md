@@ -21,6 +21,17 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **Named environments for the CLI and web UI, with tokens bound to their deployment.**
+  `qiita env add/use/list/remove` keeps named control planes (prod, a dev stack) in
+  `~/.qiita/config.toml`, each with its own token under `~/.qiita/tokens/`; every command
+  takes `--env NAME` / `$QIITA_ENV`. A stored token is only sent to the environment it
+  belongs to — before, re-pointing `$QIITA_CONTROL_PLANE_URL` sent the one `~/.qiita/token`
+  to whatever server it named. With no config file the CLI behaves as before. The control
+  plane serves its operator-set name (`QIITA_DEPLOYMENT_NAME`) at the unauthenticated
+  `GET /api/v1/deployment`; `qiita whoami` prints it on stderr. In `npm run dev`, qiita-web
+  reads the same config, proxies each environment at `/_env/<name>/api`, keeps tokens and
+  recent studies per environment, shows the server-reported name as a top-bar badge, and
+  switches environments from `/profile`.
 - **Rapid 16S amplicon processing: `golay-demux` + `amplicon` workflows (#244).**
   Two workflows bring EMP-style 16S into Qiita. `golay-demux` (ingest) converts a pool's
   Illumina 16S run with bcl-convert using a no-index dummy sheet built from RunInfo.xml

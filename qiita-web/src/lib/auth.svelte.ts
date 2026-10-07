@@ -1,7 +1,11 @@
 // The PAT the SPA sends as `Authorization: Bearer …`. Kept in localStorage so a
 // refresh survives; exposed as a rune so components react when it changes.
 // (SPA only — this module never runs under SSR, so `localStorage` is safe.)
-const KEY = 'qiita_token';
+// One token per environment: it is only ever sent to the server that minted it.
+import { scopedKey } from './environment';
+
+const TOKEN_KEY = 'qiita_token';
+const KEY = scopedKey(TOKEN_KEY);
 
 function createAuth() {
   let token = $state(typeof localStorage !== 'undefined' ? (localStorage.getItem(KEY) ?? '') : '');
@@ -24,3 +28,12 @@ function createAuth() {
 }
 
 export const auth = createAuth();
+
+/** Whether a token is stored for the named environment (for the env picker). */
+export function hasTokenFor(envName: string): boolean {
+  try {
+    return !!localStorage.getItem(scopedKey(TOKEN_KEY, envName));
+  } catch {
+    return false;
+  }
+}

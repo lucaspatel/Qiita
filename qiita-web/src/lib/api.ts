@@ -8,14 +8,8 @@
 // mechanical.
 import { auth } from './auth.svelte';
 
-const BASE = '/api/v1'; // same-origin; Vite proxies to the control plane in dev
+import { apiBase as BASE, cpOrigin as CP_ORIGIN } from './environment';
 
-// Real control-plane origin for the full-page login redirect. It MUST be the
-// real CP (not the dev proxy): /auth/login sets a freshness cookie on the CP's
-// own domain, and AuthRocket then bounces back to the CP's /auth/handoff, which
-// only sees that cookie if it was set there. Override with VITE_QIITA_BASE.
-export const CP_ORIGIN =
-  (import.meta.env.VITE_QIITA_BASE as string | undefined) ?? 'https://qiita-miint.ucsd.edu';
 
 /**
  * Browser login via AuthRocket, reusing the CLI loopback flow: this SPA plays
@@ -31,12 +25,12 @@ export function beginLogin(): void {
     // Seamless: the CP loops the one-time code back to 127.0.0.1:<port>, which
     // this SPA redeems on return.
     const port = location.port || '5173';
-    location.href = `${CP_ORIGIN}${BASE}/auth/login?cli=1&port=${port}`;
+    location.href = `${CP_ORIGIN}/api/v1/auth/login?cli=1&port=${port}`;
   } else {
     // LAN/remote viewer: the CP's CLI loopback only ever targets 127.0.0.1, so it
     // can't return here. Use the browser login flow, which authenticates via
     // AuthRocket and then shows a PAT to copy into the "PAT" box.
-    window.open(`${CP_ORIGIN}${BASE}/auth/login`, '_blank', 'noopener');
+    window.open(`${CP_ORIGIN}/api/v1/auth/login`, '_blank', 'noopener');
   }
 }
 
@@ -324,8 +318,47 @@ export type BiosampleImported = {
 
 export type BulkImportResult = { results: BiosampleImported[] };
 
+export type Deployment = { name: string | null };
+
+// --- ENA/INSDC study import (admin-only; a batch driver that spawns download tickets) ---
+
+// Per-item lifecycle. `done` is computed on read (never stored) once every spawned
+// download ticket is terminal-success; `failed` is off any step. One bad accession
+// fails only its item, never the batch.
+export type BatchItemState =
+  | 'pending'
+  | 'resolving'
+  | 'registered'
+  | 'downloading'
+  | 'done'
+  | 'failed';
+
+export type EnaRunOutcome = {
+  run_accession: string;
+  // registered | skipped_already_present | excluded | flagged_unavailable |
+  // held_not_downloaded | failed
+  status: string;
+  failure_reason: string | null;
+};
+
+export type EnaImportItem = {
+  ena_study_accession: string;
+  state: BatchItemState;
+  study_idx: number | null; // set once registered
+  failure_reason: string | null;
+  download_work_ticket_idxs: number[];
+  ena_runs: EnaRunOutcome[];
+};
+
+export type EnaImportBatch = {
+  ena_import_batch_idx: number;
+  items: EnaImportItem[];
+};
+
 export const api = {
   whoami: () => get<Whoami>('/auth/whoami'),
+  /** The control plane's self-reported deployment name; unauthenticated. */
+  deployment: () => get<Deployment>('/deployment'),
   getProfile: () => get<UserProfile>('/user/me'),
   updateProfile: (body: UserUpdate) => send<UserProfile>('PATCH', '/user/me', body),
   listTokens: () => get<ApiToken[]>('/auth/token'),
@@ -390,7 +423,14 @@ export const api = {
       'POST',
       '/amplicon-run',
       body
-    )
+    ),
+  /** Submit a batch INSDC/ENA study import (wet_lab_admin+). 202 with the batch
+   *  handle and one `pending` item per accession. */
+  submitEnaImport: (accessions: string[]) =>
+    send<EnaImportBatch>('POST', '/ena-import-batch', { accessions }),
+  /** Read a batch's current per-item state. There is no list endpoint — poll this
+   *  (Refresh) by the idx submit handed back. */
+  enaImportStatus: (idx: number) => get<EnaImportBatch>(`/ena-import-batch/${idx}`)
 };
 
 /** Bundled amplicon-run submit (run id + base64 preflight + knobs). */

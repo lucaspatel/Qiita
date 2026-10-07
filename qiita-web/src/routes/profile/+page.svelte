@@ -3,6 +3,7 @@
   import { api, type ApiResult, type UserProfile, type ApiToken } from '$lib/api';
   import PageHeading from '$lib/ui/PageHeading.svelte';
   import Card from '$lib/ui/Card.svelte';
+  import EnvironmentCard from '$lib/ui/EnvironmentCard.svelte';
 
   let profile = $state<ApiResult<UserProfile> | null>(null);
   let tokens = $state<ApiResult<ApiToken[]> | null>(null);
@@ -64,12 +65,19 @@
   const complete = $derived(profile?.ok ? profile.data.profile_complete : false);
 </script>
 
-<PageHeading title="Settings" subtitle="Your profile and API tokens." />
+<PageHeading title="Profile" subtitle="Your environment, profile, and API tokens." />
+
 
 {#if !auth.isSet}
-  <Card><p class="py-8 text-center text-gray-500">Log in to manage your account.</p></Card>
+  <div class="space-y-6">
+    <Card><p class="py-8 text-center text-gray-500">Log in to manage your account.</p></Card>
+    <EnvironmentCard />
+  </div>
 {:else if profile && !profile.ok}
-  <Card><p class="py-8 text-center text-red-700">HTTP {profile.status} — {profile.detail}</p></Card>
+  <div class="space-y-6">
+    <Card><p class="py-8 text-center text-red-700">HTTP {profile.status} — {profile.detail}</p></Card>
+    <EnvironmentCard />
+  </div>
 {:else if profile?.ok}
   <div class="space-y-6">
     <Card title="Profile">
@@ -116,6 +124,8 @@
         </div>
       </div>
     </Card>
+
+    <EnvironmentCard />
 
     <Card title="API tokens" bodyClass="">
       {#if tokens && !tokens.ok}

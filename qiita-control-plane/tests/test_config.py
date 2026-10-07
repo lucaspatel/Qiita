@@ -415,3 +415,38 @@ def test_settings_default_adapter_reference_idx_rejects_invalid(monkeypatch):
         monkeypatch.setenv("QIITA_DEFAULT_ADAPTER_REFERENCE_IDX", bad)
         with pytest.raises(RuntimeError, match="QIITA_DEFAULT_ADAPTER_REFERENCE_IDX"):
             Settings.from_env()
+
+
+def test_settings_deployment_name_set_from_env(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("QIITA_DEPLOYMENT_NAME", "dev")
+
+    from qiita_control_plane.config import Settings
+
+    assert Settings.from_env().deployment_name == "dev"
+
+
+@pytest.mark.parametrize("raw", [None, ""])
+def test_settings_deployment_name_unset_is_none(monkeypatch, raw):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    if raw is None:
+        monkeypatch.delenv("QIITA_DEPLOYMENT_NAME", raising=False)
+    else:
+        monkeypatch.setenv("QIITA_DEPLOYMENT_NAME", raw)
+
+    from qiita_control_plane.config import Settings
+
+    assert Settings.from_env().deployment_name is None
+
+
+@pytest.mark.parametrize("bad", ["Prod", "dev env", "-dev", "dev_1", "x" * 33])
+def test_settings_deployment_name_malformed_fails_boot(monkeypatch, bad):
+    """A present-but-malformed name fails boot rather than being shown as-is
+    or silently treated as unset."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    monkeypatch.setenv("QIITA_DEPLOYMENT_NAME", bad)
+
+    from qiita_control_plane.config import Settings
+
+    with pytest.raises(RuntimeError, match="QIITA_DEPLOYMENT_NAME"):
+        Settings.from_env()

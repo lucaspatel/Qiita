@@ -23,6 +23,21 @@ from qiita_common.api_paths import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolated_cli_environment(monkeypatch, tmp_path_factory):
+    """Point the CLI's environment config at an empty per-test location and
+    forget any target a previous test's `main()` resolved, so a developer's
+    real ~/.qiita/config.toml or $QIITA_ENV can never steer a CLI test."""
+    from qiita_control_plane.cli import _common, _environment
+
+    config_dir = tmp_path_factory.mktemp("qiita-config")
+    monkeypatch.setenv(_environment.QIITA_CONFIG_ENV, str(config_dir / "config.toml"))
+    monkeypatch.delenv(_environment.QIITA_ENV_ENV, raising=False)
+    _common.reset_target_for_tests()
+    yield
+    _common.reset_target_for_tests()
+
+
 class _FakeWriter:
     def __init__(self):
         self.batches = []

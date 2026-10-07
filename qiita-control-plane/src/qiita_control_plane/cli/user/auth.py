@@ -4,6 +4,7 @@ Split out of the former single-file ``cli.user`` module; behavior unchanged.
 """
 
 import argparse
+import sys
 
 from qiita_common.models import (
     UserUpdate,
@@ -44,6 +45,8 @@ def _handle_login(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
 
 
 def _handle_whoami(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    # stderr, so stdout stays the parseable whoami JSON.
+    print(_common.describe_target(args.base_url), file=sys.stderr)
     return _common.run_http_subcommand(lambda t: _common.whoami(args.base_url, t))
 
 
