@@ -38,6 +38,15 @@ export function studyAccessionError(accession: string): string | null {
   return null;
 }
 
+/** Public browser URL for an INSDC accession: NCBI BioProject for `PRJNA`, else
+ *  ENA Browser (which resolves ERP/SRP/DRP/PRJEB/PRJDB and more). */
+export function insdcAccessionUrl(accession: string): string {
+  const a = accession.trim();
+  return a.startsWith('PRJNA')
+    ? `https://www.ncbi.nlm.nih.gov/bioproject/${encodeURIComponent(a)}`
+    : `https://www.ebi.ac.uk/ena/browser/view/${encodeURIComponent(a)}`;
+}
+
 export type ParsedAccessions = { accessions: string[]; errors: string[] };
 
 /** Parse accessions, one per line (the CLI's `--from-file` contract): blanks and

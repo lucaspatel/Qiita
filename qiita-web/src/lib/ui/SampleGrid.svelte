@@ -12,13 +12,21 @@
   import GeoMap from '$lib/ui/GeoMap.svelte';
   import Modal from '$lib/ui/Modal.svelte';
 
-  // `total` and `loading` let the grid render while samples stream in.
+  // `total` and `loading` let the grid render while samples stream in. `bare`
+  // drops the Card wrapper when the grid is already inside one (e.g. a tab).
   let {
     samples,
     columns,
     total = samples.length,
-    loading = false
-  }: { samples: Biosample[]; columns: Column[]; total?: number; loading?: boolean } = $props();
+    loading = false,
+    bare = false
+  }: {
+    samples: Biosample[];
+    columns: Column[];
+    total?: number;
+    loading?: boolean;
+    bare?: boolean;
+  } = $props();
 
   // Each row keeps its sample so the filtered set can feed the map.
   type Row = { sample: Biosample; cells: Record<string, string> };
@@ -87,22 +95,22 @@
   );
 </script>
 
-<Card title="Sample metadata" bodyClass="">
-  {#snippet actions()}
-    <div class="flex items-center gap-3">
-      <input
-        placeholder="filter…"
-        bind:value={query}
-        class="w-56 rounded-md border border-gray-300 px-2.5 py-1 text-sm"
-      />
-      <button
-        class="rounded-md bg-white px-3 py-1 text-sm font-medium text-teal-700 ring-1 ring-teal-600/30 ring-inset hover:bg-teal-50 disabled:opacity-40"
-        onclick={() => (mapOpen = true)}
-        disabled={!points.length}>Map ({points.length})</button
-      >
-    </div>
-  {/snippet}
+{#snippet toolbar()}
+  <div class="flex items-center gap-3">
+    <input
+      placeholder="filter…"
+      bind:value={query}
+      class="w-56 rounded-md border border-gray-300 px-2.5 py-1 text-sm"
+    />
+    <button
+      class="rounded-md bg-white px-3 py-1 text-sm font-medium text-teal-700 ring-1 ring-teal-600/30 ring-inset hover:bg-teal-50 disabled:opacity-40"
+      onclick={() => (mapOpen = true)}
+      disabled={!points.length}>Map ({points.length})</button
+    >
+  </div>
+{/snippet}
 
+{#snippet grid()}
   <div class="overflow-x-auto">
     <table class="min-w-full divide-y divide-gray-200 text-sm">
       <thead class="bg-gray-50">
@@ -154,7 +162,17 @@
       <button class="rounded border border-gray-300 px-2 py-0.5 hover:bg-gray-50 disabled:opacity-40" onclick={() => (page = Math.min(pageCount - 1, clampedPage + 1))} disabled={clampedPage >= pageCount - 1}>Next</button>
     </span>
   </div>
-</Card>
+{/snippet}
+
+{#if bare}
+  <div class="mb-3 flex justify-end">{@render toolbar()}</div>
+  {@render grid()}
+{:else}
+  <Card title="Sample metadata" bodyClass="">
+    {#snippet actions()}{@render toolbar()}{/snippet}
+    {@render grid()}
+  </Card>
+{/if}
 
 <Modal
   bind:open={mapOpen}

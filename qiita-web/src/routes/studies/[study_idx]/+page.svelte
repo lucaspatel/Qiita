@@ -13,10 +13,28 @@
   import Modal from '$lib/ui/Modal.svelte';
   import SampleUploader from '$lib/ui/SampleUploader.svelte';
   import SampleGrid from '$lib/ui/SampleGrid.svelte';
+  import Tabs from '$lib/ui/Tabs.svelte';
   import { metadataColumns } from '$lib/samples';
   import { settings } from '$lib/settings.svelte';
+  import { humanizeLabel, fmtDate } from '$lib/utils';
+  import { insdcAccessionUrl } from '$lib/ena';
 
   const CONC = 12;
+
+  // --- study record, split across tabs ---
+  let tab = $state('overview');
+  // Overview shows the prose fields full-width; everything else (except the title,
+  // which is the page heading) falls to Details, so a new field is never dropped.
+  const OVERVIEW_KEYS = ['description', 'abstract'];
+  const DETAILS_EXCLUDE = new Set(['title', ...OVERVIEW_KEYS]);
+  const ACCESSION_KEYS = new Set(['ena_study_accession', 'bioproject_accession']);
+  const TIER_CLASS: Record<string, string> = {
+    admin: 'bg-purple-50 text-purple-700 ring-purple-600/20',
+    member: 'bg-teal-50 text-teal-700 ring-teal-600/20',
+    viewer: 'bg-gray-50 text-gray-600 ring-gray-500/10',
+    public: 'bg-gray-50 text-gray-600 ring-gray-500/10'
+  };
+  const label = (k: string) => (settings.humanizeLabels ? humanizeLabel(k) : k);
 
   const studyIdx = $derived(Number(page.params.study_idx));
   let loading = $state(false);
@@ -30,6 +48,19 @@
   let loadedFor = -1;
 
   const columns = $derived(metadataColumns(samples));
+  const rec = $derived(record?.ok ? record.data : null);
+  const studyTitle = $derived(
+    rec && typeof rec.title === 'string' && rec.title ? rec.title : `Study ${studyIdx}`
+  );
+  const overviewFields = $derived(OVERVIEW_KEYS.filter((k) => rec && k in rec));
+  const hasOverview = $derived(!!rec && OVERVIEW_KEYS.some((k) => rec[k] != null && rec[k] !== ''));
+  const detailFields = $derived(rec ? Object.keys(rec).filter((k) => !DETAILS_EXCLUDE.has(k)) : []);
+  const TABS = $derived([
+    { id: 'overview', label: 'Overview' },
+    { id: 'samples', label: total ? `Samples (${total})` : 'Samples' },
+    { id: 'details', label: 'Details' },
+    { id: 'access', label: 'Access' }
+  ]);
 
   // Auto-load when the route idx (or auth) changes.
   $effect(() => {
@@ -82,7 +113,7 @@
   <a href="/studies" class="text-sm text-teal-700 hover:underline">← Studies</a>
 </div>
 
-<PageHeading title="Study {studyIdx}" subtitle="Samples and metadata.">
+<PageHeading title={studyTitle}>
   {#snippet actions()}
     {#if auth.isSet}
       <button
@@ -96,72 +127,130 @@
   <Card><p class="py-8 text-center text-gray-500">Log in to view a study.</p></Card>
 {/if}
 
+{#snippet fieldRow(k: string, v: unknown)}
+  <div class="flex gap-2 text-sm">
+    <dt class="w-44 shrink-0 font-medium text-gray-500">{label(k)}</dt>
+    <dd class="min-w-0 break-words text-gray-900">
+      {#if v == null || v === ''}
+        —
+      {:else if ACCESSION_KEYS.has(k)}
+        <a
+          href={insdcAccessionUrl(String(v))}
+          target="_blank"
+          rel="noopener"
+          class="text-teal-700 hover:underline"
+          >{v}<svg class="ml-0.5 inline size-3 align-[-1px]" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M11 3a1 1 0 100 2h2.586l-6.293 6.293a1 1 0 101.414 1.414L15 6.414V9a1 1 0 102 0V4a1 1 0 00-1-1h-5z" /><path d="M5 5a2 2 0 00-2 2v8a2 2 0 002 2h8a2 2 0 002-2v-3a1 1 0 10-2 0v3H5V7h3a1 1 0 000-2H5z" /></svg></a
+        >
+      {:else if k.endsWith('_at')}
+        {fmtDate(v)}
+      {:else if typeof v === 'object'}
+        {@const entries = Object.entries(v as Record<string, unknown>)}
+        {#if entries.length}
+          <dl class="space-y-0.5">
+            {#each entries as [sk, sv]}
+              <div class="flex gap-2">
+                <dt class="w-40 shrink-0 text-gray-400">{label(sk)}</dt>
+                <dd class="min-w-0 break-words text-gray-700">{sv == null || sv === '' ? '—' : String(sv)}</dd>
+              </div>
+            {/each}
+          </dl>
+        {:else}
+          <span class="text-gray-400">(empty)</span>
+        {/if}
+      {:else}
+        {String(v)}
+      {/if}
+    </dd>
+  </div>
+{/snippet}
+
 {#if record}
   <div class="mb-4">
-    <Card title="Study record">
-      {#if record.ok}
-        <dl class="grid grid-cols-1 gap-x-6 gap-y-2 sm:grid-cols-2">
-          {#each Object.entries(record.data) as [k, v]}
-            <div class="flex gap-2 text-sm">
-              <dt class="w-44 shrink-0 font-medium text-gray-500">{k}</dt>
-              <dd class="text-gray-900">{v == null ? '—' : String(v)}</dd>
-            </div>
-          {/each}
-        </dl>
-      {:else if record.status === 403}
+    {#if record.ok}
+      <Card bodyClass="">
+        <div class="border-b border-gray-200 px-4 pt-1 sm:px-6">
+          <Tabs tabs={TABS} bind:active={tab} />
+        </div>
+        <div class="px-4 py-4 sm:px-6">
+          {#if tab === 'overview'}
+            {#if hasOverview}
+              <dl class="space-y-4">
+                {#each overviewFields as k (k)}
+                  <div>
+                    <dt class="mb-1 text-sm font-medium text-gray-500">{label(k)}</dt>
+                    <dd class="text-sm whitespace-pre-wrap break-words text-gray-900">
+                      {record.data[k] == null || record.data[k] === '' ? '—' : String(record.data[k])}
+                    </dd>
+                  </div>
+                {/each}
+              </dl>
+            {:else}
+              <p class="text-sm text-gray-500">No description or abstract for this study.</p>
+            {/if}
+          {:else if tab === 'samples'}
+            {#if sampleErr}
+              <p class="py-6 text-center text-amber-800">{sampleErr}</p>
+            {:else if samples.length || loading}
+              <SampleGrid {samples} {columns} {total} {loading} bare />
+            {:else}
+              <p class="py-6 text-center text-gray-500">No samples linked to this study.</p>
+            {/if}
+          {:else if tab === 'details'}
+            <dl class="grid grid-cols-1 gap-x-6 gap-y-2 sm:grid-cols-2">
+              {#each detailFields as k (k)}{@render fieldRow(k, record.data[k])}{/each}
+            </dl>
+          {:else if tab === 'access'}
+            {#if access?.ok && access.data.length}
+              <table class="min-w-full divide-y divide-gray-200 text-sm">
+                <thead>
+                  <tr>
+                    {#each ['Principal', 'Tier', 'Granted'] as h}
+                      <th class="py-2 pr-4 text-left text-xs font-semibold tracking-wide text-gray-500 uppercase">{h}</th>
+                    {/each}
+                  </tr>
+                </thead>
+                <tbody class="divide-y divide-gray-100">
+                  {#each access.data as a (a.principal_idx)}
+                    <tr>
+                      <td class="py-2 pr-4 text-gray-800">{a.email ?? `principal ${a.principal_idx}`}</td>
+                      <td class="py-2 pr-4">
+                        <span class="inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium capitalize ring-1 ring-inset {TIER_CLASS[a.access_tier]}">{a.access_tier}</span>
+                      </td>
+                      <td class="py-2 pr-4 text-gray-500">{fmtDate(a.granted_at)}</td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            {:else if access && !access.ok && access.status === 403}
+              <p class="text-sm text-gray-500">The access list is visible to members and admins of this study.</p>
+            {:else}
+              <p class="text-sm text-gray-500">{access ? 'No access entries.' : 'Loading…'}</p>
+            {/if}
+          {/if}
+        </div>
+      </Card>
+    {:else if record.status === 403}
+      <Card title="Study record">
         <div class="rounded-md bg-amber-50 px-3 py-2 text-sm text-amber-800 ring-1 ring-amber-600/20">
           Study record restricted at your tier — {record.detail}. Sample metadata below is still readable.
         </div>
-      {:else}
+      </Card>
+    {:else}
+      <Card title="Study record">
         <p class="text-sm text-red-700">HTTP {record.status} — {record.detail}</p>
-      {/if}
-    </Card>
+      </Card>
+    {/if}
   </div>
 {/if}
 
-{#if access?.ok && access.data.length}
-  {@const TIER = {
-    admin: 'bg-purple-50 text-purple-700 ring-purple-600/20',
-    member: 'bg-teal-50 text-teal-700 ring-teal-600/20',
-    viewer: 'bg-gray-50 text-gray-600 ring-gray-500/10',
-    public: 'bg-gray-50 text-gray-600 ring-gray-500/10'
-  }}
-  <div class="mb-4">
-    <Card title="Access" bodyClass="">
-      <table class="min-w-full divide-y divide-gray-200 text-sm">
-        <thead class="bg-gray-50">
-          <tr>
-            {#each ['Principal', 'Tier', 'Granted'] as h}
-              <th class="px-4 py-2 text-left text-xs font-semibold tracking-wide text-gray-500 uppercase">{h}</th>
-            {/each}
-          </tr>
-        </thead>
-        <tbody class="divide-y divide-gray-100">
-          {#each access.data as a (a.principal_idx)}
-            <tr class="hover:bg-gray-50">
-              <td class="px-4 py-2 text-gray-800">{a.email ?? `principal ${a.principal_idx}`}</td>
-              <td class="px-4 py-2">
-                <span class="inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium capitalize ring-1 ring-inset {TIER[a.access_tier]}">{a.access_tier}</span>
-              </td>
-              <td class="px-4 py-2 text-gray-500">{new Date(a.granted_at).toLocaleDateString()}</td>
-            </tr>
-          {/each}
-        </tbody>
-      </table>
-    </Card>
-  </div>
-{:else if access && !access.ok && access.status === 403}
-  <div class="mb-4">
-    <Card title="Access">
-      <p class="text-sm text-gray-500">The access list is visible to members and admins of this study.</p>
-    </Card>
-  </div>
-{/if}
-
-{#if sampleErr}
-  <Card><p class="py-6 text-center text-amber-800">{sampleErr}</p></Card>
-{:else if samples.length || loading}
-  <SampleGrid {samples} {columns} {total} {loading} />
+{#if auth.isSet}
+  <Card title="Processing & data">
+    <p class="text-sm text-gray-500">
+      Reads, QC, masks, alignments, assemblies, and feature tables for this study's
+      sequenced pools will appear here — built piece by piece. First up: listing the
+      study's pools (needs <code class="rounded bg-gray-100 px-1">GET /study/&lbrace;idx&rbrace;/sequenced-pool</code>).
+    </p>
+  </Card>
 {/if}
 
 <Modal bind:open={addOpen} title="Add samples to study {studyIdx}">
