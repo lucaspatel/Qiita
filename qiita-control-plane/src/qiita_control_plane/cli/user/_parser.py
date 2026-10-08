@@ -328,13 +328,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="List your own and shared studies, newest first (GET /study)",
     )
     p_study_list.add_argument(
-        "--query", help="full-text search over title, alias, abstract, description, notes"
+        "--query",
+        help=(
+            "full-text search: title, alias and accessions, plus abstract, description,"
+            " notes and funding where you can read the full record; whole English words"
+        ),
     )
     study_list_scope = p_study_list.add_mutually_exclusive_group()
     study_list_scope.add_argument(
         "--include-public",
         action="store_true",
-        help="also list public studies you have no grant on (default: only yours and shared)",
+        help=(
+            "list every study you can read: also public studies you have no grant on, and"
+            " for wet_lab_admin+ every study (default: only yours and shared)"
+        ),
     )
     study_list_scope.add_argument(
         "--min-tier",

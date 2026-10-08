@@ -24,10 +24,11 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 - **List the studies you can read: `GET /api/v1/study` and `qiita study list` (#660).**
   Returns owned studies, studies shared with you at any tier, and public-default
   studies (every study for wet_lab_admin+), newest first, each with your
-  `caller_tier` and why you can read it (`access_via`). Filters: full-text `q`,
-  `min_tier` on your own tier, and cursor paging. The CLI defaults to your own and
-  shared studies; `--include-public` widens it. Someone granted access no longer
-  needs to be told a study's idx to find it.
+  `caller_tier`, why you can read it (`access_via`), and which view of its record
+  you get (`record_view`). Filters: full-text `q` (a summary reader matches only the
+  summary fields; accessions are searchable), `min_tier` on your own tier, and cursor
+  paging. The CLI defaults to your own and shared studies; `--include-public` widens
+  it. Someone granted access no longer needs to be told a study's idx to find it.
 - **`qiita biosample get-by-unique-field` / `qiita biosample patch-metadata-by-unique-field`
   reach the by-unique-field surface from the CLI (#639).** Read a study's view of a
   biosample, and upsert this study's metadata on it, naming the sample by a
@@ -4011,11 +4012,14 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
-- **A study's record is readable by anyone it is shared with, at any tier (#660).**
-  `GET /api/v1/study/{idx}` previously required the caller's tier to reach the
-  study's `default_tier` (`member` unless set), so a viewer could read a study's
-  samples but got 403 on the study itself. The record now opens for any grant,
-  matching the new study listing.
+- **A grant below a study's `default_tier` reads the study's summary (#660).**
+  `GET /api/v1/study/{idx}` previously answered 403 to any caller whose tier was
+  below the study's `default_tier` (`member` unless set). It now returns them a
+  summary — title, alias, accessions, tiers, `updated_at`, marked `"view":
+  "summary"` — so a study shared with someone can be found and recognised; the full
+  record still requires a tier at or above `default_tier`, and carries `"view":
+  "full"` (on POST and PATCH responses too). What each tier reads is defined in
+  `docs/architecture/data-model.md`.
 - **`qiita biosample create-field` validates its flags before reading the auth token
   (#639).** An invalid flag combination now exits 2 naming the flag, where it previously
   reported a missing token first and left the real problem to be found on the retry. The

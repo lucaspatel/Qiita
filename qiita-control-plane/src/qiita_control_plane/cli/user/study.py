@@ -55,7 +55,7 @@ def _list_studies(base_url: str, token: str, args: argparse.Namespace) -> dict:
         params["min_tier"] = args.min_tier
     elif not args.include_public:
         params["min_tier"] = Tier.VIEWER.value
-    if args.after_study_idx:
+    if args.after_study_idx is not None:
         params["after_study_idx"] = args.after_study_idx
     studies: list = []
     while True:

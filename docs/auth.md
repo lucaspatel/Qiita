@@ -274,8 +274,8 @@ Beyond the kind / role / scope guards above, `auth.guards` carries resource-acce
 
 | Guard | Predicate |
 |---|---|
-| `require_study_access(min_tier, bypass_role)` | factory; caller's tier on the path's `study_idx` ≥ `min_tier`. Study owner bypasses the tier comparison; `min_tier=None` resolves to the study's `default_tier`; `resolve_min_tier=f` resolves it to `f(default_tier)`. |
-| `study_record_min_tier(default_tier)` / `caller_may_read_study_record(...)` | the rule for reading a study's own record: any grant, or none on a public-default study (wet_lab_admin+ by role). `GET /study/{idx}` and the `GET /study` listing both use it, so a study is listed exactly when it can be opened. |
+| `require_study_access(min_tier, bypass_role)` | factory; caller's tier on the path's `study_idx` ≥ `min_tier`. Study owner bypasses the tier comparison. |
+| `study_record_view(row, caller)` | the full / summary / none view of a study's own record; the rule is in `architecture/data-model.md`. `GET /study/{idx}` and the `GET /study` listing both decide through it, so a study is listed exactly when it can be opened. |
 | `require_caller_owns_run(bypass_role)` | factory; `sequencing_run.created_by_idx == caller`. |
 | `require_caller_owns_pool(bypass_role)` | factory; `sequenced_pool.created_by_idx == caller`. |
 | `require_caller_has_tier_on_all_studies(min_tier, ...)` | body-time helper (not a `Depends`); caller has `min_tier` (or owns, or bypasses) on **every** study in a list — used where the studies come from the request body, not the path. Comparison goes through `_TIER_ORDER`, never the `Tier` members, which are a `StrEnum` and compare *lexically* (`'admin' < 'member' < 'public' < 'viewer'`). |
@@ -347,20 +347,23 @@ The system principal (`idx=1`) is rejected by every mutation endpoint above (`di
 
 ### Reading and listing studies
 
-`GET /api/v1/study/{idx}` returns a study's record to its owner, to anyone holding a
-`qiita.study_access` row on it at any tier, to anyone when its `default_tier` is
-`public`, and to wet_lab_admin+ by role. The study's `default_tier` still decides what
-a tier unlocks elsewhere (metadata fields fall through to it); it does not hide the
-record from someone the study was shared with.
+What a caller may read of a study's own record — the **full** record, its
+**summary**, or nothing — is defined in
+[`architecture/data-model.md`](architecture/data-model.md) ("What a tier reads
+of a study's own record"). `GET /api/v1/study/{idx}` returns the view the caller
+has (`view` in the body says which; only the full view carries an `ETag`).
 
-`GET /api/v1/study` lists exactly those studies, newest first, `study:read`. Query
-parameters: `q` (full-text, web-search syntax, over title, alias, abstract,
-description, notes and funding), `min_tier` (only studies where the caller's *own*
-tier reaches it, which also drops public studies they hold no grant on and
-role-only reads), `after_study_idx` (the previous page's `next_after_study_idx`) and
-`limit` (≤ 500). Each row carries the caller's `caller_tier` and `access_via`
-(`owner` / `grant` / `public` / `role`). A page can come back shorter than `limit`
-with a cursor when many candidates were filtered out; follow the cursor.
+`GET /api/v1/study` lists the studies the caller can read at either view, newest
+first, `study:read`. Query parameters: `q` (full-text, web-search syntax:
+stemmed English words matched whole, over title, alias and the accessions, plus
+abstract, description, notes and funding on studies whose full record the caller
+reads; NUL is refused), `min_tier` (only studies where the caller's *own* tier
+reaches it — an owner counts as `admin`; above `public` it also drops public
+studies they hold no grant on and role-only reads), `after_study_idx` (the
+previous page's `next_after_study_idx`) and `limit` (≤ 500). Each row carries the
+caller's `caller_tier`, `access_via` (`owner` / `grant` / `public` / `role`) and
+`record_view`. A page can come back shorter than `limit` with a cursor when many
+candidates were filtered out; follow the cursor.
 
 ### Study access (`qiita.study_access`)
 
@@ -483,7 +486,7 @@ End-user companion to `qiita-admin`, installed as the `qiita` console script via
 | `whoami` | HTTP | Calls `GET /api/v1/auth/whoami`. |
 | `profile set [--affiliation ... --address ... --phone ... --orcid ... --[no-]receive-processing-emails]` | HTTP | Calls `PATCH /api/v1/user/me` with only the fields the caller actually supplied (matches the server's `exclude_unset` semantics). Used to fill `affiliation`/`address`/`phone` so `qiita.user.profile_complete` flips to true. |
 | `study create --title T [--alias … --description … …]` | HTTP | Calls `POST /api/v1/study`. Caller is always the owner; the `--owner-idx` (lab-tech-on-behalf) path is intentionally not exposed. |
-| `study list [--query Q] [--include-public \| --min-tier T] [--limit N] [--after-study-idx C] [--all]` | HTTP | Calls `GET /api/v1/study`. Defaults to your own and shared studies (`min_tier=viewer`); `--include-public` lists every study you can read; `--all` follows the cursor to the end. |
+| `study list [--query Q] [--include-public \| --min-tier T] [--limit N] [--after-study-idx C] [--all]` | HTTP | Calls `GET /api/v1/study`. Defaults to your own and shared studies (`min_tier=viewer`); `--include-public` lists every study you can read (for wet_lab_admin+, every study); `--all` follows the cursor to the end. |
 | `study access list --study-idx S` | HTTP | Calls `GET /api/v1/study/{S}/access`. |
 | `study access grant --study-idx S --email E --tier T` | HTTP | Calls `POST /api/v1/study/{S}/access`. `--tier` is `viewer`, `member` or `admin`. |
 | `study access set-tier --study-idx S --principal-idx P --tier T` | HTTP | Calls `PATCH /api/v1/study/{S}/access/{P}`. |
