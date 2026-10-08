@@ -9,8 +9,11 @@
   import Card from '$lib/ui/Card.svelte';
   import Modal from '$lib/ui/Modal.svelte';
   import Select from '$lib/ui/Select.svelte';
+  import StudyList from '$lib/ui/StudyList.svelte';
 
   let recents = $state<RecentStudy[]>([]);
+  // True when this server has no GET /study; the recents list stands in for it.
+  let listUnsupported = $state(false);
   onMount(() => (recents = getRecents()));
 
   // --- open a study (by idx or accession) ---
@@ -75,7 +78,7 @@
   }
 </script>
 
-<PageHeading title="Studies" subtitle="Create a study, or open one by id or accession. Load samples from a study's page.">
+<PageHeading title="Studies" subtitle="Your studies, and ones shared with you. Open any other by id or accession.">
   {#snippet actions()}
     {#if auth.isSet}
       <button
@@ -122,6 +125,9 @@
     </Card>
   </div>
 
+  <StudyList bind:unsupported={listUnsupported} />
+
+  {#if listUnsupported}
   <Card title="Recent studies" bodyClass="">
     {#if recents.length}
       <table class="min-w-full divide-y divide-gray-200 text-sm">
@@ -158,6 +164,7 @@
       <p class="px-4 py-8 text-center text-gray-500">No studies yet — create one or open one above.</p>
     {/if}
   </Card>
+  {/if}
 {/if}
 
 <Modal bind:open={createOpen} title="Create a study">
