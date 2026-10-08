@@ -648,7 +648,7 @@ async def fetch_sequenced_pools_for_study(
     """
     return await pool_or_conn.fetch(
         "SELECT sp.idx AS sequenced_pool_idx, sp.sequencing_run_idx,"
-        "       sp.run_preflight_filename, sr.instrument_model, sp.created_at,"
+        "       sr.instrument_model, sp.created_at,"
         "       COUNT(DISTINCT ss.idx) AS sample_count"
         " FROM qiita.prep_sample_to_study pts"
         " JOIN qiita.sequenced_sample ss ON ss.prep_sample_idx = pts.prep_sample_idx"
@@ -659,7 +659,7 @@ async def fetch_sequenced_pools_for_study(
         "   AND pts.retired = false"
         "   AND ps.retired = false"
         "   AND ss.ena_status IS NULL"
-        " GROUP BY sp.idx, sp.sequencing_run_idx, sp.run_preflight_filename,"
+        " GROUP BY sp.idx, sp.sequencing_run_idx,"
         "          sr.instrument_model, sp.created_at"
         " ORDER BY sp.sequencing_run_idx DESC, sp.idx DESC"
         " LIMIT $2",

@@ -4859,9 +4859,67 @@ async def test_list_sequenced_pools_in_study_groups_samples_to_distinct_pools(ct
     assert row["sequenced_pool_idx"] == pool_idx
     assert row["sequencing_run_idx"] == run_idx
     assert row["sample_count"] == 3
-    assert row["run_preflight_filename"] == "preflight-pools-one.sqlite"
+    # run_preflight_filename is run-level operator metadata and is withheld from
+    # this viewer-tier study surface.
+    assert "run_preflight_filename" not in row
     # _seed_run_and_pool leaves instrument_model unset.
     assert row["instrument_model"] is None
+
+
+async def test_list_sequenced_pools_in_study_sample_count_excludes_other_studies(ctx):
+    # One pool holds this study's sample AND another study's two samples; the
+    # row's sample_count counts only this study's. Fails if the COUNT loses its
+    # pts.study_idx = $1 scope (it would report 3).
+    study_a = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="pools-xsa"
+    )
+    study_b = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="pools-xsb"
+    )
+    run_idx, pool_idx = await _seed_run_and_pool(ctx, "pools-xs")
+    await _seed_ss_in_pool(ctx, study_idx=study_a, run_idx=run_idx, pool_idx=pool_idx, suffix="xsa")
+    await _seed_ss_in_pool(
+        ctx, study_idx=study_b, run_idx=run_idx, pool_idx=pool_idx, suffix="xsb1"
+    )
+    await _seed_ss_in_pool(
+        ctx, study_idx=study_b, run_idx=run_idx, pool_idx=pool_idx, suffix="xsb2"
+    )
+
+    resp = await ctx["user"].get(URL_SEQUENCED_POOL_BY_STUDY.format(study_idx=study_a))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["count"] == 1
+    row = body["sequenced_pool"][0]
+    assert row["sequenced_pool_idx"] == pool_idx
+    # Only study_a's one sample, not the three the pool holds across studies.
+    assert row["sample_count"] == 1
+
+
+async def test_list_sequenced_pools_in_study_excludes_not_yet_pooled_samples(ctx):
+    # A sequenced_sample not yet in a pool (sequenced_pool_idx IS NULL) contributes
+    # no row: the INNER JOIN on sequenced_pool drops it, while a pooled sample stays.
+    study_idx = await _seed_study(
+        ctx, owner_idx=ctx["user_session"]["principal_idx"], suffix="pools-null"
+    )
+    run_keep, pool_keep = await _seed_run_and_pool(ctx, "null-keep")
+    run_drop, pool_drop = await _seed_run_and_pool(ctx, "null-drop")
+    await _seed_ss_in_pool(
+        ctx, study_idx=study_idx, run_idx=run_keep, pool_idx=pool_keep, suffix="nk"
+    )
+    dropped = await _seed_ss_in_pool(
+        ctx, study_idx=study_idx, run_idx=run_drop, pool_idx=pool_drop, suffix="nd"
+    )
+    await ctx["pool"].execute(
+        "UPDATE qiita.sequenced_sample SET sequenced_pool_idx = NULL,"
+        " sequenced_pool_item_id = NULL WHERE idx = $1",
+        dropped["sequenced_sample_idx"],
+    )
+
+    resp = await ctx["user"].get(URL_SEQUENCED_POOL_BY_STUDY.format(study_idx=study_idx))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["count"] == 1
+    assert body["sequenced_pool"][0]["sequenced_pool_idx"] == pool_keep
 
 
 async def test_list_sequenced_pools_in_study_spans_multiple_pools_and_runs_newest_first(ctx):

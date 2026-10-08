@@ -268,14 +268,16 @@ class StudySequencedPoolSummary(BaseModel):
 
     `sample_count` is how many of *this study's* active sequenced_samples fall in
     the pool (not the pool's full size — a pool can hold samples from other
-    studies). `instrument_model` and `run_preflight_filename` come from the pool's
-    run and are None when unset. No read-metric rollup, matching
-    SequencedPoolSummary: a per-pool aggregate would make the list cost a scan.
+    studies). `instrument_model` comes from the pool's run and is None when unset.
+    `run_preflight_filename` is deliberately NOT surfaced here: it is run-level
+    operator metadata the run-first pool list gates behind run ownership, so a
+    study viewer (who may not own the run, and whose pool can hold other studies'
+    samples) does not see it. No read-metric rollup, matching SequencedPoolSummary:
+    a per-pool aggregate would make the list cost a scan.
     """
 
     sequenced_pool_idx: Annotated[int, Field(gt=0)]
     sequencing_run_idx: Annotated[int, Field(gt=0)]
-    run_preflight_filename: str | None
     instrument_model: str | None
     sample_count: Annotated[int, Field(ge=0)]
     created_at: AwareDatetime

@@ -42,10 +42,11 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   another import for the same owner now answers a retryable 503, not a 500.
 - **List a study's sequenced pools: `GET /api/v1/study/{study_idx}/sequenced-pool` (#NNN).**
   The distinct sequenced_pools a study's active samples sit in (newest run/pool
-  first), each with its run's `instrument_model`, `run_preflight_filename`, and the
-  study's `sample_count` in that pool. Viewer-tier, the same exclusions as the
-  study's sequenced-sample listing (retired links/prep_samples, ena_status-flagged
-  samples). The pool routes are otherwise run-first — a `sequenced_pool_idx` was
+  first), each with its run's `instrument_model` and the study's `sample_count` in
+  that pool. Viewer-tier, the same exclusions as the study's sequenced-sample
+  listing (retired links/prep_samples, ena_status-flagged samples); the run-level
+  `run_preflight_filename` is withheld, as the run-first pool list gates it behind
+  run ownership. The pool routes are otherwise run-first — a `sequenced_pool_idx` was
   obtainable only by already knowing its run; this is the study-first join that
   makes a study's pools (and the pool-scoped processing routes behind them)
   reachable without walking the run.
