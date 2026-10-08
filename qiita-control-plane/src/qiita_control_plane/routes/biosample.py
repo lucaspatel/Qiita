@@ -491,12 +491,23 @@ async def import_biosamples_bulk(
         # rolls back to before it and is written again row by row through the
         # per-value path, which raises the same diagnosed error, for the same
         # row, as an import that never batched.
-        written = await insert_new_entities_metadata_batch(
+        # The batch write re-raises a transient DB error (deadlock, serialization,
+        # lock-wait timeout) rather than returning False; map it to the same
+        # retryable 503 the single import and phase 1 send, not a 500. A
+        # non-transient failure still returns False and falls through to the
+        # row-by-row replay below. The batch is not one row, so it maps against the
+        # first -- only the transient arms, which read no row fields, can fire here
+        # (every mappable non-transient returns False instead of raising).
+        written = await _with_import_error_mapping(
             conn,
-            spec=BIOSAMPLE_METADATA_SPEC,
-            study_idx=study_idx,
-            caller_idx=user.principal_idx,
-            entries=deferred,
+            body.rows[0],
+            lambda: insert_new_entities_metadata_batch(
+                conn,
+                spec=BIOSAMPLE_METADATA_SPEC,
+                study_idx=study_idx,
+                caller_idx=user.principal_idx,
+                entries=deferred,
+            ),
         )
         if not written:
             for i, (row, (biosample_idx, resolved)) in enumerate(

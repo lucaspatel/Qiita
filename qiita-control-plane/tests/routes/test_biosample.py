@@ -5061,6 +5061,32 @@ async def test_import_waiting_on_the_owner_lock_past_the_timeout_is_a_503(ctx, p
     assert bulk.headers.get("Retry-After")
 
 
+@pytest.mark.parametrize(
+    "exc",
+    [asyncpg.DeadlockDetectedError("probe"), asyncpg.QueryCanceledError("probe")],
+)
+async def test_bulk_import_phase2_transient_is_a_503(ctx, monkeypatch, exc):
+    """A transient DB error raised from the phase-2 batched metadata write (a
+    deadlock, or a lock wait that timed out on the batched statement) is the
+    batch's, not the row's: a retryable 503 with a Retry-After, not a 500. Phase 2
+    is the slow statement most likely to hit the pool's command timeout, so it must
+    map transients like the single import and phase 1 do."""
+
+    async def boom(*args, **kwargs):
+        raise exc
+
+    monkeypatch.setattr(routes_biosample, "insert_new_entities_metadata_batch", boom)
+    wet_idx = ctx["wet_session"]["principal_idx"]
+    study_idx = await _seed_study(ctx, owner_idx=wet_idx, suffix="bulk-phase2")
+    rows = _bulk_rows(wet_idx, unique_field_name("BulkId"), ["A", "B"])
+    for row in rows:
+        row["metadata"] = {"host taxon id": "not applicable"}
+
+    resp = await _post_biosamples_bulk(ctx["wet"], ctx, study_idx, rows)
+    assert resp.status_code == 503, resp.text
+    assert resp.headers.get("Retry-After")
+
+
 async def test_bulk_import_unexpected_error_names_the_row(ctx, monkeypatch):
     """A failure that is not mapped to an HTTP status stays a 500 with its
     traceback, carrying a note that names the row."""
