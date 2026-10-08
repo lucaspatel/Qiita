@@ -894,8 +894,7 @@ URL_SEQUENCED_POOL_WORK_TICKET_SUMMARY = (
 #   • GET/PATCH /biosample/{biosample_idx}          → its own prefix
 
 PATH_BIOSAMPLE_BY_STUDY = "/{study_idx}/biosample"
-# Bulk import: a whole plate's biosamples in one all-or-nothing POST. Static
-# `/bulk` segment, so it is declared before the `/{biosample_idx}` route.
+# Bulk import: a sheet's biosamples in one all-or-nothing POST.
 PATH_BIOSAMPLE_BULK_BY_STUDY = "/{study_idx}/biosample/bulk"
 PATH_BIOSAMPLE_LIST_BY_STUDY = "/{study_idx}/biosample/list-idxs"
 # Study-scoped single biosample: a GET view carrying this study's local

@@ -280,7 +280,7 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_SEQUENCING_RUN_PREFIX",
         "PATH_SEQUENCED_POOL_WORK_TICKET_SUMMARY",
     ),
-    # /biosample — two re-anchor on /study, one on /biosample
+    # /biosample — the study-scoped routes re-anchor on /study, the rest on /biosample
     ("URL_BIOSAMPLE_BY_STUDY", "PATH_STUDY_PREFIX", "PATH_BIOSAMPLE_BY_STUDY"),
     (
         "URL_BIOSAMPLE_BULK_BY_STUDY",

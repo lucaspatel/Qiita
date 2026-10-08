@@ -175,9 +175,23 @@ async def import_biosample(
     non-existent study_idx rather than slipping through to an FK violation.
     """
     async with tx() as conn:
+        await _require_eligible_import_owner(conn, body.owner_idx)
         return await _import_one_biosample(
-            conn, study_idx=study_idx, body=body, caller_idx=user.principal_idx
+            conn,
+            study_idx=study_idx,
+            body=body,
+            caller_idx=user.principal_idx,
+            metadata_checklist_idx=await resolve_metadata_checklist_idx(
+                conn, body.metadata_checklist_name
+            ),
         )
+
+
+async def _require_eligible_import_owner(conn: asyncpg.Connection, owner_idx: int) -> None:
+    """Owner eligibility pre-flight for an import; collapses every
+    ineligibility case to one 422. Once per request: a bulk batch has one
+    owner (BiosampleBulkImportRequest enforces it)."""
+    await require_eligible_owner(conn, candidate_idx=owner_idx, detail=_MSG_OWNER_NOT_ELIGIBLE)
 
 
 async def _import_one_biosample(
@@ -186,6 +200,7 @@ async def _import_one_biosample(
     study_idx: int,
     body: BiosampleImportRequest,
     caller_idx: int,
+    metadata_checklist_idx: int | None,
 ) -> BiosampleImportResponse:
     """Import ONE biosample within an EXISTING transaction, mapping composer and DB
     errors to HTTPException.
@@ -195,24 +210,14 @@ async def _import_one_biosample(
     transaction: a raised HTTPException propagates out of the caller's `async with
     tx()` and rolls its whole unit back — which is what makes the bulk route
     all-or-nothing. The bulk route catches and re-raises with the failing row's index.
-    """
-    # Owner eligibility pre-flight; collapses every ineligibility case to
-    # one 422.
-    await require_eligible_owner(
-        conn,
-        candidate_idx=body.owner_idx,
-        detail=_MSG_OWNER_NOT_ELIGIBLE,
-    )
 
+    The caller has already checked the owner's eligibility
+    (`_require_eligible_import_owner`) and resolved the checklist name, so a bulk
+    batch does each once rather than once per row.
+    """
     # Map known composer-side validation errors and DB-level violations to
     # user-friendly 422 / 409 responses. Composer-specific exceptions are
     # caught first so their detail wins over the generic asyncpg fallbacks.
-    # Resolve the checklist name to its idx before the write; an
-    # unknown name surfaces as a clean 422 rather than an FK violation.
-    metadata_checklist_idx = await resolve_metadata_checklist_idx(
-        conn, body.metadata_checklist_name
-    )
-
     try:
         result = await import_biosample_from_owner_biosample_id(
             conn,
@@ -342,6 +347,16 @@ async def _import_one_biosample(
             "a concurrent edit of one of this study's fields interrupted the"
             " import; nothing was stored — resubmit the identical request"
         )
+    except TimeoutError, asyncpg.QueryCanceledError:
+        # Each biosample INSERT takes a per-owner lock held until commit, so an
+        # import waits behind any other open import for the same owner -- a bulk
+        # batch holds it for its whole run. Waiting past the pool's command
+        # timeout lands here: nothing was written, and it clears once the other
+        # import commits.
+        raise_transient_retry(
+            "another import for this biosample owner held a lock this one needed"
+            " for too long; nothing was stored — resubmit the identical request"
+        )
 
     return BiosampleImportResponse(
         biosample_idx=result.biosample_idx,
@@ -364,32 +379,79 @@ async def import_biosamples_bulk(
 ) -> BiosampleBulkImportResponse:
     """Create many biosamples on a study in ONE transaction — the wetlab front door.
 
-    A plate's worth of samples (a metadata sheet → one row per sample) in a single
-    call instead of N. Same per-row contract, guards (Tier.ADMIN on the study, or
-    wet_lab_admin+), and error mapping as the single import — each row runs through
-    the shared `_import_one_biosample`. The batch is ALL-OR-NOTHING: a failing row
-    rolls back every row and the 4xx names the failing row's index (and its
-    owner_biosample_id_value) so the operator can fix the sheet and resubmit.
+    A sheet's biosamples in a single call instead of N. Same per-row contract,
+    guards (Tier.ADMIN on the study, or wet_lab_admin+), and error mapping as the
+    single import — each row runs through the shared `_import_one_biosample`. The
+    batch is ALL-OR-NOTHING: a failing row rolls back every row, and the error
+    names the failing row (counting from 0) and its owner_biosample_id_value so
+    the caller can fix the sheet and resubmit. The request model enforces one
+    owner and one id field per batch, and the size caps.
     """
+    # Two rows naming the same owner id would collide on the id field's unique
+    # index mid-write, and the error would blame "another biosample" that is in
+    # fact this request. Refuse before writing, naming both rows.
+    first_row_for: dict[str, int] = {}
+    for i, row in enumerate(body.rows):
+        j = first_row_for.setdefault(row.owner_biosample_id_value, i)
+        if j != i:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"rows {j} and {i} (counting from 0) both give owner_biosample_id_value"
+                    f" {row.owner_biosample_id_value!r}; each biosample needs its own"
+                ),
+            )
+
     async with tx() as conn:
+        await _require_eligible_import_owner(conn, body.rows[0].owner_idx)
+        checklist_idx_for: dict[str | None, int | None] = {}
         results: list[BiosampleImportResponse] = []
         for i, row in enumerate(body.rows):
             try:
+                name = row.metadata_checklist_name
+                if name not in checklist_idx_for:
+                    checklist_idx_for[name] = await resolve_metadata_checklist_idx(conn, name)
                 results.append(
                     await _import_one_biosample(
-                        conn, study_idx=study_idx, body=row, caller_idx=user.principal_idx
+                        conn,
+                        study_idx=study_idx,
+                        body=row,
+                        caller_idx=user.principal_idx,
+                        metadata_checklist_idx=checklist_idx_for[name],
                     )
                 )
             except HTTPException as exc:
+                if exc.status_code == 503:
+                    # Transient (a deadlock, or a lock wait that timed out): the
+                    # batch as a whole lost to concurrent work, not this row.
+                    # Keep the Retry-After hint, drop the row prefix.
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(
+                            "the batch waited on another import or edit on this study or"
+                            " for this owner and was interrupted; nothing was stored —"
+                            " resubmit the identical request"
+                        ),
+                        headers=exc.headers,
+                    ) from exc
                 # Atomic: annotate with the offending row and re-raise so the
                 # caller's `async with tx()` rolls the whole batch back.
                 raise HTTPException(
                     status_code=exc.status_code,
                     detail=(
-                        f"row {i} (owner_biosample_id_value="
+                        f"row {i} (counting from 0; owner_biosample_id_value="
                         f"{row.owner_biosample_id_value!r}): {exc.detail}"
                     ),
+                    headers=exc.headers,
+                ) from exc
+            except Exception as exc:
+                # Unexpected: leave it a 500 with its traceback, but say which row.
+                exc.add_note(
+                    f"bulk biosample import, study {study_idx}: failed at row {i}"
+                    f" (counting from 0; owner_biosample_id_value="
+                    f"{row.owner_biosample_id_value!r})"
                 )
+                raise
     return BiosampleBulkImportResponse(results=results)
 
 
