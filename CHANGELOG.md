@@ -40,7 +40,7 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   limit and read timeout; a larger sheet is sent in several requests. No CLI
   command or client calls it yet. A single import that waits too long behind
   another import for the same owner now answers a retryable 503, not a 500.
-- **List a study's sequenced pools: `GET /api/v1/study/{study_idx}/sequenced-pool` (#NNN).**
+- **List a study's sequenced pools: `GET /api/v1/study/{study_idx}/sequenced-pool` (#665).**
   The distinct sequenced_pools a study's active samples sit in (newest run/pool
   first), each with its run's `instrument_model` and the study's `sample_count` in
   that pool. Viewer-tier, the same exclusions as the study's sequenced-sample
