@@ -8,8 +8,11 @@ ineligibility shapes), Pydantic validation, and the route's
 exception-mapping path (PI FK 422, owner non-user 422).
 
 GET: covers the wiring-level cases (round-trip with POST, 401, missing
-scope 403, 404, below-default-tier 403); exhaustive tier-policy edge
-cases live at the guard level in tests/auth/test_guards.py.
+scope 403, 404, no-grant 403, viewer grant admitted); exhaustive tier-policy
+edge cases live at the guard level in tests/auth/test_guards.py.
+GET (list): who sees which study (owner, grantee, public-default, no access,
+wet_lab_admin, anonymous), that the list and GET /study/{idx} agree, the
+min_tier filter, full-text search, and cursor paging.
 
 PATCH: covers the auth-bar variants (owner self, study admin tier,
 wet_lab_admin role bypass), If-Match concurrency (428 / 412), body
@@ -584,10 +587,10 @@ async def test_get_study_nonexistent_404(ctx):
     assert resp.status_code == 404
 
 
-async def test_get_study_below_default_tier_403(ctx):
+async def test_get_study_without_grant_403(ctx):
     """A regular user with no study_access row on a study whose
-    default_tier is 'member' has effective tier public-by-absence, fails
-    the access guard, and receives 403."""
+    default_tier is 'member' has effective tier public-by-absence, below
+    the record minimum of 'viewer', and receives 403."""
     # Create the study as a wet_lab_admin on behalf of a fresh user so
     # the regular_user caller in ctx is NOT the owner (owner has the
     # ADMIN auto-grant which would otherwise pass any tier check).
@@ -608,7 +611,33 @@ async def test_get_study_below_default_tier_403(ctx):
 
     resp = await ctx["user"].get(URL_STUDY_BY_IDX.format(study_idx=study_idx))
     assert resp.status_code == 403
-    assert "'member'" in resp.json()["detail"]
+    assert "'viewer'" in resp.json()["detail"]
+
+
+async def test_get_study_viewer_grant_reads_member_default_record(ctx):
+    """A viewer grant reads the record of a study whose default_tier is
+    'member': any grant suffices for the record (study_record_min_tier)."""
+    other_owner = await seed_user_principal(ctx["pool"], prefix=_SEED_PREFIX, suffix="get-viewer")
+    ctx["created"]["user_principals"].append(other_owner)
+    create_resp = await _post_study(
+        ctx["wet"],
+        ctx,
+        title=_unique_title("get-viewer"),
+        owner_idx=other_owner,
+        default_tier="member",
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    study_idx = create_resp.json()["study_idx"]
+    await _grant_study_access(
+        ctx,
+        study_idx=study_idx,
+        principal_idx=ctx["user_session"]["principal_idx"],
+        tier="viewer",
+        granted_by_idx=other_owner,
+    )
+
+    resp = await ctx["user"].get(URL_STUDY_BY_IDX.format(study_idx=study_idx))
+    assert resp.status_code == 200, resp.text
 
 
 async def test_get_study_sets_etag_header(ctx):
@@ -1247,3 +1276,257 @@ async def test_lookup_study_by_accession_rejects_extra_field_422(ctx):
         json={"accessions": ["ERP000001"], "unknown": "x"},
     )
     assert resp.status_code == 422
+
+
+# ===========================================================================
+# GET /api/v1/study — the caller's readable studies
+# ===========================================================================
+# Every test tags its studies' titles with a fresh token and searches for it,
+# so studies left by other tests in the shared DB never enter the assertions.
+
+
+async def _seed_list_fixture(ctx) -> tuple[str, dict[str, int]]:
+    """Four studies, one per way a caller can (not) see a study, from the
+    regular user's point of view: owned by someone else and not shared
+    (`private`), shared with them at viewer on a member-default study
+    (`shared`), public-default (`public`), and their own (`own`)."""
+    token = f"lst{secrets.token_hex(4)}"
+    other = await seed_user_principal(ctx["pool"], prefix=_SEED_PREFIX, suffix=f"list-{token}")
+    ctx["created"]["user_principals"].append(other)
+    idxs: dict[str, int] = {}
+    for name, tier in (("private", "member"), ("shared", "member"), ("public", "public")):
+        resp = await _post_study(
+            ctx["wet"], ctx, title=f"{token} {name}", owner_idx=other, default_tier=tier
+        )
+        assert resp.status_code == 201, resp.text
+        idxs[name] = resp.json()["study_idx"]
+    await _grant_study_access(
+        ctx,
+        study_idx=idxs["shared"],
+        principal_idx=ctx["user_session"]["principal_idx"],
+        tier="viewer",
+        granted_by_idx=other,
+    )
+    resp = await _post_study(ctx["user"], ctx, title=f"{token} own")
+    assert resp.status_code == 201, resp.text
+    idxs["own"] = resp.json()["study_idx"]
+    return token, idxs
+
+
+async def _list(client, **params) -> dict:
+    resp = await client.get(URL_STUDY_PREFIX, params=params)
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+async def test_list_studies_shows_owned_shared_and_public_only(ctx):
+    token, idxs = await _seed_list_fixture(ctx)
+    body = await _list(ctx["user"], q=token)
+    rows = {r["study_idx"]: r for r in body["studies"]}
+    assert set(rows) == {idxs["shared"], idxs["public"], idxs["own"]}
+    assert rows[idxs["shared"]]["caller_tier"] == "viewer"
+    assert rows[idxs["public"]]["caller_tier"] == "public"
+    assert rows[idxs["own"]]["access_via"] == "owner"
+    assert rows[idxs["shared"]]["access_via"] == "grant"
+    assert rows[idxs["public"]]["access_via"] == "public"
+    # Newest first.
+    assert [r["study_idx"] for r in body["studies"]] == sorted(rows, reverse=True)
+
+
+async def test_list_studies_agrees_with_get_by_idx(ctx):
+    """For every fixture study, the list includes it exactly when
+    GET /study/{idx} admits the same caller."""
+    token, idxs = await _seed_list_fixture(ctx)
+    listed = {r["study_idx"] for r in (await _list(ctx["user"], q=token))["studies"]}
+    for name, idx in idxs.items():
+        status = (await ctx["user"].get(URL_STUDY_BY_IDX.format(study_idx=idx))).status_code
+        assert (status == 200) == (idx in listed), (name, status)
+
+
+async def test_list_studies_wet_lab_admin_sees_every_study(ctx):
+    token, idxs = await _seed_list_fixture(ctx)
+    rows = {r["study_idx"]: r for r in (await _list(ctx["wet"], q=token))["studies"]}
+    assert set(rows) == set(idxs.values())
+    # Ungranted and not public: readable only by role, which access_via names
+    # where caller_tier ('public') could not.
+    assert rows[idxs["private"]]["access_via"] == "role"
+    assert rows[idxs["private"]]["caller_tier"] == "public"
+
+
+async def test_list_studies_min_tier_filters_on_the_callers_own_tier(ctx):
+    token, idxs = await _seed_list_fixture(ctx)
+    viewer = {
+        r["study_idx"] for r in (await _list(ctx["user"], q=token, min_tier="viewer"))["studies"]
+    }
+    assert viewer == {idxs["shared"], idxs["own"]}
+    member = {
+        r["study_idx"] for r in (await _list(ctx["user"], q=token, min_tier="member"))["studies"]
+    }
+    assert member == {idxs["own"]}
+    # Applies to a role-bypass caller too: the wet_lab_admin holds no grant here.
+    assert (await _list(ctx["wet"], q=token, min_tier="viewer"))["studies"] == []
+
+
+async def test_list_studies_search_matches_title_words(ctx):
+    token, idxs = await _seed_list_fixture(ctx)
+    body = await _list(ctx["user"], q=f"{token} shared")
+    assert [r["study_idx"] for r in body["studies"]] == [idxs["shared"]]
+
+
+async def test_list_studies_cursor_pages_through_without_gaps_or_repeats(ctx):
+    """limit=1 forces one candidate study per page; following the cursor
+    yields exactly the readable set, newest first, each study once."""
+    token, idxs = await _seed_list_fixture(ctx)
+    seen: list[int] = []
+    params: dict = {"q": token, "limit": 1}
+    for _ in range(10):
+        body = await _list(ctx["user"], **params)
+        seen += [r["study_idx"] for r in body["studies"]]
+        if body["next_after_study_idx"] is None:
+            break
+        params["after_study_idx"] = body["next_after_study_idx"]
+    assert seen == sorted({idxs["shared"], idxs["public"], idxs["own"]}, reverse=True)
+
+
+async def test_list_studies_anonymous_401(ctx):
+    from qiita_control_plane.main import app
+
+    app.state.pool = ctx["pool"]
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as anon:
+        resp = await anon.get(URL_STUDY_PREFIX)
+    assert resp.status_code == 401
+
+
+async def test_list_studies_requires_study_read_scope(ctx, no_study_read_client):
+    resp = await no_study_read_client.get(URL_STUDY_PREFIX)
+    assert resp.status_code == 403
+    assert "study:read" in resp.json()["detail"]
+
+
+async def test_list_studies_min_tier_pages_are_not_padded_with_dropped_rows(ctx):
+    """With min_tier above public, the public study between the caller's own
+    and the shared one is not a candidate, so page two is the shared study —
+    not an empty page carrying a cursor."""
+    token, idxs = await _seed_list_fixture(ctx)
+    first = await _list(ctx["user"], q=token, min_tier="viewer", limit=1)
+    assert [r["study_idx"] for r in first["studies"]] == [idxs["own"]]
+    second = await _list(
+        ctx["user"],
+        q=token,
+        min_tier="viewer",
+        limit=1,
+        after_study_idx=first["next_after_study_idx"],
+    )
+    assert [r["study_idx"] for r in second["studies"]] == [idxs["shared"]]
+
+
+async def test_list_studies_reads_past_dropped_candidates_to_the_end(ctx):
+    """min_tier=member: the viewer-shared study is a candidate (the caller
+    holds a grant) that the tier check drops. The page after the caller's own
+    study reads past it and reports the end, rather than returning an empty
+    page with a cursor."""
+    token, idxs = await _seed_list_fixture(ctx)
+    first = await _list(ctx["user"], q=token, min_tier="member", limit=1)
+    assert [r["study_idx"] for r in first["studies"]] == [idxs["own"]]
+    second = await _list(
+        ctx["user"],
+        q=token,
+        min_tier="member",
+        limit=1,
+        after_study_idx=first["next_after_study_idx"],
+    )
+    assert second == {"studies": [], "next_after_study_idx": None}
+
+
+async def test_list_studies_agrees_with_get_by_idx_for_wet_lab_admin(ctx):
+    """The role bypass is the other path through the record rule: the list
+    still includes a study exactly when GET /study/{idx} admits the caller."""
+    token, idxs = await _seed_list_fixture(ctx)
+    listed = {r["study_idx"] for r in (await _list(ctx["wet"], q=token))["studies"]}
+    for name, idx in idxs.items():
+        status = (await ctx["wet"].get(URL_STUDY_BY_IDX.format(study_idx=idx))).status_code
+        assert (status == 200) == (idx in listed), (name, status)
+
+
+async def test_list_studies_explicit_public_min_tier_matches_no_filter(ctx):
+    """Every readable study clears min_tier=public, so it must not narrow the
+    list — in particular it must not take the relationship-only path."""
+    token, _ = await _seed_list_fixture(ctx)
+    for client in (ctx["user"], ctx["wet"]):
+        plain = await _list(client, q=token)
+        public = await _list(client, q=token, min_tier="public")
+        assert public == plain
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"limit": 0},
+        {"limit": 501},
+        {"q": ""},
+        {"q": "x" * 201},
+        {"after_study_idx": 0},
+        {"min_tier": "owner"},
+    ],
+)
+async def test_list_studies_rejects_bad_parameters(ctx, params):
+    resp = await ctx["user"].get(URL_STUDY_PREFIX, params=params)
+    assert resp.status_code == 422, resp.text
+
+
+async def test_list_studies_service_account_403(ctx, compute_worker_service_account):
+    """study:read is outside the service-account scope ceiling, so a worker
+    token can never list studies."""
+    from qiita_control_plane.main import app
+
+    app.state.pool = ctx["pool"]
+    headers = {"Authorization": f"Bearer {compute_worker_service_account['token']}"}
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test", headers=headers
+    ) as sa:
+        resp = await sa.get(URL_STUDY_PREFIX)
+    assert resp.status_code == 403
+    assert "study:read" in resp.json()["detail"]
+
+
+async def test_list_studies_stops_after_the_fill_round_cap_and_resumes(ctx):
+    """One request reads at most _MAX_LIST_FILL_ROUNDS candidate batches. With
+    limit=1 and min_tier=member, every newer viewer-shared study is a candidate
+    the tier check drops, so the first request spends its rounds, returns an
+    empty page with a cursor, and following the cursor reaches the one
+    member-shared study, then the end."""
+    from qiita_control_plane.routes.study import _MAX_LIST_FILL_ROUNDS
+
+    token = f"lst{secrets.token_hex(4)}"
+    other = await seed_user_principal(ctx["pool"], prefix=_SEED_PREFIX, suffix=f"cap-{token}")
+    ctx["created"]["user_principals"].append(other)
+
+    async def shared(name: str, tier: str) -> int:
+        resp = await _post_study(ctx["wet"], ctx, title=f"{token} {name}", owner_idx=other)
+        assert resp.status_code == 201, resp.text
+        idx = resp.json()["study_idx"]
+        await _grant_study_access(
+            ctx,
+            study_idx=idx,
+            principal_idx=ctx["user_session"]["principal_idx"],
+            tier=tier,
+            granted_by_idx=other,
+        )
+        return idx
+
+    member_idx = await shared("member", "member")  # oldest, so read last
+    viewer_idxs = [await shared(f"viewer{i}", "viewer") for i in range(_MAX_LIST_FILL_ROUNDS + 1)]
+
+    params = {"q": token, "min_tier": "member", "limit": 1}
+    first = await _list(ctx["user"], **params)
+    # Rounds spent on the newest viewer studies: nothing kept, cursor at the last one read.
+    assert first == {
+        "studies": [],
+        "next_after_study_idx": sorted(viewer_idxs, reverse=True)[_MAX_LIST_FILL_ROUNDS - 1],
+    }
+
+    second = await _list(ctx["user"], **params, after_study_idx=first["next_after_study_idx"])
+    assert [r["study_idx"] for r in second["studies"]] == [member_idx]
+
+    third = await _list(ctx["user"], **params, after_study_idx=second["next_after_study_idx"])
+    assert third == {"studies": [], "next_after_study_idx": None}

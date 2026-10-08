@@ -32,6 +32,13 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   reads the same config, proxies each environment at `/_env/<name>/api`, keeps tokens and
   recent studies per environment, shows the server-reported name as a top-bar badge, and
   switches environments from `/profile`.
+- **List the studies you can read: `GET /api/v1/study` and `qiita study list` (#660).**
+  Returns owned studies, studies shared with you at any tier, and public-default
+  studies (every study for wet_lab_admin+), newest first, each with your
+  `caller_tier` and why you can read it (`access_via`). Filters: full-text `q`,
+  `min_tier` on your own tier, and cursor paging. The CLI defaults to your own and
+  shared studies; `--include-public` widens it. Someone granted access no longer
+  needs to be told a study's idx to find it.
 - **`qiita biosample get-by-unique-field` / `qiita biosample patch-metadata-by-unique-field`
   reach the by-unique-field surface from the CLI (#639).** Read a study's view of a
   biosample, and upsert this study's metadata on it, naming the sample by a
@@ -4015,6 +4022,11 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
+- **A study's record is readable by anyone it is shared with, at any tier (#660).**
+  `GET /api/v1/study/{idx}` previously required the caller's tier to reach the
+  study's `default_tier` (`member` unless set), so a viewer could read a study's
+  samples but got 403 on the study itself. The record now opens for any grant,
+  matching the new study listing.
 - **`qiita biosample create-field` validates its flags before reading the auth token
   (#639).** An invalid flag combination now exits 2 naming the flag, where it previously
   reported a missing token first and left the real problem to be found on the retry. The

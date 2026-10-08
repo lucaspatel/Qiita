@@ -16,6 +16,13 @@ from fastapi import HTTPException
 from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
 from qiita_common.models import Tier
 
+from qiita_control_plane.auth.guards import (
+    caller_may_read_study_record,
+    study_access_via,
+    study_record_min_tier,
+)
+from qiita_control_plane.repositories.study_access import CallerStudyAccessRow
+
 
 def _human(*, role=SystemRole.USER, scopes=frozenset(), profile_complete=True):
     from qiita_control_plane.auth.principal import HumanUser
@@ -1180,3 +1187,68 @@ async def test_filter_studies_empty_input_is_empty(study_access_ctx):
         min_tier=Tier.VIEWER,
     )
     assert got == set()
+
+
+# ---------------------------------------------------------------------------
+# Study-record read policy (study_record_min_tier / caller_may_read_study_record)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("default_tier", "expected"),
+    [
+        (Tier.PUBLIC, Tier.PUBLIC),
+        (Tier.VIEWER, Tier.VIEWER),
+        (Tier.MEMBER, Tier.VIEWER),
+        (Tier.ADMIN, Tier.VIEWER),
+    ],
+)
+def test_study_record_min_tier_is_any_grant_unless_public(default_tier, expected):
+    assert study_record_min_tier(default_tier) is expected
+
+
+def _access_row(*, owner_idx=99, access_tier=None, default_tier=Tier.MEMBER):
+    return CallerStudyAccessRow(
+        owner_idx=owner_idx, access_tier=access_tier, default_tier=default_tier
+    )
+
+
+@pytest.mark.parametrize(
+    ("row", "readable"),
+    [
+        (_access_row(), False),  # no grant, member default
+        (_access_row(access_tier=Tier.VIEWER), True),  # any grant
+        (_access_row(default_tier=Tier.PUBLIC), True),  # public default
+        (_access_row(owner_idx=7, default_tier=Tier.ADMIN), True),  # owner
+    ],
+)
+def test_caller_may_read_study_record(row, readable):
+    assert caller_may_read_study_record(row, caller=_human_with_idx(7)) is readable
+
+
+def test_caller_may_read_study_record_bypass_role_reads_ungranted():
+    caller = _human_with_idx(7, role=SystemRole.WET_LAB_ADMIN)
+    assert caller_may_read_study_record(_access_row(), caller=caller)
+
+
+def test_caller_may_read_study_record_at_least_applies_to_bypass_role():
+    """`at_least` filters on the caller's own tier, so a role bypass with no
+    grant does not pass it."""
+    caller = _human_with_idx(7, role=SystemRole.WET_LAB_ADMIN)
+    assert not caller_may_read_study_record(_access_row(), caller=caller, at_least=Tier.VIEWER)
+    shared = _access_row(access_tier=Tier.MEMBER)
+    assert caller_may_read_study_record(shared, caller=caller, at_least=Tier.MEMBER)
+    assert not caller_may_read_study_record(shared, caller=caller, at_least=Tier.ADMIN)
+
+
+@pytest.mark.parametrize(
+    ("row", "role", "expected"),
+    [
+        (_access_row(owner_idx=7, access_tier=Tier.ADMIN), SystemRole.USER, "owner"),
+        (_access_row(access_tier=Tier.VIEWER, default_tier=Tier.PUBLIC), SystemRole.USER, "grant"),
+        (_access_row(default_tier=Tier.PUBLIC), SystemRole.WET_LAB_ADMIN, "public"),
+        (_access_row(), SystemRole.WET_LAB_ADMIN, "role"),
+    ],
+)
+def test_study_access_via_names_the_strongest_reason(row, role, expected):
+    assert study_access_via(row, caller=_human_with_idx(7, role=role)) == expected
