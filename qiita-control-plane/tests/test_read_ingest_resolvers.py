@@ -22,6 +22,7 @@ from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 
 from qiita_control_plane.auth import tickets
 from qiita_control_plane.auth.tickets import run_signed_flight_call, token_expiry
+from qiita_control_plane.preflight import AmpliconBarcode, amplicon_barcode_from_blob
 from qiita_control_plane.repositories import INT4_MASK
 from qiita_control_plane.repositories.sequencing_run import (
     POOL_LOCK_WAIT_TIMEOUT_S,
@@ -44,6 +45,7 @@ from qiita_control_plane.runner import (
     _workflow_needs_staged_reads,
     _write_reference_fasta,
 )
+from qiita_control_plane.runner._read_ingest import _barcode_roster_mismatches
 
 
 def _step(**kw) -> SimpleNamespace:
@@ -577,29 +579,151 @@ def test_block_read_resolvers_are_gone():
 # --- barcode_map (golay-demux) ----------------------------------------------
 
 
-def test_resolve_barcode_map_writes_parquet(tmp_path):
-    """The action_context roster is written with the (prep_sample_idx, barcode,
-    barcodes_are_rc) columns the golay_demux step reads."""
-    action_context = {
-        BARCODE_MAP_BINDING: [
-            {"prep_sample_idx": 5, "barcode": "ACGT", "barcodes_are_rc": True},
-            {"prep_sample_idx": 6, "barcode": "TTGG", "barcodes_are_rc": False},
-        ]
-    }
-    bound = asyncio.run(_resolve_barcode_map(action_context, tmp_path / "ws"))
-    out = bound[BARCODE_MAP_BINDING]
+_READ_INGEST = "qiita_control_plane.runner._read_ingest"
+
+
+def _pool_with_preflight(monkeypatch, blob: bytes | None, members: dict[str, int]) -> None:
+    """Stand in for the pool's two reads: its stored pre-flight and its
+    `{sequenced_pool_item_id: prep_sample_idx}` membership."""
+
+    async def preflight(_pool, *, sequencing_run_idx, sequenced_pool_idx):
+        assert (sequencing_run_idx, sequenced_pool_idx) == (3, 7)
+        return None if blob is None else {"run_preflight_blob": blob}
+
+    async def item_prep_sample_idxs(_pool, sequenced_pool_idx):
+        assert sequenced_pool_idx == 7
+        return members
+
+    monkeypatch.setattr(f"{_READ_INGEST}.fetch_sequenced_pool_preflight", preflight)
+    monkeypatch.setattr(
+        f"{_READ_INGEST}.fetch_sequenced_pool_item_prep_sample_idxs", item_prep_sample_idxs
+    )
+
+
+def _real_pool(monkeypatch, build_amplicon_preflight, **build):
+    """The committed amplicon pre-flight as the pool's blob, its samples as the
+    pool's members (prep_sample_idx = 1000 + prepped_sample_idx), and the roster
+    the CLI would submit for it."""
+    blob = build_amplicon_preflight(**build).read_bytes()
+    by_item = amplicon_barcode_from_blob(blob)
+    members = {item_id: 1000 + int(item_id) for item_id in by_item}
+    _pool_with_preflight(monkeypatch, blob, members)
+    roster = [
+        {
+            "prep_sample_idx": members[item_id],
+            "barcode": b.barcode,
+            "barcodes_are_rc": b.barcodes_are_rc,
+        }
+        for item_id, b in by_item.items()
+    ]
+    return roster
+
+
+def _resolve(roster, tmp_path):
+    return asyncio.run(
+        _resolve_barcode_map(
+            None,
+            {BARCODE_MAP_BINDING: roster},
+            tmp_path / "ws",
+            sequencing_run_idx=3,
+            sequenced_pool_idx=7,
+        )
+    )
+
+
+def _bad_input(roster, tmp_path) -> str:
+    with pytest.raises(BackendFailure) as exc:
+        _resolve(roster, tmp_path)
+    assert exc.value.kind == FailureKind.BAD_INPUT
+    return exc.value.reason
+
+
+@pytest.mark.parametrize("barcodes_are_rc", [True, False])
+def test_resolve_barcode_map_writes_a_roster_the_preflight_confirms(
+    monkeypatch, tmp_path, build_amplicon_preflight, barcodes_are_rc
+):
+    """A roster that matches the pool's stored pre-flight is written with the
+    (prep_sample_idx, barcode, barcodes_are_rc) columns the golay_demux step reads."""
+    roster = _real_pool(monkeypatch, build_amplicon_preflight, barcodes_are_rc=barcodes_are_rc)
+    out = _resolve(roster, tmp_path)[BARCODE_MAP_BINDING]
     with duckdb.connect(":memory:") as conn:
         rows = conn.execute(
-            f"SELECT prep_sample_idx, barcode, barcodes_are_rc FROM read_parquet('{out}') "
-            "ORDER BY prep_sample_idx"
+            f"SELECT prep_sample_idx, barcode, barcodes_are_rc FROM read_parquet('{out}')"
         ).fetchall()
-    assert rows == [(5, "ACGT", True), (6, "TTGG", False)]
+    assert sorted(rows) == sorted(
+        (e["prep_sample_idx"], e["barcode"], e["barcodes_are_rc"]) for e in roster
+    )
+
+
+def test_resolve_barcode_map_refuses_a_transposed_roster(
+    monkeypatch, tmp_path, build_amplicon_preflight
+):
+    """Two samples' barcodes swapped -- the failure the check exists for: each
+    would demultiplex the other's reads, and nothing downstream would notice."""
+    roster = _real_pool(monkeypatch, build_amplicon_preflight)
+    roster[0]["barcode"], roster[1]["barcode"] = roster[1]["barcode"], roster[0]["barcode"]
+    reason = _bad_input(roster, tmp_path)
+    assert "does not match sequenced_pool 7's stored pre-flight" in reason
+    for entry in roster[:2]:
+        assert f"prep_sample_idx {entry['prep_sample_idx']} has barcode" in reason
+
+
+def test_resolve_barcode_map_refuses_the_wrong_orientation(
+    monkeypatch, tmp_path, build_amplicon_preflight
+):
+    roster = _real_pool(monkeypatch, build_amplicon_preflight)
+    roster[0]["barcodes_are_rc"] = not roster[0]["barcodes_are_rc"]
+    assert "barcodes_are_rc" in _bad_input(roster, tmp_path)
+
+
+def test_resolve_barcode_map_refuses_missing_extra_and_repeated_samples(
+    monkeypatch, tmp_path, build_amplicon_preflight
+):
+    roster = _real_pool(monkeypatch, build_amplicon_preflight)
+    dropped = roster.pop()
+    roster.append({**roster[0]})  # repeated
+    roster.append({"prep_sample_idx": 9, "barcode": "ACGT", "barcodes_are_rc": True})  # extra
+    reason = _bad_input(roster, tmp_path)
+    assert f"prep_sample_idx {roster[0]['prep_sample_idx']} appears more than once" in reason
+    assert "prep_sample_idx 9 is not a sample of this pool" in reason
+    assert f"prep_sample_idx {dropped['prep_sample_idx']} is missing from barcode_map" in reason
+
+
+def test_resolve_barcode_map_needs_the_pools_preflight(monkeypatch, tmp_path):
+    _pool_with_preflight(monkeypatch, None, {})
+    roster = [{"prep_sample_idx": 5, "barcode": "ACGT", "barcodes_are_rc": True}]
+    assert "carries no run pre-flight" in _bad_input(roster, tmp_path)
+
+
+def test_resolve_barcode_map_refuses_a_preflight_the_cli_would_refuse(
+    monkeypatch, tmp_path, build_amplicon_preflight
+):
+    blob = build_amplicon_preflight(populate_accessions=False).read_bytes()
+    _pool_with_preflight(monkeypatch, blob, {"1": 5})
+    roster = [{"prep_sample_idx": 5, "barcode": "ACGT", "barcodes_are_rc": True}]
+    assert "cannot supply a barcode roster" in _bad_input(roster, tmp_path)
+
+
+def test_resolve_barcode_map_refuses_a_pool_sample_the_preflight_lacks(
+    monkeypatch, tmp_path, build_amplicon_preflight
+):
+    blob = build_amplicon_preflight().read_bytes()
+    _pool_with_preflight(monkeypatch, blob, {"no-such-item": 5})
+    roster = [{"prep_sample_idx": 5, "barcode": "ACGT", "barcodes_are_rc": True}]
+    assert "does not list (sequenced_pool_item_id no-such-item)" in _bad_input(roster, tmp_path)
 
 
 def test_resolve_barcode_map_rejects_empty_roster(tmp_path):
     with pytest.raises(BackendFailure) as exc:
-        asyncio.run(_resolve_barcode_map({BARCODE_MAP_BINDING: []}, tmp_path / "ws"))
+        _resolve([], tmp_path)
     assert exc.value.kind == FailureKind.BAD_INPUT
+
+
+def test_barcode_roster_mismatches_names_five_and_counts_the_rest():
+    expected = {i: AmpliconBarcode("ACGT", True) for i in range(1, 10)}
+    problems = _barcode_roster_mismatches([], expected)
+    assert problems[:5] == [f"prep_sample_idx {i} is missing from barcode_map" for i in range(1, 6)]
+    assert problems[5:] == ["and 4 more"]
 
 
 # --- SortMeRNA reference FASTA writer ----------------------------------------

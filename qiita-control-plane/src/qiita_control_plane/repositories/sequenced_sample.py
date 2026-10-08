@@ -481,6 +481,21 @@ async def fetch_sequenced_pool_samples(
     return list(rows)
 
 
+async def fetch_sequenced_pool_item_prep_sample_idxs(
+    pool_or_conn: asyncpg.Pool | asyncpg.Connection, sequenced_pool_idx: int
+) -> dict[str, int]:
+    """Every sequenced_sample in the pool as `{sequenced_pool_item_id:
+    prep_sample_idx}` — the join from a pre-flight's per-sample facts (keyed on
+    item id) to the prep_sample they belong to. Unfiltered: it is the pool's
+    membership, against which a submitted roster is checked."""
+    rows = await pool_or_conn.fetch(
+        "SELECT sequenced_pool_item_id, prep_sample_idx FROM qiita.sequenced_sample"
+        " WHERE sequenced_pool_idx = $1",
+        sequenced_pool_idx,
+    )
+    return {r["sequenced_pool_item_id"]: r["prep_sample_idx"] for r in rows}
+
+
 async def fetch_pool_members(
     pool_or_conn: asyncpg.Pool | asyncpg.Connection, sequenced_pool_idx: int
 ) -> list[tuple[int, int, int]]:

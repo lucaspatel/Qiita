@@ -39,7 +39,11 @@ _None yet._
 
 ### Notes (no host action)
 
-_None yet._
+- **A golay-demux ticket now fails (bad input) when its `barcode_map` disagrees with the
+  pool's stored run pre-flight, or the pool stores none (#657).** Pools ingested with
+  `qiita submit-golay-demux` carry their pre-flight, so a normal submission is
+  unaffected; a hand-built `barcode_map`, or one for a pool created without a
+  pre-flight, is refused rather than demultiplexed.
 
 ## Deployed history
 

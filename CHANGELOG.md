@@ -21,12 +21,17 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
-- **Server-side amplicon barcode roster from a stored preflight blob (#657).**
-  `amplicon_barcode_from_blob` reads each sample's Golay barcode and
-  reverse-complement flag out of a run's preflight SQLite — the twin of the PacBio
-  `pacbio_protocol_from_blob` reader — so an amplicon ingest resolves barcodes from
-  the blob the run already carries rather than a side file. A test pins the result
-  byte-for-byte against the kl-run-preflight CLI's own reader.
+- **golay-demux checks its submitted barcode roster against the pool's stored
+  pre-flight (#657).** The CLI builds `barcode_map` client-side; a transposed roster
+  would route one sample's reads under another's `prep_sample_idx` with nothing
+  downstream to notice. Before running, the runner rebuilds the roster from the
+  pre-flight blob stored on the pool (`preflight.amplicon_barcode_from_blob`, joined
+  to the pool's sequenced samples) and fails the ticket as bad input, naming each
+  differing sample, if the submitted one differs in samples, barcodes or
+  orientation. The CLI and the runner validate the pre-flight through one function
+  (`preflight.amplicon_samples`), so they refuse the same sheets: not an amplicon
+  pre-flight, no samples, or a sample missing its barcode or a required accession.
+  The `barcode_map` input and the workflow version are unchanged.
 - **`qiita biosample get-by-unique-field` / `qiita biosample patch-metadata-by-unique-field`
   reach the by-unique-field surface from the CLI (#639).** Read a study's view of a
   biosample, and upsert this study's metadata on it, naming the sample by a

@@ -193,19 +193,28 @@ def build_amplicon_preflight(tmp_path):
     it never migrates a classic prep template) and populates the biosample + project
     **bioproject** accessions `get_amplicon_sample_info` REQUIRES (left NULL by the
     fixture, set upstream in production): biosample -> BIO_<name>; each project's
-    bioproject -> PRJNA<external_project_id>.
+    bioproject -> PRJNA<external_project_id>. `barcodes_are_rc` overrides the
+    fixture's run-level orientation (it is True, the EMP 515rcbc set).
     """
     import gzip
 
-    def _build(*, populate_accessions: bool = True, name: str = "amplicon_v1.db") -> Path:
+    def _build(
+        *,
+        populate_accessions: bool = True,
+        barcodes_are_rc: bool | None = None,
+        name: str = "amplicon_v1.db",
+    ) -> Path:
         db = tmp_path / name
         db.write_bytes(gzip.decompress(_AMPLICON_V1_SQLITE_GZ.read_bytes()))
+        conn = sqlite3.connect(db)
         if populate_accessions:
-            conn = sqlite3.connect(db)
             conn.execute("UPDATE input_sample SET biosample_accession = 'BIO_' || sample_name")
             conn.execute("UPDATE project SET bioproject_accession = 'PRJNA' || external_project_id")
-            conn.commit()
-            conn.close()
+        if barcodes_are_rc is not None:
+            # Run-level: amplicon_run carries it; run_amplicon_sample stamps it per row.
+            conn.execute("UPDATE amplicon_run SET barcodes_are_rc = ?", (int(barcodes_are_rc),))
+        conn.commit()
+        conn.close()
         return db
 
     return _build

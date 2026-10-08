@@ -8,7 +8,9 @@ them to derive each sample's read-mask gates.
 
 What lives here is PROTOCOL facts (`PacbioProtocol`: sheet_type /
 twist_adaptor_id / syndna_is_twisted) — library-prep truths about how the sample
-was built, which drive `lima_enabled` / `syndna_enabled`. `host_filter_enabled` is
+was built, which drive `lima_enabled` / `syndna_enabled` — and the amplicon demux
+roster (`amplicon_samples`, `AmpliconBarcode`): each sample's Golay barcode, which
+the runner checks a golay-demux submission's `barcode_map` against. `host_filter_enabled` is
 deliberately NOT among them: a sample's host is a property of the sample, resolved
 from its own `host_taxon_id` metadata, not of the project it was booked under.
 
@@ -159,51 +161,118 @@ def pacbio_protocol_from_blob(blob: bytes) -> dict[str, PacbioProtocol]:
         return pacbio_protocol_by_sample_idx(conn)
 
 
+class AmpliconPreflightError(ValueError):
+    """An amplicon pre-flight that cannot supply a demux roster: not an amplicon
+    sheet, no samples, or a sample missing its barcode or a required accession.
+    The message names the sample by `prepped_sample_idx`, its id on the sheet."""
+
+
+@dataclass(frozen=True, slots=True)
+class AmpliconSample:
+    """One amplicon pre-flight sample, validated for a golay-demux submission."""
+
+    prepped_sample_idx: int
+    barcode: str
+    # Run-level in the pre-flight (inferred from the primer), stamped per row.
+    barcodes_are_rc: bool
+    biosample_accession: str
+    primary_bioproject_accession: str
+    secondary_bioproject_accessions: tuple[str, ...]
+
+
+def amplicon_samples(conn: sqlite3.Connection) -> list[AmpliconSample]:
+    """Every amplicon sample in the pre-flight, refusing one that cannot be
+    demultiplexed or registered.
+
+    THE validation of an amplicon pre-flight: the ingest CLI runs it before
+    submitting (`cli/user/amplicon.py::_read_amplicon_preflight_rows`) and the
+    runner runs it on the pool's stored blob when it verifies the submitted
+    `barcode_map` (`runner/_read_ingest.py`), so the two cannot accept different
+    sheets. Reads kl-run-preflight's own `get_amplicon_sample_info`.
+
+    Accessions are required even though the roster itself uses only the barcode:
+    `get_amplicon_sample_info` refuses a NULL biosample or bioproject accession,
+    and a sample without them cannot be registered anyway, so the barcode lookup
+    asks for the same accessioned pre-flight the submission does.
+
+    RAISES `AmpliconPreflightError` for a non-amplicon sheet, an empty sample set,
+    or a sample with an empty barcode or accession; `ValueError` ("missing
+    required accession") from the accessor for a NULL accession; and
+    `sqlite3.DatabaseError` / `ValueError` for an unreadable pre-flight.
+    """
+    from run_preflight.db import SHEET_TYPE_AMPLICON, get_amplicon_sample_info  # noqa: PLC0415
+
+    sheet_type = run_sheet_type(conn)
+    if sheet_type != SHEET_TYPE_AMPLICON:
+        raise AmpliconPreflightError(f"not an amplicon pre-flight (sheet_type {sheet_type!r})")
+    infos = get_amplicon_sample_info(conn)
+    if not infos:
+        raise AmpliconPreflightError(
+            "no amplicon_sample rows; a golay-demux submission needs at least"
+            " one sample to demultiplex"
+        )
+    samples: list[AmpliconSample] = []
+    for info in infos:
+        row = info.kind_row
+        if not row.barcode:
+            raise AmpliconPreflightError(
+                f"prepped_sample_idx {info.sample_idx} carries no Golay barcode; a sample"
+                " cannot be demultiplexed without it"
+            )
+        if not info.biosample_accession:
+            raise AmpliconPreflightError(
+                f"prepped_sample_idx {info.sample_idx} carries no biosample_accession;"
+                " populate upstream before re-submitting"
+            )
+        if not info.primary_bioproject_accession:
+            raise AmpliconPreflightError(
+                f"prepped_sample_idx {info.sample_idx} carries no primary bioproject"
+                " accession; populate upstream before re-submitting"
+            )
+        samples.append(
+            AmpliconSample(
+                prepped_sample_idx=info.sample_idx,
+                barcode=row.barcode,
+                barcodes_are_rc=bool(row.barcodes_are_rc),
+                biosample_accession=info.biosample_accession,
+                primary_bioproject_accession=info.primary_bioproject_accession,
+                secondary_bioproject_accessions=tuple(info.secondary_bioproject_accessions),
+            )
+        )
+    return samples
+
+
 @dataclass(frozen=True, slots=True)
 class AmpliconBarcode:
-    """The per-sample amplicon demux facts the golay-demux submit needs.
-
-    The amplicon twin of `PacbioProtocol`. `barcode` is the sample's Golay index;
-    `barcodes_are_rc` is run-level in the pre-flight (inferred from the primer) but
-    carried per row so a caller holding one roster row needs no second lookup.
-    """
+    """One sample's golay-demux roster facts: its Golay barcode and whether the
+    run's barcodes are reverse-complemented."""
 
     barcode: str
     barcodes_are_rc: bool
 
 
 def amplicon_barcode_by_item_id(conn: sqlite3.Connection) -> dict[str, AmpliconBarcode]:
-    """Map each amplicon sample's `sequenced_pool_item_id` to its Golay barcode.
+    """Map each amplicon sample's `sequenced_pool_item_id` to its barcode facts.
 
     Keyed on `str(prepped_sample_idx)` because THAT is the `sequenced_pool_item_id`
-    the amplicon composer assigns (see `cli/user/amplicon.py`), so this map joins the
-    pool roster directly to resolve each sample's `prep_sample_idx` — the final
-    `{prep_sample_idx, barcode, barcodes_are_rc}` the golay-demux workflow consumes.
-    The pacbio analogue (`pacbio_protocol_by_sample_idx`) keys the same way.
-
-    Reads the SAME accessor the ingest CLI uses
-    (`cli/user/amplicon.py::_read_amplicon_preflight_rows` -> `get_amplicon_sample_info`),
-    so the roster the server builds matches what ingest validated; a parity test pins
-    the two (`tests/test_preflight.py`). This is the server-side build of a roster the
-    CLI currently hand-builds client-side and ships in `action_context`.
-
-    RAISES `ValueError` when the pre-flight's required biosample/bioproject accessions
-    are still NULL (`get_amplicon_sample_info` demands the accessioned state) — the
-    same failure the CLI surfaces — and (via `open_blob`) for an unreadable blob.
+    the amplicon composer assigns (see `cli/user/amplicon.py`), so it joins a
+    pool's sequenced samples directly; the runner makes that join to rebuild the
+    `{prep_sample_idx, barcode, barcodes_are_rc}` roster golay-demux consumes.
+    Validates through `amplicon_samples`, so it refuses (never returns `{}` for)
+    a sheet the submission would refuse.
     """
-    from run_preflight.db import get_amplicon_sample_info  # noqa: PLC0415
-
     return {
-        str(info.sample_idx): AmpliconBarcode(
-            barcode=info.kind_row.barcode,
-            barcodes_are_rc=bool(info.kind_row.barcodes_are_rc),
+        str(sample.prepped_sample_idx): AmpliconBarcode(
+            barcode=sample.barcode, barcodes_are_rc=sample.barcodes_are_rc
         )
-        for info in get_amplicon_sample_info(conn)
+        for sample in amplicon_samples(conn)
     }
 
 
 def amplicon_barcode_from_blob(blob: bytes) -> dict[str, AmpliconBarcode]:
-    """`amplicon_barcode_by_item_id` over a stored blob."""
+    """`amplicon_barcode_by_item_id` over a stored blob. RAISES as that does,
+    plus `ValueError` / `sqlite3.DatabaseError` (via `open_blob`) for a blob that
+    is not a readable pre-flight."""
     with open_blob(blob) as conn:
         return amplicon_barcode_by_item_id(conn)
 

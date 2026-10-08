@@ -353,7 +353,20 @@ async def run_workflow(
             bound.update(await _resolve_sample_map(bound, workspace))
         # golay-demux consumes the same shape: a barcode roster + the staging root.
         if _workflow_declares_input(action.steps, BARCODE_MAP_BINDING):
-            bound.update(await _resolve_barcode_map(bound, workspace))
+            if scope_target["kind"] != ScopeTargetKind.SEQUENCED_POOL.value:
+                raise _submission_bad_input(
+                    "a workflow taking barcode_map must be scoped to a sequenced_pool,"
+                    f" not {scope_target['kind']}"
+                )
+            bound.update(
+                await _resolve_barcode_map(
+                    pool,
+                    bound,
+                    workspace,
+                    sequencing_run_idx=scope_target["sequencing_run_idx"],
+                    sequenced_pool_idx=scope_target["sequenced_pool_idx"],
+                )
+            )
         if _workflow_declares_input(action.steps, READS_STAGING_ROOT_BINDING):
             bound[READS_STAGING_ROOT_BINDING] = str(upload_staging_root)
 
