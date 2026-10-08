@@ -6,13 +6,14 @@
 <script lang="ts">
   import { page } from '$app/state';
   import { auth } from '$lib/auth.svelte';
-  import { api, type ApiResult, type StudyAccessRow } from '$lib/api';
+  import { api, type ApiResult, type StudyAccessRow, type StudySequencedPool } from '$lib/api';
   import { addRecent } from '$lib/recents';
   import PageHeading from '$lib/ui/PageHeading.svelte';
   import Card from '$lib/ui/Card.svelte';
   import Modal from '$lib/ui/Modal.svelte';
   import SampleUploader from '$lib/ui/SampleUploader.svelte';
   import SampleGrid from '$lib/ui/SampleGrid.svelte';
+  import StudyPools from '$lib/ui/StudyPools.svelte';
   import Tabs from '$lib/ui/Tabs.svelte';
   import { metadataColumns } from '$lib/samples';
   import { settings } from '$lib/settings.svelte';
@@ -41,6 +42,7 @@
   let record = $state<ApiResult<Record<string, unknown>> | null>(null);
   let access = $state<ApiResult<StudyAccessRow[]> | null>(null);
   let total = $state(0);
+  let pools = $state<StudySequencedPool[]>([]);
   let samples = $state<Biosample[]>([]);
   let sampleErr = $state('');
   let addOpen = $state(false);
@@ -55,6 +57,12 @@
   const overviewFields = $derived(OVERVIEW_KEYS.filter((k) => rec && k in rec));
   const hasOverview = $derived(!!rec && OVERVIEW_KEYS.some((k) => rec[k] != null && rec[k] !== ''));
   const detailFields = $derived(rec ? Object.keys(rec).filter((k) => !DETAILS_EXCLUDE.has(k)) : []);
+  const poolsSummary = $derived.by(() => {
+    if (!pools.length) return null;
+    const platforms = [...new Set(pools.map((p) => p.instrument_model).filter(Boolean))].join(', ');
+    const n = pools.reduce((a, p) => a + p.sample_count, 0);
+    return `${pools.length} · ${platforms || 'unknown platform'} · ${n} samples`;
+  });
   const TABS = $derived([
     { id: 'overview', label: 'Overview' },
     { id: 'samples', label: total ? `Samples (${total})` : 'Samples' },
@@ -77,10 +85,15 @@
     samples = [];
     sampleErr = '';
     access = null;
+    pools = [];
     record = await api.studyRecord(i);
     // Access list (member+ only) loads alongside — never blocks sample loading.
     api.studyAccess(i).then((r) => {
       if (seq === loadSeq) access = r;
+    });
+    // Pools summary for the Details tab; non-blocking.
+    api.studyPools(i).then((r) => {
+      if (seq === loadSeq) pools = r.ok ? r.data.sequenced_pool : [];
     });
     const list = await api.biosampleIdxs(i);
     if (seq !== loadSeq) return;
@@ -197,6 +210,12 @@
             {/if}
           {:else if tab === 'details'}
             <dl class="grid grid-cols-1 gap-x-6 gap-y-2 sm:grid-cols-2">
+              {#if poolsSummary}
+                <div class="flex gap-2 text-sm">
+                  <dt class="w-44 shrink-0 font-medium text-gray-500">Sequenced pools</dt>
+                  <dd class="min-w-0 break-words text-gray-900">{poolsSummary}</dd>
+                </div>
+              {/if}
               {#each detailFields as k (k)}{@render fieldRow(k, record.data[k])}{/each}
             </dl>
           {:else if tab === 'access'}
@@ -244,13 +263,7 @@
 {/if}
 
 {#if auth.isSet}
-  <Card title="Processing & data">
-    <p class="text-sm text-gray-500">
-      Reads, QC, masks, alignments, assemblies, and feature tables for this study's
-      sequenced pools will appear here — built piece by piece. First up: listing the
-      study's pools (needs <code class="rounded bg-gray-100 px-1">GET /study/&lbrace;idx&rbrace;/sequenced-pool</code>).
-    </p>
-  </Card>
+  <StudyPools {studyIdx} />
 {/if}
 
 <Modal bind:open={addOpen} title="Add samples to study {studyIdx}">

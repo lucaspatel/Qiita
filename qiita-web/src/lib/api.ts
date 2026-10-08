@@ -354,6 +354,98 @@ export type BulkImportResult = { results: BiosampleImported[] };
 
 export type Deployment = { name: string | null };
 
+// A sequenced pool a study's samples sit in (GET /study/{idx}/sequenced-pool).
+export type StudySequencedPool = {
+  sequenced_pool_idx: number;
+  sequencing_run_idx: number;
+  run_preflight_filename: string | null;
+  instrument_model: string | null;
+  sample_count: number;
+  created_at: string;
+};
+export type StudySequencedPoolList = {
+  study_idx: number;
+  sequenced_pool: StudySequencedPool[];
+  count: number;
+  truncated: boolean;
+};
+
+// --- long-read lineage inputs (GET /processing, /mask-definition, /assembly/.../membership) ---
+
+/** One processing RUN — identity = hash of {workflow, version, params}. For
+ *  long-read-assembly, params carries mask_idx + assembler (the lineage link). */
+export type Processing = {
+  processing_idx: number;
+  workflow: string;
+  version: string;
+  params: Record<string, unknown>; // { mask_idx, assembler, ... }
+  status: string;
+};
+export type ProcessingList = { processing: Processing[]; count: number; truncated: boolean };
+
+/** A read-mask identity (host-filter / lima / syndna config). */
+export type MaskDefinition = {
+  mask_idx: number;
+  host_filter_enabled: boolean;
+  lima_enabled: boolean;
+  syndna_enabled: boolean;
+};
+
+/** One contig of an assembly run, tagged by kind/bin. completeness/contamination
+ *  are CheckM (MAGs only) — mocked in the shim; real data is Flight-only. */
+export type AssemblyMembershipRow = {
+  kind: 'MAG' | 'LCG' | 'UNBINNED';
+  bin_id: string | null;
+  feature_idx: number;
+  completeness: number | null;
+  contamination: number | null;
+};
+export type AssemblyMembership = {
+  prep_sample_idx: number;
+  processing_idx: number;
+  membership: AssemblyMembershipRow[];
+  count: number;
+  truncated: boolean;
+};
+
+// Study-level lineage aggregate — the pipeline stages rolled up across every
+// pool/sample. `GET /study/{idx}/lineage` is a Phase-3 endpoint that doesn't exist
+// server-side yet (shimmed today); a real impl rolls up processing + mask + membership.
+export type LineageColumn = { key: string; label: string };
+export type LineageSampleRow = {
+  accession: string;
+  prep_sample_idx: number;
+  pool: number;
+  state: string; // completed | processing | failed | no_data | …
+  values: Record<string, number | string | null>;
+};
+export type LineageNode = {
+  id: string;
+  label: string;
+  kind: 'stage' | 'bin' | 'feature_table';
+  /** The submittable action this node represents, if any — present only on workflow
+   *  nodes (reads/mask/assembly), absent on facet (bins/mag/lcg/unbinned) and
+   *  feature-table nodes, which are outputs, not actions. Gates the Queue button. */
+  action_id?: string;
+  completion: { done: number; total: number };
+  columns: LineageColumn[];
+  samples: LineageSampleRow[];
+};
+export type FeatureTableStat = {
+  id: string;
+  rows: number;
+  cols: number;
+  sparsity_pct: number;
+  merged_sample_count: number;
+};
+export type LineageEdge = [string, string, { dashed?: boolean }];
+export type StudyLineage = {
+  study_idx: number;
+  nodes: LineageNode[];
+  edges: LineageEdge[];
+  feature_table_stats: { tables: FeatureTableStat[] };
+};
+
 // --- ENA/INSDC study import (admin-only; a batch driver that spawns download tickets) ---
 
 // Per-item lifecycle; `done` is computed on read (never stored), and one bad
@@ -433,20 +525,56 @@ export const api = {
   /** Sample idx set for a study. Needs tier >= viewer. */
   sequencedIdxs: (studyIdx: number) =>
     get<IdxList>(`/study/${studyIdx}/sequenced-sample/list-idxs`),
+  /** The distinct sequenced pools a study's samples sit in. Needs tier >= viewer.
+   *  404/405 on a server predating the endpoint — treat as "unsupported". */
+  studyPools: (studyIdx: number) =>
+    get<StudySequencedPoolList>(`/study/${studyIdx}/sequenced-pool`),
+  /** Study-level pipeline lineage aggregate (stages rolled up across pools/samples).
+   *  404/405 on a server predating the endpoint — treat as "unsupported". */
+  studyLineage: (studyIdx: number) => get<StudyLineage>(`/study/${studyIdx}/lineage`),
+  /** (mock) Kick off a sample's next processing step; the lineage reflects it on refetch. */
+  processSample: (studyIdx: number, prepSampleIdx: number) =>
+    send<{ prep_sample_idx: number; state: string }>(
+      'POST',
+      `/study/${studyIdx}/sample/${prepSampleIdx}/process`,
+      {}
+    ),
   biosampleIdxs: (studyIdx: number) =>
     get<IdxList>(`/study/${studyIdx}/biosample/list-idxs`),
   /** One biosample incl. its global_metadata values. Readable at viewer tier. */
   biosample: (idx: number) => get<Biosample>(`/biosample/${idx}`),
   /** Your work tickets (own by default; wet_lab_admin+ sees all with all=true). */
-  tickets: (q: { state?: string; active?: boolean; all?: boolean; limit?: number } = {}) => {
+  tickets: (
+    q: {
+      state?: string;
+      active?: boolean;
+      all?: boolean;
+      limit?: number;
+      prep_sample_idx?: number;
+      sequenced_pool_idx?: number;
+    } = {}
+  ) => {
     const p = new URLSearchParams();
     if (q.state) p.set('state', q.state);
     if (q.active) p.set('active', 'true');
     if (q.all) p.set('all', 'true');
     if (q.limit) p.set('limit', String(q.limit));
+    if (q.prep_sample_idx) p.set('prep_sample_idx', String(q.prep_sample_idx));
+    if (q.sequenced_pool_idx) p.set('sequenced_pool_idx', String(q.sequenced_pool_idx));
     const qs = p.toString();
     return get<WorkTicketListResponse>(`/work-ticket${qs ? `?${qs}` : ''}`);
   },
+  /** The prep_samples in a pool. Needs tier >= viewer. */
+  poolSamples: (run: number, pool: number) =>
+    get<IdxList>(`/sequencing-run/${run}/sequenced-pool/${pool}/sequenced-sample/list-idxs`),
+  /** Processing runs over a prep_sample (long-read-assembly). */
+  processing: (prepSampleIdx: number) =>
+    get<ProcessingList>(`/processing?prep_sample_idx=${prepSampleIdx}`),
+  /** A read-mask identity by idx. */
+  maskDefinition: (idx: number) => get<MaskDefinition>(`/mask-definition/${idx}`),
+  /** An assembly run's contigs (by kind/bin) for a prep_sample. */
+  assemblyMembership: (prepSampleIdx: number, processingIdx: number) =>
+    get<AssemblyMembership>(`/assembly/${prepSampleIdx}/${processingIdx}/membership`),
   ticket: (idx: number) => get<WorkTicket>(`/work-ticket/${idx}`),
   ticketLogs: (idx: number, step: number, opts: { attempt?: number; tailLines?: number } = {}) => {
     const p = new URLSearchParams();
