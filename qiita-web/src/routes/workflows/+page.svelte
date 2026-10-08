@@ -10,19 +10,30 @@
   import { isAdminRole } from '$lib/roles';
 
   // --- ENA import (admin-only; opens the batch submit/status modal) ---
-  let isAdmin = $state(false);
   let enaOpen = $state(false);
 
-  // Gate the ENA card on the caller's role, mirroring the route's own gate.
+  // Always show the card (like the CLI's visible-but-403'd verb); disable it with a
+  // reason, distinguishing "not admin" from "backend unreachable".
+  let adminState = $state<'loading' | 'admin' | 'denied' | 'unreachable'>('loading');
   $effect(() => {
-    if (auth.isSet) {
-      api.whoami().then((r) => {
-        isAdmin = r.ok && isAdminRole(r.data.system_role);
-      });
-    } else {
-      isAdmin = false;
+    if (!auth.isSet) {
+      adminState = 'loading';
+      return;
     }
+    adminState = 'loading';
+    api.whoami().then((r) => {
+      adminState = r.ok ? (isAdminRole(r.data.system_role) ? 'admin' : 'denied') : 'unreachable';
+    });
   });
+  const enaGateReason = $derived(
+    adminState === 'loading'
+      ? 'Checking your access…'
+      : adminState === 'denied'
+        ? 'Requires wet-lab admin.'
+        : adminState === 'unreachable'
+          ? 'Admin status unavailable — backend unreachable.'
+          : ''
+  );
 
   // --- Amplicon run submit (run id + preflight → chains golay-demux → denoise) ---
   let open = $state(false);
@@ -123,14 +134,19 @@
       <p class="text-sm text-gray-600">Assemble and bin long-read (PacBio) samples into genomes.</p>
     </Card>
 
-    {#if isAdmin}
-      <Card title="Import from ENA (INSDC)">
-        {#snippet actions()}
-          <button class="rounded-md bg-teal-700 px-4 py-1.5 text-sm font-semibold text-white shadow-sm hover:bg-teal-600" onclick={() => (enaOpen = true)}>Import</button>
-        {/snippet}
-        <p class="text-sm text-gray-600">Pull a public study into Qiita by accession — reads plus harmonized metadata.</p>
-      </Card>
-    {/if}
+    <Card title="Import from ENA (INSDC)">
+      {#snippet actions()}
+        <button
+          class="rounded-md bg-teal-700 px-4 py-1.5 text-sm font-semibold text-white shadow-sm hover:bg-teal-600 disabled:cursor-not-allowed disabled:opacity-50"
+          onclick={() => (enaOpen = true)}
+          disabled={adminState !== 'admin'}
+          title={enaGateReason}>Import</button>
+      {/snippet}
+      <p class="text-sm text-gray-600">Pull a public study into Qiita by accession — reads plus harmonized metadata.</p>
+      {#if adminState !== 'admin'}
+        <p class="mt-1 text-xs {adminState === 'unreachable' ? 'text-amber-700' : 'text-gray-500'}">{enaGateReason}</p>
+      {/if}
+    </Card>
   </div>
 {/if}
 

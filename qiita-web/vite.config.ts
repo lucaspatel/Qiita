@@ -99,7 +99,25 @@ export default defineConfig(({ command }) => {
       target: env.origin,
       changeOrigin: true,
       secure: true,
-      rewrite: (p) => p.slice(prefix.length)
+      rewrite: (p) => p.slice(prefix.length),
+      // Fail fast with a structured 503 when the backend is unreachable.
+      timeout: 8000,
+      proxyTimeout: 8000,
+      configure: (proxyServer) => {
+        proxyServer.on('error', (err, _req, res) => {
+          const r = res as import('node:http').ServerResponse;
+          if (!r.headersSent && typeof r.writeHead === 'function') {
+            r.writeHead(503, { 'content-type': 'application/json' });
+            r.end(
+              JSON.stringify({
+                detail: `${env.name} backend unreachable (${(err as NodeJS.ErrnoException).code ?? 'proxy error'})`
+              })
+            );
+          } else {
+            r.destroy?.();
+          }
+        });
+      }
     };
   }
   return {

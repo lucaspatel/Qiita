@@ -44,6 +44,20 @@ export type Ok<T> = { ok: true; status: number; data: T };
 export type Err = { ok: false; status: number; detail: string };
 export type ApiResult<T> = Ok<T> | Err;
 
+// fetch has no default timeout; cap every request so a dead backend fails fast.
+const REQUEST_TIMEOUT_MS = 10_000;
+
+function networkErr(e: unknown): Err {
+  const timedOut = e instanceof DOMException && e.name === 'TimeoutError';
+  return {
+    ok: false,
+    status: 0,
+    detail: timedOut
+      ? `request timed out after ${REQUEST_TIMEOUT_MS / 1000}s — backend unreachable?`
+      : `network error: ${String(e)}`
+  };
+}
+
 async function send<T>(method: string, path: string, body?: unknown): Promise<ApiResult<T>> {
   let res: Response;
   try {
@@ -53,10 +67,11 @@ async function send<T>(method: string, path: string, body?: unknown): Promise<Ap
         ...(auth.isSet ? { Authorization: `Bearer ${auth.token}` } : {}),
         ...(body !== undefined ? { 'Content-Type': 'application/json' } : {})
       },
-      body: body !== undefined ? JSON.stringify(body) : undefined
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
     });
   } catch (e) {
-    return { ok: false, status: 0, detail: `network error: ${String(e)}` };
+    return networkErr(e);
   }
   if (res.status === 204) return { ok: true, status: 204, data: undefined as T };
   const b: unknown = await res.json().catch(() => ({}));
@@ -70,10 +85,11 @@ async function get<T>(path: string): Promise<ApiResult<T>> {
   let res: Response;
   try {
     res = await fetch(BASE + path, {
-      headers: auth.isSet ? { Authorization: `Bearer ${auth.token}` } : {}
+      headers: auth.isSet ? { Authorization: `Bearer ${auth.token}` } : {},
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
     });
   } catch (e) {
-    return { ok: false, status: 0, detail: `network error: ${String(e)}` };
+    return networkErr(e);
   }
   const body: unknown = await res.json().catch(() => ({}));
   if (res.ok) return { ok: true, status: res.status, data: body as T };
@@ -158,10 +174,11 @@ export async function cliExchange(otCode: string): Promise<ApiResult<{ token: st
     res = await fetch(BASE + '/auth/cli-exchange', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ot_code: otCode })
+      body: JSON.stringify({ ot_code: otCode }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
     });
   } catch (e) {
-    return { ok: false, status: 0, detail: `network error: ${String(e)}` };
+    return networkErr(e);
   }
   const body: unknown = await res.json().catch(() => ({}));
   if (res.ok) return { ok: true, status: res.status, data: body as { token: string } };
@@ -273,6 +290,23 @@ export type WorkTicketStepLogs = {
 
 export type StudyAccessionField = 'bioproject_accession' | 'ena_study_accession';
 
+export type Tier = 'public' | 'viewer' | 'member' | 'admin';
+
+/** One row of GET /study — a study the caller may read, and why. */
+export type StudySummary = {
+  study_idx: number;
+  title: string;
+  alias: string | null;
+  bioproject_accession: string | null;
+  ena_study_accession: string | null;
+  default_tier: Tier;
+  caller_tier: Tier;
+  access_via: 'owner' | 'grant' | 'public' | 'role';
+  updated_at: string;
+};
+
+export type StudySummaryList = { studies: StudySummary[]; next_after_study_idx: number | null };
+
 /** Response of POST /study/lookup-by-accession: accession → study_idx + unresolved. */
 export type StudyLookupResponse = {
   resolved: Record<string, number>;
@@ -322,9 +356,8 @@ export type Deployment = { name: string | null };
 
 // --- ENA/INSDC study import (admin-only; a batch driver that spawns download tickets) ---
 
-// Per-item lifecycle. `done` is computed on read (never stored) once every spawned
-// download ticket is terminal-success; `failed` is off any step. One bad accession
-// fails only its item, never the batch.
+// Per-item lifecycle; `done` is computed on read (never stored), and one bad
+// accession fails only its own item.
 export type BatchItemState =
   | 'pending'
   | 'resolving'
@@ -380,6 +413,16 @@ export const api = {
   bulkImportBiosamples: (studyIdx: number, rows: BiosampleRow[]) =>
     send<BulkImportResult>('POST', `/study/${studyIdx}/biosample/bulk`, { rows }),
   /** Resolve study accession(s) → study_idx. Needs study:read scope. */
+  /** Studies the caller may read, newest first (405 on a server that predates the route). */
+  studies: (q: { q?: string; min_tier?: Tier; after_study_idx?: number; limit?: number } = {}) => {
+    const p = new URLSearchParams();
+    if (q.q) p.set('q', q.q);
+    if (q.min_tier) p.set('min_tier', q.min_tier);
+    if (q.after_study_idx) p.set('after_study_idx', String(q.after_study_idx));
+    if (q.limit) p.set('limit', String(q.limit));
+    const qs = p.toString();
+    return get<StudySummaryList>(`/study${qs ? `?${qs}` : ''}`);
+  },
   lookupStudyByAccession: (accessions: string[], field: StudyAccessionField = 'bioproject_accession') =>
     send<StudyLookupResponse>('POST', '/study/lookup-by-accession', {
       accessions,

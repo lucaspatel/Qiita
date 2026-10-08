@@ -8,10 +8,9 @@
 
 export const STUDY_PREFIXES = ['PRJNA', 'PRJEB', 'PRJDB', 'ERP', 'SRP', 'DRP'] as const;
 
-// Full-match patterns, mirroring ena_accession.py's `_ACCESSION_PATTERNS`: a
-// known prefix followed by digits (sample accessions may carry one letter first).
-// Prefix-only (e.g. bare `PRJEB`) is NOT a match — the server fullmatches too, so
-// a looser check here would wave through an accession the batch route then 422s.
+// Mirrors ena_accession.py's `_ACCESSION_PATTERNS` — prefix + digits, full-match
+// like the server (sample accessions may carry one letter); a looser check would
+// pass an accession the batch route then 422s.
 const KIND_PATTERNS: Record<string, RegExp> = {
   study: new RegExp(`^(?:${STUDY_PREFIXES.join('|')})[0-9]+$`),
   sample: /^(?:SAMN|SAME|SAMD)[A-Z]?[0-9]+$/,
@@ -41,11 +40,9 @@ export function studyAccessionError(accession: string): string | null {
 
 export type ParsedAccessions = { accessions: string[]; errors: string[] };
 
-/** Parse pasted text or an uploaded file into study accessions, mirroring the
- *  CLI's `--from-file` contract: one accession per line, blank lines and whole-line
- *  `#` comments skipped, a line carrying a trailing comment / comma / more than one
- *  token refused by line number. Survivors are study-validated and de-duplicated
- *  order-preserving (as the batch driver does). */
+/** Parse accessions, one per line (the CLI's `--from-file` contract): blanks and
+ *  whole-line `#` comments skipped; a line with a comment/comma/extra token is
+ *  refused by line number; survivors are validated and de-duplicated. */
 export function parseAccessionText(text: string): ParsedAccessions {
   const accessions: string[] = [];
   const errors: string[] = [];
@@ -70,11 +67,7 @@ export function parseAccessionText(text: string): ParsedAccessions {
   return { accessions, errors };
 }
 
-// --- badge colours, in the same vocabulary the Jobs table uses (tickets.ts) ---
-
-// Batch-item lifecycle: pending -> resolving -> registered -> downloading -> done,
-// with failed off any step. Terminal states read distinctly (done green, failed
-// red); live states blue; not-yet-started amber.
+// Badge colours, same palette as tickets.ts STATE_CLASS.
 export const BATCH_STATE_CLASS: Record<string, string> = {
   pending: 'bg-amber-50 text-amber-800 ring-amber-600/20',
   resolving: 'bg-blue-50 text-blue-700 ring-blue-600/20',
@@ -84,8 +77,6 @@ export const BATCH_STATE_CLASS: Record<string, string> = {
   failed: 'bg-red-50 text-red-700 ring-red-600/10'
 };
 
-// Per-run outcome: a registered run is a win; skipped/excluded are neutral; a held
-// run flags amber; a failed run is red.
 export const RUN_STATUS_CLASS: Record<string, string> = {
   registered: 'bg-green-50 text-green-700 ring-green-600/20',
   skipped_already_present: 'bg-gray-50 text-gray-600 ring-gray-500/10',

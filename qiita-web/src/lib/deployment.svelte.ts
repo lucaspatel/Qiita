@@ -37,9 +37,7 @@ export function isProduction(d: DeploymentState): boolean {
   return displayName(d) === PRODUCTION_NAME;
 }
 
-/** What the server reports, for the "server reports: X" caption. `detailed`
- *  surfaces the failure detail on the unknown branch (the full /profile card);
- *  the compact top-bar badge leaves it at "not reported". */
+/** The server's reported name; `detailed` includes the failure detail on unknown. */
 export function reportedName(d: DeploymentState, detailed = false): string {
   switch (d.status) {
     case 'named':

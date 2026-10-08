@@ -70,9 +70,7 @@
   });
 
   let mapOpen = $state(false);
-  // A geo point is a property of each sample, not of the filter — compute it once
-  // from `samples` so a filter keystroke does a cheap Map lookup, not a re-scan of
-  // every sample's metadata.
+  // Compute each sample's point once from `samples`, so filtering is a Map lookup.
   const geoByIdx = $derived.by(() => {
     const m = new Map<number, GeoPoint>();
     for (const s of samples) {

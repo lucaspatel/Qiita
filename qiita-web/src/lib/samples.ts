@@ -55,8 +55,7 @@ function sampleType(s: Biosample): string {
 const LAT_RE = /\b(lat|latitude)\b/;
 const LON_RE = /\b(lon|lng|long|longitude)\b/;
 
-/** Resolve a sample's lat/lon in one pass over its metadata (each key is either
- *  a latitude or a longitude key, never both), instead of two full scans. */
+/** A sample's lat/lon, resolved in one metadata pass. */
 function geoLatLon(s: Biosample): { lat: number | null; lon: number | null } {
   let lat: number | null = null;
   let lon: number | null = null;
