@@ -21,6 +21,14 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **List the studies you can read: `GET /api/v1/study` and `qiita study list` (#660).**
+  Returns owned studies, studies shared with you at any tier, and public-default
+  studies (every study for wet_lab_admin+), newest first, each with your
+  `caller_tier`, why you can read it (`access_via`), and which view of its record
+  you get (`record_view`). Filters: full-text `q` (a summary reader matches only the
+  summary fields; accessions are searchable), `min_tier` on your own tier, and cursor
+  paging. The CLI defaults to your own and shared studies; `--min-tier public` widens
+  it to public studies. Someone granted access no longer needs to be told a study's idx to find it.
 - **The branch reviewer is in the repo, and a PR description records its run (#655).**
   `.claude/agents/qiita-reviewer.md` (the rules) and `.claude/skills/qiita-review/` (the
   review, fix, re-review loop) were per-developer files that `CLAUDE.md` already pointed
@@ -2113,6 +2121,10 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **CI pins the Python interpreter to 3.14.** `requires-python` is open-ended
+  (`>=3.14`), so once CPython 3.15.0 was published `uv` began downloading it in
+  CI and `pydantic-core`'s `pyo3` build failed against a Python newer than pyo3
+  supports. Each `astral-sh/setup-uv` step now passes `python-version: "3.14"`.
 - **`ingest_ena_reads` retries an ENA md5 mismatch and a run miint skipped instead of failing permanently (#661).**
   miint documents a transfer truncated on a clean gzip member boundary as indistinguishable
   from a genuinely bad digest and advises bounded retries, so the ticket's `max_retries`
@@ -4063,6 +4075,14 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Changed
 
+- **A grant below a study's `default_tier` reads the study's summary (#660).**
+  `GET /api/v1/study/{idx}` previously answered 403 to any caller whose tier was
+  below the study's `default_tier` (`member` unless set). It now returns them a
+  summary — title, alias, accessions, tiers, `updated_at`, marked `"view":
+  "summary"` — so a study shared with someone can be found and recognised; the full
+  record still requires a tier at or above `default_tier`, and carries `"view":
+  "full"` (on POST and PATCH responses too). What each tier reads is defined in
+  `docs/architecture/data-model.md`.
 - **DuckDB 1.5.4 → 1.5.5 across every component, and every DuckDB pin is now exact
   (#651).** The team miint mirror now builds against DuckDB 1.5.5 (its 1.5.4 builds stopped
   updating on Sep 11), so the data-plane crate (`=1.10505.0`), the four Python components
