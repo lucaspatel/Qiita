@@ -868,12 +868,13 @@ async def _seed_amplicon_pool(pool, owner_idx, item_ids, blob):
             sequenced_pool_idx=pool_idx,
         )
         prep_by_item[item] = prep
-    await pool.execute(
-        "UPDATE qiita.sequenced_pool SET run_preflight_blob = $1,"
-        " run_preflight_filename = 'preflight.db' WHERE idx = $2",
-        blob,
-        pool_idx,
-    )
+    if blob is not None:
+        await pool.execute(
+            "UPDATE qiita.sequenced_pool SET run_preflight_blob = $1,"
+            " run_preflight_filename = 'preflight.db' WHERE idx = $2",
+            blob,
+            pool_idx,
+        )
     return run_idx, pool_idx, prep_by_item
 
 
@@ -939,6 +940,65 @@ async def test_resolve_barcode_map_over_real_sql_drops_retired_samples(
     )
     # A roster missing an active sample is refused.
     assert "is missing from barcode_map" in await _bad_input_db(active_roster[:1])
+
+
+@pytest.mark.db
+async def test_resolve_barcode_map_over_real_sql_drops_ena_flagged_samples(
+    postgres_pool, human_admin_session, tmp_path
+):
+    """An `ena_status`-flagged sequenced_sample leaves the pool's ACTIVE set the same
+    way a retired prep_sample does: the membership read filters BOTH
+    (`ss.ena_status IS NULL`), so the expected roster drops it. Pins the ena_status
+    half of the filter, which the retired-sample test leaves NULL."""
+    owner = human_admin_session["principal_idx"]
+    blob = _three_sample_blob(tmp_path)
+    run_idx, pool_idx, prep_by_item = await _seed_amplicon_pool(
+        postgres_pool, owner, ["1", "2", "3"], blob
+    )
+    assert set(
+        await _preflight_barcode_roster(
+            postgres_pool, sequencing_run_idx=run_idx, sequenced_pool_idx=pool_idx
+        )
+    ) == set(prep_by_item.values())  # all three active
+
+    # Flag sample "3" as unavailable at ENA (any non-NULL ena_status): now out.
+    await postgres_pool.execute(
+        "UPDATE qiita.sequenced_sample SET ena_status = 'suppressed' WHERE prep_sample_idx = $1",
+        prep_by_item["3"],
+    )
+    assert set(
+        await _preflight_barcode_roster(
+            postgres_pool, sequencing_run_idx=run_idx, sequenced_pool_idx=pool_idx
+        )
+    ) == {prep_by_item["1"], prep_by_item["2"]}
+
+
+@pytest.mark.db
+async def test_resolve_barcode_map_over_real_sql_refuses_a_pool_with_a_null_blob(
+    postgres_pool, human_admin_session, tmp_path
+):
+    """Over the REAL query, a pool whose row exists but stores a NULL blob is bad
+    input. The monkeypatched reader returns no row; the DB returns a row with a
+    NULL `run_preflight_blob` -- the `row["run_preflight_blob"] is None` half of the
+    guard, which the stub-backed `needs_the_pools_preflight` test cannot reach."""
+    owner = human_admin_session["principal_idx"]
+    run_idx, pool_idx, prep_by_item = await _seed_amplicon_pool(
+        postgres_pool, owner, ["1", "2", "3"], None
+    )
+    roster = [
+        {"prep_sample_idx": p, "barcode": "CTACAGGGTCTC", "barcodes_are_rc": True}
+        for p in prep_by_item.values()
+    ]
+    with pytest.raises(BackendFailure) as exc:
+        await _resolve_barcode_map(
+            postgres_pool,
+            {BARCODE_MAP_BINDING: roster},
+            tmp_path / "ws",
+            sequencing_run_idx=run_idx,
+            sequenced_pool_idx=pool_idx,
+        )
+    assert exc.value.kind == FailureKind.BAD_INPUT
+    assert "carries no run pre-flight" in exc.value.reason
 
 
 # --- SortMeRNA reference FASTA writer ----------------------------------------

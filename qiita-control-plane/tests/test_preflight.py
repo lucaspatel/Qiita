@@ -84,6 +84,10 @@ def test_cli_and_server_amplicon_readers_agree(build_amplicon_preflight, barcode
             " WHERE rowid = (SELECT min(rowid) FROM input_sample)",
             "carries no biosample_accession",
         ),
+        (
+            "UPDATE project SET bioproject_accession = ''",
+            "no primary bioproject",
+        ),
         ("DELETE FROM amplicon_sample", "no amplicon_sample rows"),
     ],
 )
