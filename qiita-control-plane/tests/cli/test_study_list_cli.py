@@ -40,10 +40,10 @@ def test_defaults_to_own_and_shared_studies(pages):
     assert calls == [{"limit": 100, "min_tier": "viewer"}]
 
 
-def test_include_public_sends_no_min_tier(pages):
+def test_min_tier_public_widens_to_all_readable(pages):
     _, calls = pages
-    assert main(["--base-url", _BASE, "study", "list", "--include-public"]) == 0
-    assert calls == [{"limit": 100}]
+    assert main(["--base-url", _BASE, "study", "list", "--min-tier", "public"]) == 0
+    assert calls == [{"limit": 100, "min_tier": "public"}]
 
 
 def test_explicit_min_tier_and_query(pages):
@@ -51,11 +51,6 @@ def test_explicit_min_tier_and_query(pages):
     argv = ["--base-url", _BASE, "study", "list", "--min-tier", "member", "--query", "soil"]
     assert main(argv) == 0
     assert calls == [{"limit": 100, "min_tier": "member", "q": "soil"}]
-
-
-def test_include_public_and_min_tier_are_exclusive(pages):
-    with pytest.raises(SystemExit):
-        main(["--base-url", _BASE, "study", "list", "--include-public", "--min-tier", "member"])
 
 
 def test_all_follows_the_cursor_and_merges_pages(pages, capsys):

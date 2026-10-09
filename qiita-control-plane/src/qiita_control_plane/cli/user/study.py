@@ -11,7 +11,6 @@ from qiita_common.models import (
     StudyAccessGrant,
     StudyAccessTierUpdate,
     StudyCreate,
-    Tier,
 )
 
 from .. import _common
@@ -47,14 +46,10 @@ def _list_studies(base_url: str, token: str, args: argparse.Namespace) -> dict:
 
     Defaults to the caller's own and shared studies (min_tier=viewer): on a
     deploy with many public studies, those otherwise bury the handful a
-    person actually works on. --include-public lists everything readable."""
-    params: dict = {"limit": args.limit}
+    person actually works on. --min-tier public lists everything readable."""
+    params: dict = {"limit": args.limit, "min_tier": args.min_tier}
     if args.query:
         params["q"] = args.query
-    if args.min_tier:
-        params["min_tier"] = args.min_tier
-    elif not args.include_public:
-        params["min_tier"] = Tier.VIEWER.value
     if args.after_study_idx is not None:
         params["after_study_idx"] = args.after_study_idx
     studies: list = []

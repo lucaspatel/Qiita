@@ -488,7 +488,7 @@ End-user companion to `qiita-admin`, installed as the `qiita` console script via
 | `whoami` | HTTP | Calls `GET /api/v1/auth/whoami`. |
 | `profile set [--affiliation ... --address ... --phone ... --orcid ... --[no-]receive-processing-emails]` | HTTP | Calls `PATCH /api/v1/user/me` with only the fields the caller actually supplied (matches the server's `exclude_unset` semantics). Used to fill `affiliation`/`address`/`phone` so `qiita.user.profile_complete` flips to true. |
 | `study create --title T [--alias … --description … …]` | HTTP | Calls `POST /api/v1/study`. Caller is always the owner; the `--owner-idx` (lab-tech-on-behalf) path is intentionally not exposed. |
-| `study list [--query Q] [--include-public \| --min-tier T] [--limit N] [--after-study-idx C] [--all]` | HTTP | Calls `GET /api/v1/study`. Defaults to your own and shared studies (`min_tier=viewer`); `--include-public` lists every study you can read (for wet_lab_admin+, every study); `--all` follows the cursor to the end. |
+| `study list [--query Q] [--min-tier T] [--limit N] [--after-study-idx C] [--all]` | HTTP | Calls `GET /api/v1/study`. Defaults to your own and shared studies (`--min-tier viewer`); `--min-tier public` lists every study you can read (for wet_lab_admin+, every study); `--all` follows the cursor to the end. |
 | `study access list --study-idx S` | HTTP | Calls `GET /api/v1/study/{S}/access`. |
 | `study access grant --study-idx S --email E --tier T` | HTTP | Calls `POST /api/v1/study/{S}/access`. `--tier` is `viewer`, `member` or `admin`. |
 | `study access set-tier --study-idx S --principal-idx P --tier T` | HTTP | Calls `PATCH /api/v1/study/{S}/access/{P}`. |

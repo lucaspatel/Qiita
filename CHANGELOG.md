@@ -27,8 +27,8 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   `caller_tier`, why you can read it (`access_via`), and which view of its record
   you get (`record_view`). Filters: full-text `q` (a summary reader matches only the
   summary fields; accessions are searchable), `min_tier` on your own tier, and cursor
-  paging. The CLI defaults to your own and shared studies; `--include-public` widens
-  it. Someone granted access no longer needs to be told a study's idx to find it.
+  paging. The CLI defaults to your own and shared studies; `--min-tier public` widens
+  it to public studies. Someone granted access no longer needs to be told a study's idx to find it.
 - **The branch reviewer is in the repo, and a PR description records its run (#655).**
   `.claude/agents/qiita-reviewer.md` (the rules) and `.claude/skills/qiita-review/` (the
   review, fix, re-review loop) were per-developer files that `CLAUDE.md` already pointed

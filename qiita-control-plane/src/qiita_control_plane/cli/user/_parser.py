@@ -334,19 +334,15 @@ def _build_parser() -> argparse.ArgumentParser:
             " notes and funding where you can read the full record; whole English words"
         ),
     )
-    study_list_scope = p_study_list.add_mutually_exclusive_group()
-    study_list_scope.add_argument(
-        "--include-public",
-        action="store_true",
-        help=(
-            "list every study you can read: also public studies you have no grant on, and"
-            " for wet_lab_admin+ every study (default: only yours and shared)"
-        ),
-    )
-    study_list_scope.add_argument(
+    p_study_list.add_argument(
         "--min-tier",
         choices=tuple(t.value for t in Tier),
-        help="only studies where your own tier is at least this (default: viewer)",
+        default=Tier.VIEWER.value,
+        help=(
+            "only studies where your own tier is at least this (default: viewer, i.e. your"
+            " own and shared studies); public also lists public studies you have no grant"
+            " on, and for wet_lab_admin+ every study"
+        ),
     )
     p_study_list.add_argument("--limit", type=int, default=100, help="page size (max 500)")
     p_study_list.add_argument(
