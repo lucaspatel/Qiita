@@ -74,6 +74,13 @@ _None yet._
   unaffected; a hand-built `barcode_map` that **differs** from the stored pre-flight
   (a matching one is accepted), or any `barcode_map` for a pool created without a
   pre-flight, is refused rather than demultiplexed.
+- **A grant below a study's `default_tier` now gets the study's summary, not 403.**
+  `GET /api/v1/study/{idx}` answers 200 with a `"view": "summary"` body (title, alias,
+  accessions, tiers, `updated_at`) to a caller whose grant is below the study's
+  `default_tier` — a `viewer` on a `member`- or `admin`-default study, or a `member` on
+  an `admin`-default one. Clients that treated that 403 as "restricted" should read
+  `view`. Full records now also carry `"view": "full"`. New: `GET /api/v1/study` lists a
+  caller's readable studies. (#660)
 - **DuckDB 1.5.4 → 1.5.5 everywhere.** (#651)
   - The redeploy's miint stage re-stages miint and httpfs into
     `MIINT_EXTENSION_DIRECTORY/v1.5.5/` by itself: `stage-miint --check` sees the version
