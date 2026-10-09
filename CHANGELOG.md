@@ -2121,6 +2121,10 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **CI pins the Python interpreter to 3.14.** `requires-python` is open-ended
+  (`>=3.14`), so once CPython 3.15.0 was published `uv` began downloading it in
+  CI and `pydantic-core`'s `pyo3` build failed against a Python newer than pyo3
+  supports. Each `astral-sh/setup-uv` step now passes `python-version: "3.14"`.
 - **`ingest_ena_reads` retries an ENA md5 mismatch and a run miint skipped instead of failing permanently (#661).**
   miint documents a transfer truncated on a clean gzip member boundary as indistinguishable
   from a genuinely bad digest and advises bounded retries, so the ticket's `max_retries`
