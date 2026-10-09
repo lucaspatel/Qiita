@@ -196,16 +196,27 @@ def amplicon_samples(conn: sqlite3.Connection) -> list[AmpliconSample]:
     asks for the same accessioned pre-flight the submission does.
 
     RAISES `AmpliconPreflightError` for a non-amplicon sheet, an empty sample set,
-    or a sample with an empty barcode or accession; `ValueError` ("missing
-    required accession") from the accessor for a NULL accession; and
-    `sqlite3.DatabaseError` / `ValueError` for an unreadable pre-flight.
+    or a sample with an empty or NULL barcode or accession — the accessor's
+    "missing required accession" (a NULL accession) is re-raised as this type too,
+    so a pre-flight whose CONTENT cannot supply a roster is one exception kind.
+    `sqlite3.DatabaseError` / `ValueError` still surface for a pre-flight that
+    cannot be READ (an unreadable blob, or `run_sheet_type`'s dependency-drift
+    `ValueError`) — a different failure the caller maps differently.
     """
     from run_preflight.db import SHEET_TYPE_AMPLICON, get_amplicon_sample_info  # noqa: PLC0415
 
     sheet_type = run_sheet_type(conn)
     if sheet_type != SHEET_TYPE_AMPLICON:
         raise AmpliconPreflightError(f"not an amplicon pre-flight (sheet_type {sheet_type!r})")
-    infos = get_amplicon_sample_info(conn)
+    try:
+        infos = get_amplicon_sample_info(conn)
+    except ValueError as exc:
+        # The accessor refuses a NULL accession with "missing required accession".
+        # run_sheet_type already confirmed a readable amplicon sheet above, so a
+        # ValueError here is about the sheet's CONTENT, not its readability —
+        # re-raise it as the pre-flight-content error it is (this class's contract),
+        # so a caller maps it with the other content failures.
+        raise AmpliconPreflightError(str(exc)) from exc
     if not infos:
         raise AmpliconPreflightError(
             "no amplicon_sample rows; a golay-demux submission needs at least"

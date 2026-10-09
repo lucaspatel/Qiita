@@ -2008,9 +2008,10 @@ def _build_parser() -> argparse.ArgumentParser:
             " no-index dummy sheet (every read to Undetermined, the Golay I1 emitted)"
             " and demuxes on the Golay barcode. The per-sample Golay barcode_map is"
             " read from the preflight's amplicon_sample rows and carried in"
-            " action_context. Run + pool are find-or-create and the per-sample roster"
-            " is create-missing, so a re-run after a partial failure converges without"
-            " operator cleanup."
+            " action_context; at run time the runner re-checks it against the"
+            " preflight stored on the pool and fails the ticket if it differs. Run +"
+            " pool are find-or-create and the per-sample roster is create-missing, so a"
+            " re-run after a partial failure converges without operator cleanup."
         ),
     )
     p_submit_golay.add_argument(

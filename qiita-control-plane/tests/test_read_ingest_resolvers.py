@@ -13,6 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import gzip
+import logging
+import sqlite3
+from pathlib import Path
 from types import SimpleNamespace
 
 import duckdb
@@ -22,7 +26,11 @@ from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 
 from qiita_control_plane.auth import tickets
 from qiita_control_plane.auth.tickets import run_signed_flight_call, token_expiry
-from qiita_control_plane.preflight import AmpliconBarcode, amplicon_barcode_from_blob
+from qiita_control_plane.preflight import (
+    AmpliconBarcode,
+    AmpliconPreflightError,
+    amplicon_barcode_from_blob,
+)
 from qiita_control_plane.repositories import INT4_MASK
 from qiita_control_plane.repositories.sequencing_run import (
     POOL_LOCK_WAIT_TIMEOUT_S,
@@ -45,7 +53,16 @@ from qiita_control_plane.runner import (
     _workflow_needs_staged_reads,
     _write_reference_fasta,
 )
-from qiita_control_plane.runner._read_ingest import _barcode_roster_mismatches
+from qiita_control_plane.runner._read_ingest import (
+    _barcode_roster_mismatches,
+    _preflight_barcode_roster,
+)
+from qiita_control_plane.testing.db_seeds import (
+    seed_biosample_with_sequenced_prep_sample,
+    seed_sequenced_sample_subtype,
+)
+
+_AMPLICON_GZ = Path(__file__).resolve().parent / "cli" / "data" / "good_amplicon_v1.sqlite.gz"
 
 
 def _step(**kw) -> SimpleNamespace:
@@ -724,6 +741,204 @@ def test_barcode_roster_mismatches_names_five_and_counts_the_rest():
     problems = _barcode_roster_mismatches([], expected)
     assert problems[:5] == [f"prep_sample_idx {i} is missing from barcode_map" for i in range(1, 6)]
     assert problems[5:] == ["and 4 more"]
+
+
+def test_resolve_barcode_map_pins_each_barcode_to_its_own_sample(
+    monkeypatch, tmp_path, build_amplicon_preflight
+):
+    """The written roster pairs each prep_sample_idx with ITS OWN barcode, checked
+    against the blob's amplicon_sample table read directly -- so a barcode<->sample
+    swap inside `amplicon_samples` (which both sides of the check call, so they would
+    still agree) is caught. The other tests compare the check against itself."""
+    blob_path = build_amplicon_preflight()
+    with sqlite3.connect(blob_path) as truth_conn:
+        truth = {
+            1000 + int(prepped): barcode
+            for prepped, barcode in truth_conn.execute(
+                "SELECT prepped_sample_idx, barcode FROM amplicon_sample"
+            )
+        }
+    blob = blob_path.read_bytes()
+    by_item = amplicon_barcode_from_blob(blob)
+    members = {item_id: 1000 + int(item_id) for item_id in by_item}
+    _pool_with_preflight(monkeypatch, blob, members)
+    roster = [
+        {"prep_sample_idx": members[i], "barcode": b.barcode, "barcodes_are_rc": b.barcodes_are_rc}
+        for i, b in by_item.items()
+    ]
+    out = _resolve(roster, tmp_path)[BARCODE_MAP_BINDING]
+    with duckdb.connect(":memory:") as conn:
+        written = dict(
+            conn.execute(f"SELECT prep_sample_idx, barcode FROM read_parquet('{out}')").fetchall()
+        )
+    assert written
+    for prep_sample_idx, barcode in written.items():
+        assert truth[prep_sample_idx] == barcode
+
+
+def test_resolve_barcode_map_accepts_a_lower_cased_roster(
+    monkeypatch, tmp_path, build_amplicon_preflight
+):
+    """Barcode comparison is case-insensitive: the golay-demux job upper-cases
+    barcodes before decoding, so a lower-cased roster still matches the pre-flight."""
+    roster = _real_pool(monkeypatch, build_amplicon_preflight)
+    for entry in roster:
+        entry["barcode"] = entry["barcode"].lower()
+    out = _resolve(roster, tmp_path)[BARCODE_MAP_BINDING]  # does not raise
+    assert out.exists()
+
+
+def test_resolve_barcode_map_propagates_an_unreadable_blob_error(monkeypatch, tmp_path):
+    """A stored blob that cannot be READ (e.g. written against a newer pre-flight
+    schema than this deployment ships -> ValueError from open_blob) is a deployment
+    fault, not the submitter's bad input: it propagates rather than becoming BAD_INPUT."""
+    _pool_with_preflight(monkeypatch, b"blob", {"1": 5})
+
+    def _raise(_blob):
+        raise ValueError("pre-flight written against a newer schema than this deployment ships")
+
+    monkeypatch.setattr(f"{_READ_INGEST}.amplicon_barcode_from_blob", _raise)
+    roster = [{"prep_sample_idx": 5, "barcode": "ACGT", "barcodes_are_rc": True}]
+    with pytest.raises(ValueError, match="newer schema"):
+        _resolve(roster, tmp_path)
+
+
+def test_resolve_barcode_map_maps_bad_content_to_bad_input(monkeypatch, tmp_path):
+    """An AmpliconPreflightError (the pre-flight's CONTENT cannot supply a roster)
+    IS the submitter's bad input, unlike an unreadable blob."""
+    _pool_with_preflight(monkeypatch, b"blob", {"1": 5})
+
+    def _raise(_blob):
+        raise AmpliconPreflightError("prepped_sample_idx 1 carries no Golay barcode")
+
+    monkeypatch.setattr(f"{_READ_INGEST}.amplicon_barcode_from_blob", _raise)
+    roster = [{"prep_sample_idx": 5, "barcode": "ACGT", "barcodes_are_rc": True}]
+    assert "cannot supply a barcode roster" in _bad_input(roster, tmp_path)
+
+
+def test_resolve_barcode_map_accepts_a_pool_subset_of_the_preflight(
+    monkeypatch, tmp_path, build_amplicon_preflight, caplog
+):
+    """A pool holding only SOME of the pre-flight's samples is accepted (a well may
+    be dropped before pooling); the pre-flight's absent samples are surfaced in the
+    log, not silently ignored."""
+    blob = build_amplicon_preflight().read_bytes()
+    by_item = amplicon_barcode_from_blob(blob)
+    one = next(iter(by_item))
+    members = {one: 1000 + int(one)}  # the pool holds a single sample
+    _pool_with_preflight(monkeypatch, blob, members)
+    roster = [
+        {
+            "prep_sample_idx": members[one],
+            "barcode": by_item[one].barcode,
+            "barcodes_are_rc": by_item[one].barcodes_are_rc,
+        }
+    ]
+    with caplog.at_level(logging.INFO):
+        out = _resolve(roster, tmp_path)[BARCODE_MAP_BINDING]
+    assert out.exists()
+    assert "absent from the pool" in caplog.text
+
+
+def _three_sample_blob(tmp_path) -> bytes:
+    """The committed amplicon pre-flight trimmed to prepped_sample_idx 1-3 with
+    accessions populated, so a three-sample pool can be seeded against it."""
+    db = tmp_path / "preflight.db"
+    db.write_bytes(gzip.decompress(_AMPLICON_GZ.read_bytes()))
+    conn = sqlite3.connect(db)
+    conn.execute("DELETE FROM amplicon_sample WHERE prepped_sample_idx > 3")
+    conn.execute("UPDATE input_sample SET biosample_accession = 'BIO_' || sample_name")
+    conn.execute("UPDATE project SET bioproject_accession = 'PRJNA' || external_project_id")
+    conn.commit()
+    conn.close()
+    return db.read_bytes()
+
+
+async def _seed_amplicon_pool(pool, owner_idx, item_ids, blob):
+    run_idx = pool_idx = None
+    prep_by_item: dict[str, int] = {}
+    for item in item_ids:
+        _bio, prep = await seed_biosample_with_sequenced_prep_sample(pool, owner_idx=owner_idx)
+        run_idx, pool_idx, _ss = await seed_sequenced_sample_subtype(
+            pool,
+            prep_sample_idx=prep,
+            owner_idx=owner_idx,
+            sequenced_pool_item_id=item,
+            sequencing_run_idx=run_idx,
+            sequenced_pool_idx=pool_idx,
+        )
+        prep_by_item[item] = prep
+    await pool.execute(
+        "UPDATE qiita.sequenced_pool SET run_preflight_blob = $1,"
+        " run_preflight_filename = 'preflight.db' WHERE idx = $2",
+        blob,
+        pool_idx,
+    )
+    return run_idx, pool_idx, prep_by_item
+
+
+@pytest.mark.db
+async def test_resolve_barcode_map_over_real_sql_drops_retired_samples(
+    postgres_pool, human_admin_session, tmp_path
+):
+    """End-to-end over the REAL pool SQL (not the monkeypatched reads): the runner's
+    expected roster joins the stored blob to the pool's ACTIVE members, so a retired
+    sample is out of the expected set -- `retire` means the same here as for the CLI.
+    Exercises `_preflight_barcode_roster` + the active-set filter on a seeded pool."""
+    owner = human_admin_session["principal_idx"]
+    blob = _three_sample_blob(tmp_path)
+    run_idx, pool_idx, prep_by_item = await _seed_amplicon_pool(
+        postgres_pool, owner, ["1", "2", "3"], blob
+    )
+
+    async def _resolve_db(roster):
+        return await _resolve_barcode_map(
+            postgres_pool,
+            {BARCODE_MAP_BINDING: roster},
+            tmp_path / "ws",
+            sequencing_run_idx=run_idx,
+            sequenced_pool_idx=pool_idx,
+        )
+
+    async def _bad_input_db(roster) -> str:
+        with pytest.raises(BackendFailure) as exc:
+            await _resolve_db(roster)
+        assert exc.value.kind == FailureKind.BAD_INPUT
+        return exc.value.reason
+
+    expected = await _preflight_barcode_roster(
+        postgres_pool, sequencing_run_idx=run_idx, sequenced_pool_idx=pool_idx
+    )
+    assert set(expected) == set(prep_by_item.values())  # all three active
+    full = [
+        {"prep_sample_idx": p, "barcode": b.barcode, "barcodes_are_rc": b.barcodes_are_rc}
+        for p, b in expected.items()
+    ]
+    await _resolve_db(full)  # matching -> accepted (no raise)
+
+    # Retire sample "3": the active set is now {1, 2} on both sides.
+    await postgres_pool.execute(
+        "UPDATE qiita.prep_sample SET retired = true, retired_at = now(), retired_by_idx = $2"
+        " WHERE idx = $1",
+        prep_by_item["3"],
+        owner,
+    )
+    active = {p for item, p in prep_by_item.items() if item != "3"}
+    expected_active = await _preflight_barcode_roster(
+        postgres_pool, sequencing_run_idx=run_idx, sequenced_pool_idx=pool_idx
+    )
+    assert set(expected_active) == active  # the retired sample is gone
+
+    active_roster = [e for e in full if e["prep_sample_idx"] in active]
+    await _resolve_db(active_roster)  # active-only roster -> accepted
+
+    # A roster that still names the retired sample is refused: it is not in the set.
+    assert (
+        f"prep_sample_idx {prep_by_item['3']} is not a sample of this pool"
+        in await _bad_input_db(full)
+    )
+    # A roster missing an active sample is refused.
+    assert "is missing from barcode_map" in await _bad_input_db(active_roster[:1])
 
 
 # --- SortMeRNA reference FASTA writer ----------------------------------------

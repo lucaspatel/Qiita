@@ -187,7 +187,8 @@ def build_amplicon_preflight(tmp_path):
 
     The amplicon twin of `build_case5_preflight`: ONE builder shared by the ingest
     CLI's reader tests and the server-side `preflight` reader tests (incl. the
-    CLI-vs-route parity pin), so both parse the SAME bytes.
+    CLI-vs-runner parity pin — the runner reads this roster, no route does), so
+    both parse the SAME bytes.
 
     Decompresses the committed migrated preflight (the artifact Qiita-MIINT consumes —
     it never migrates a classic prep template) and populates the biosample + project

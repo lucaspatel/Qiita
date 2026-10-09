@@ -31,7 +31,12 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   orientation. The CLI and the runner validate the pre-flight through one function
   (`preflight.amplicon_samples`), so they refuse the same sheets: not an amplicon
   pre-flight, no samples, or a sample missing its barcode or a required accession.
-  The `barcode_map` input and the workflow version are unchanged.
+  The expected roster is the pool's ACTIVE set (retired and ena_status-flagged
+  samples excluded, as the CLI's roster read does), barcodes compare
+  case-insensitively (the job upper-cases them), and a stored blob that cannot be
+  READ (unreadable, or a newer pre-flight schema than this deployment ships) fails
+  as a deployment error rather than the submitter's bad input. The `barcode_map`
+  input and the workflow version are unchanged.
 - **`qiita biosample get-by-unique-field` / `qiita biosample patch-metadata-by-unique-field`
   reach the by-unique-field surface from the CLI (#639).** Read a study's view of a
   biosample, and upsert this study's metadata on it, naming the sample by a

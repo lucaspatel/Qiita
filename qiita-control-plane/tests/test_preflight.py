@@ -114,9 +114,11 @@ def test_amplicon_samples_refuse_a_non_amplicon_preflight(build_case5_preflight)
 
 def test_amplicon_barcode_raises_on_missing_accession(build_amplicon_preflight):
     """`get_amplicon_sample_info` REQUIRES the accessioned state, so the barcode
-    lookup asks for the same pre-flight the submission does."""
+    lookup asks for the same pre-flight the submission does. The accessor's
+    "missing required accession" is surfaced as `AmpliconPreflightError` (bad
+    pre-flight content), not a bare `ValueError` that "not a SQLite file" also is."""
     blob = build_amplicon_preflight(populate_accessions=False).read_bytes()
-    with pytest.raises(ValueError, match="missing required accession"):
+    with pytest.raises(AmpliconPreflightError, match="missing required accession"):
         amplicon_barcode_from_blob(blob)
 
 

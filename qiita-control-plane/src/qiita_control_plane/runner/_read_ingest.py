@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +20,7 @@ from ..auth.tickets import run_signed_flight_call, sign_action, sign_ticket
 from ..block_read import READ_MASKED_TABLE
 from ..host_filter_resolver import is_control_sample
 from ..miint import connect_with_miint_staged
-from ..preflight import AmpliconBarcode, amplicon_barcode_from_blob
+from ..preflight import AmpliconBarcode, AmpliconPreflightError, amplicon_barcode_from_blob
 from ..repositories.block import MASK_SAMPLE_COMPLETED, fetch_mask_sample_state
 from ..repositories.prep_sample import fetch_biosample_idx_for_prep_sample
 from ..repositories.sequenced_sample import (
@@ -360,7 +359,11 @@ async def _resolve_barcode_map(
     one would route one sample's reads under another's prep_sample_idx with
     nothing downstream to notice. Every field of it is a fact the pre-flight
     blob the pool carries already states, so the runner rebuilds the roster
-    from that blob and refuses a submitted one that differs."""
+    from that blob and refuses a submitted one that differs.
+
+    Deliberately checked here at run time, not at submit (unlike the path
+    cross-checks that answer a synchronous 4xx): the stored blob is read once at
+    materialization, and a redrive re-checks against the pool's current blob."""
     roster = action_context.get(BARCODE_MAP_BINDING)
     if not roster:
         raise _submission_bad_input("golay-demux requires a non-empty barcode_map")
@@ -397,7 +400,13 @@ async def _preflight_barcode_roster(
         )
     try:
         by_item_id = amplicon_barcode_from_blob(bytes(row["run_preflight_blob"]))
-    except (sqlite3.DatabaseError, ValueError) as exc:
+    except AmpliconPreflightError as exc:
+        # Only the pre-flight's CONTENT being unusable for a roster is the
+        # submitter's bad input. A stored blob that cannot be READ at all —
+        # unreadable, or written against a newer pre-flight schema than this
+        # deployment ships (`open_blob` raises `ValueError`), or a dependency-drift
+        # shape error — is a deployment fault: let it propagate (→ 5xx), as the
+        # lane-update route does, rather than blame the submitter for the stored blob.
         raise _submission_bad_input(
             f"golay-demux: sequenced_pool {sequenced_pool_idx}'s stored pre-flight cannot"
             f" supply a barcode roster: {exc}"
@@ -407,14 +416,36 @@ async def _preflight_barcode_roster(
     if unknown:
         raise _submission_bad_input(
             f"golay-demux: sequenced_pool {sequenced_pool_idx} has samples its stored"
-            f" pre-flight does not list (sequenced_pool_item_id {', '.join(unknown[:5])}"
-            + (f" and {len(unknown) - 5} more" if len(unknown) > 5 else "")
+            " pre-flight does not list (sequenced_pool_item_id "
+            + ", ".join(unknown[:_MAX_ROSTER_MISMATCHES_SHOWN])
+            + (
+                f" and {len(unknown) - _MAX_ROSTER_MISMATCHES_SHOWN} more"
+                if len(unknown) > _MAX_ROSTER_MISMATCHES_SHOWN
+                else ""
+            )
             + ")"
+        )
+    # A pool may legitimately hold only SOME of the blob's samples (a well dropped
+    # before pooling), so a blob entry with no pool member is not an error — but
+    # surface it rather than silently ignore, so a pool unexpectedly a subset of its
+    # pre-flight is visible. Those entries are simply not demultiplexed.
+    extra = sorted(item_id for item_id in by_item_id if item_id not in members)
+    if extra:
+        _log.info(
+            "golay-demux: sequenced_pool %s's stored pre-flight lists %d sample(s) absent"
+            " from the pool (sequenced_pool_item_id %s%s); they are not demultiplexed",
+            sequenced_pool_idx,
+            len(extra),
+            ", ".join(extra[:_MAX_ROSTER_MISMATCHES_SHOWN]),
+            f" and {len(extra) - _MAX_ROSTER_MISMATCHES_SHOWN} more"
+            if len(extra) > _MAX_ROSTER_MISMATCHES_SHOWN
+            else "",
         )
     return {prep_sample_idx: by_item_id[item_id] for item_id, prep_sample_idx in members.items()}
 
 
-# How many differences a refused roster names; the rest are counted.
+# How many entries a roster message names before the rest are counted — shared by
+# the mismatch, unknown-sample and absent-from-pool messages.
 _MAX_ROSTER_MISMATCHES_SHOWN = 5
 
 
@@ -435,7 +466,9 @@ def _barcode_roster_mismatches(
         want = expected.get(idx)
         if want is None:
             problems.append(f"prep_sample_idx {idx} is not a sample of this pool")
-        elif entry["barcode"] != want.barcode:
+        elif entry["barcode"].upper() != want.barcode.upper():
+            # Case-insensitive: the golay-demux job upper-cases barcodes before
+            # decoding (jobs/golay_demux.py), so case is not a real difference.
             problems.append(
                 f"prep_sample_idx {idx} has barcode {entry['barcode']!r}, the pre-flight"
                 f" says {want.barcode!r}"
