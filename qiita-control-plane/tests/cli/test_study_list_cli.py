@@ -40,10 +40,10 @@ def test_defaults_to_own_and_shared_studies(pages):
     assert calls == [{"limit": 100, "min_tier": "viewer"}]
 
 
-def test_include_public_sends_no_min_tier(pages):
+def test_min_tier_public_widens_to_all_readable(pages):
     _, calls = pages
-    assert main(["--base-url", _BASE, "study", "list", "--include-public"]) == 0
-    assert calls == [{"limit": 100}]
+    assert main(["--base-url", _BASE, "study", "list", "--min-tier", "public"]) == 0
+    assert calls == [{"limit": 100, "min_tier": "public"}]
 
 
 def test_explicit_min_tier_and_query(pages):
@@ -51,11 +51,6 @@ def test_explicit_min_tier_and_query(pages):
     argv = ["--base-url", _BASE, "study", "list", "--min-tier", "member", "--query", "soil"]
     assert main(argv) == 0
     assert calls == [{"limit": 100, "min_tier": "member", "q": "soil"}]
-
-
-def test_include_public_and_min_tier_are_exclusive(pages):
-    with pytest.raises(SystemExit):
-        main(["--base-url", _BASE, "study", "list", "--include-public", "--min-tier", "member"])
 
 
 def test_all_follows_the_cursor_and_merges_pages(pages, capsys):
@@ -77,3 +72,12 @@ def test_without_all_returns_one_page_and_its_cursor(pages, capsys):
     assert main(["--base-url", _BASE, "study", "list", "--limit", "1"]) == 0
     assert len(calls) == 1
     assert json.loads(capsys.readouterr().out)["next_after_study_idx"] == 9
+
+
+def test_after_study_idx_zero_is_sent_not_dropped(pages):
+    """0 is not a valid cursor; it goes to the server, which refuses it (422),
+    rather than being dropped and the first page returned as if asked for."""
+    _, calls = pages
+    argv = ["--base-url", _BASE, "study", "list", "--after-study-idx", "0"]
+    assert main(argv) == 0  # the fake server answers 200; the real one 422s
+    assert calls == [{"limit": 100, "min_tier": "viewer", "after_study_idx": 0}]

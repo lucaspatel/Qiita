@@ -1,7 +1,7 @@
 """Study create / patch / response models."""
 
 from enum import StrEnum
-from typing import Annotated, ClassVar
+from typing import Annotated, ClassVar, Literal
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
 
@@ -78,14 +78,26 @@ class StudyPatchRequest(PatchRequestModel):
     extra_metadata: dict[str, object] | None = None
 
 
+class StudyRecordView(StrEnum):
+    """How much of a study's record a caller may read (see
+    docs/architecture/data-model.md, "What a tier reads of a study's own
+    record"). No Postgres twin: derived per request."""
+
+    FULL = "full"
+    SUMMARY = "summary"
+
+
 class StudyResponse(BaseModel):
-    """Returned by POST /api/v1/study on success.
+    """Returned by POST /api/v1/study on success, and by GET and PATCH
+    /api/v1/study/{study_idx} to a caller who may read the full record
+    (`view` = full; see `StudyRecordSummary` for the other view).
 
     Mirrors the qiita.study row's caller-visible columns, with the
     generated search_vector and parent_study_idx (not exposed in v1)
     omitted.
     """
 
+    view: Literal[StudyRecordView.FULL] = StudyRecordView.FULL
     study_idx: Annotated[int, Field(gt=0)]
     owner_idx: Annotated[int, Field(gt=0)]
     principal_investigator_idx: int | None
@@ -123,8 +135,9 @@ class StudyAccessVia(StrEnum):
 class StudySummary(BaseModel):
     """One row of GET /api/v1/study — a study the caller may read.
 
-    `caller_tier` is the caller's own tier on the study: their
-    qiita.study_access row, or `public` when they hold none. `access_via`
+    `caller_tier` is the caller's own tier on the study: `admin` for its
+    owner, else their qiita.study_access row, or `public` when they hold none.
+    `access_via`
     says why they can read it, which `caller_tier` alone cannot: a
     wet_lab_admin with no grant and a stranger on a public study both have
     `caller_tier` public.
@@ -138,6 +151,8 @@ class StudySummary(BaseModel):
     default_tier: Tier
     caller_tier: Tier
     access_via: StudyAccessVia
+    # What GET /study/{study_idx} would return this caller.
+    record_view: StudyRecordView
     updated_at: AwareDatetime
 
 
@@ -152,6 +167,21 @@ class StudySummaryListResponse(BaseModel):
 
     studies: list[StudySummary]
     next_after_study_idx: int | None
+
+
+class StudyRecordSummary(BaseModel):
+    """GET /api/v1/study/{study_idx} for a caller who may read only the
+    study's summary: a grant below the study's default_tier. The full record
+    is `StudyResponse`; `view` tells the two apart."""
+
+    view: Literal[StudyRecordView.SUMMARY] = StudyRecordView.SUMMARY
+    study_idx: Annotated[int, Field(gt=0)]
+    title: str
+    alias: str | None
+    bioproject_accession: str | None
+    ena_study_accession: str | None
+    default_tier: Tier
+    updated_at: AwareDatetime
 
 
 def _reject_public_tier(tier: Tier) -> Tier:
