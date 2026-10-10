@@ -68,6 +68,12 @@ _None yet._
 
 ### Notes (no host action)
 
+- **`amplicon` 1.1.0 replaces 1.0.0.** The deploy's action sync loads it and
+  auto-deprecates 1.0.0, so new amplicon submissions must name 1.1.0 and pass only
+  `sortmerna_reference_idx` and `trim`; a context still carrying `primer` or
+  `orient_primer` is refused. A disabled version cannot run, so any 1.0.0 amplicon
+  ticket still pending, in flight, or failed and awaiting `/run` at deploy time
+  becomes unrunnable (it fails, or its redrive is refused): resubmit it as 1.1.0.
 - **A golay-demux ticket now fails (bad input) when its `barcode_map` disagrees with the
   pool's stored run pre-flight, or the pool stores none (#657).** Pools ingested with
   `qiita submit-golay-demux` carry their pre-flight, so a normal submission is

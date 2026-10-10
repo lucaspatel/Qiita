@@ -101,10 +101,11 @@ def _build_processing_params(
         "assembler": bound.get(ASSEMBLER_BINDING) or assembler_default,
     }
     # amplicon knobs, gated on `trim` (amplicon-required, assembly never binds it) so
-    # they never enter an assembly identity. orient_primer's default (off) is applied
-    # here, and primer is hashed ONLY when orienting — otherwise it's a no-op knob
-    # (`_set_session_vars` ignores it) and an omitted-vs-explicit primer must not
-    # split the identity.
+    # they never enter an assembly identity. orient_primer / primer are bound only by
+    # workflow 1.0.0, where primer is hashed ONLY when orienting (otherwise it is a
+    # no-op knob, and an omitted-vs-explicit primer must not split the identity).
+    # 1.1.0 binds neither and hashes orient_primer off, the shape of an un-oriented
+    # 1.0.0 run.
     if bound.get("trim") is not None:
         orient = bool(bound.get("orient_primer"))
         candidates["trim"] = bound.get("trim")

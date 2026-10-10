@@ -347,18 +347,14 @@ def test_probe_script_checks_miint_host_filter_functions():
 
 def test_probe_script_checks_amplicon_functions():
     """The probe asserts the amplicon deblur functions (align_sortmerna_rrna,
-    detect_chimera_uchime_denovo, align_mafft, deblur, sequence_dna_as_regexp) are
-    registered in the staged miint build — the newest deploy dependency, so a stale
-    build missing one surfaces at deploy, not at the first amplicon submit."""
+    detect_chimera_uchime_denovo, align_mafft, deblur) are registered in the staged
+    miint build — the newest deploy dependency, so a stale build missing one
+    surfaces at deploy, not at the first amplicon submit."""
     script = cr.build_probe_script(path_scratch="/scratch/qiita")
-    for fn in (
-        "align_sortmerna_rrna",
-        "detect_chimera_uchime_denovo",
-        "align_mafft",
-        "deblur",
-        "sequence_dna_as_regexp",
-    ):
+    for fn in ("align_sortmerna_rrna", "detect_chimera_uchime_denovo", "align_mafft", "deblur"):
         assert fn in script
+    # The denoise step no longer orients reads, so the orient regex is not a dependency.
+    assert "sequence_dna_as_regexp" not in script
     assert "miint-amplicon-fns=ok" in script
     assert "miint-amplicon-fns=fail" in script
 

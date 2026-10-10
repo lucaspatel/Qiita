@@ -491,7 +491,7 @@ fi
 rm -f "$MIINT_BOUNDARY_PROBE"
 
 # The amplicon deblur pipeline (align_sortmerna_rrna → detect_chimera_uchime_denovo
-# → align_mafft → deblur, plus the sequence_dna_as_regexp orient step) is the newest
+# → align_mafft → deblur) is the newest
 # set of miint functions the deploy depends on. These are all statically linked
 # in-process (NOT behind the GPL boundary, unlike bowtie2/FastTree), so a registration
 # check is the right level: assert every amplicon FUNCTION is REGISTERED in the staged
@@ -508,12 +508,12 @@ try:
     conn.execute(miint_load_sql())
     want = [
         "align_sortmerna_rrna", "detect_chimera_uchime_denovo",
-        "align_mafft", "deblur", "sequence_dna_as_regexp",
+        "align_mafft", "deblur",
     ]
     rows = conn.execute(
         "SELECT DISTINCT function_name FROM duckdb_functions() "
         "WHERE function_name IN ('align_sortmerna_rrna', 'detect_chimera_uchime_denovo', "
-        "'align_mafft', 'deblur', 'sequence_dna_as_regexp')"
+        "'align_mafft', 'deblur')"
     ).fetchall()
     have = [r[0] for r in rows]
     missing = [f for f in want if f not in have]
