@@ -44,6 +44,7 @@ from qiita_common.api_paths import (
     URL_WORK_TICKET_STEP_LOGS,
 )
 from qiita_common.auth_constants import BEARER_PREFIX
+from run_preflight.db import PlatformSampleInfo
 
 from qiita_control_plane.cli.user import main
 
@@ -2446,7 +2447,13 @@ def preflight_stub(monkeypatch, tmp_path):
 
             stub_module.get_illumina_sample_info = _get
         else:
-            stub_module.get_illumina_sample_info = lambda _conn: list(captured_rows)
+            # The library's own record type, so the reader is pinned to the real
+            # contract (a 4-tuple stub once hid a crash on its 6 fields).
+            records = [
+                PlatformSampleInfo(idx, "standard", biosample, primary, list(secondary), None)
+                for idx, biosample, primary, secondary in captured_rows
+            ]
+            stub_module.get_illumina_sample_info = lambda _conn: list(records)
         monkeypatch.setitem(sys.modules, "run_preflight", stub_module)
         return blob
 

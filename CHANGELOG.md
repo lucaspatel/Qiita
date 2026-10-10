@@ -2137,6 +2137,12 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **`submit-bcl-convert` no longer crashes reading a real pre-flight.** The reader
+  unpacked each `PlatformSampleInfo` as four values; the library returns more, so
+  every real pre-flight failed with "too many values to unpack". It reads the
+  record's fields by name, and the CLI tests stub the library's own record type.
+
+
 - **CI pins the Python interpreter to 3.14.** `requires-python` is open-ended
   (`>=3.14`), so once CPython 3.15.0 was published `uv` began downloading it in
   CI and `pydantic-core`'s `pyo3` build failed against a Python newer than pyo3

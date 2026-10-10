@@ -142,7 +142,11 @@ def _read_preflight_rows(
         )
 
     parsed: list[_PreflightRow] = []
-    for illumina_sample_idx, biosample_accession, primary, secondary in illumina_samples:
+    for info in illumina_samples:
+        illumina_sample_idx = info.sample_idx
+        biosample_accession = info.biosample_accession
+        primary = info.primary_bioproject_accession
+        secondary = info.secondary_bioproject_accessions
         if not biosample_accession:
             parser.error(
                 f"--preflight-blob {preflight_blob}: illumina_sample_idx"
