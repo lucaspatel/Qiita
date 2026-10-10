@@ -21,6 +21,7 @@ from pathlib import Path
 
 import duckdb
 from pydantic import BaseModel
+from qiita_common.amplicon_constants import AMPLICON_MEMBERSHIP_BASENAME
 from qiita_common.parquet import validate_parquet_path
 
 from ..miint import (
@@ -75,7 +76,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     workspace.mkdir(parents=True, exist_ok=True)
     staging = workspace / "amplicon_staging"
     staging.mkdir(parents=True, exist_ok=True)
-    membership_out = validate_parquet_path(staging / "amplicon_membership.parquet")
+    membership_out = validate_parquet_path(staging / AMPLICON_MEMBERSHIP_BASENAME)
     sequences_out = validate_parquet_path(staging / "amplicon_sequence.parquet")
     chunks_dir = staging / "amplicon_sequence_chunks"
 

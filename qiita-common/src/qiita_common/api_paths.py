@@ -236,6 +236,11 @@ class LibraryPrimitive(StrEnum):
     # runner keys its de novo alignment resolver off. See
     # qiita_control_plane.actions.library.finalize_alignment_sample_gate.
     FINALIZE_ALIGNMENT_SAMPLE = "finalize-alignment-sample"
+    # Amplicon: mint the public QM identifier of every processed sample the run's
+    # staged amplicon_membership names, as the ticket's originator. Runs after
+    # register-files, so an identifier never names data that did not land. See
+    # qiita_control_plane.actions.library.mint_amplicon_identifiers.
+    MINT_AMPLICON_IDENTIFIERS = "mint-amplicon-identifiers"
 
 
 # =============================================================================
@@ -610,6 +615,20 @@ URL_ASSEMBLY_GENOME_MAP_PARQUET = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_GENOME_M
 URL_ASSEMBLY_MEMBERSHIP = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_MEMBERSHIP}"
 URL_ASSEMBLY_MEMBERSHIP_PARQUET = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_MEMBERSHIP_PARQUET}"
 URL_ASSEMBLY_PREP_SAMPLE = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_PREP_SAMPLE}"
+
+
+# =============================================================================
+# /amplicon/* — an amplicon run's feature table
+# =============================================================================
+# Keyed on the run's processing_idx, the identity a completed amplicon ticket
+# minted. The table itself is labelled only with public handles: ASV sequences
+# for rows, the samples' QM identifiers (minted at load) for columns.
+
+PATH_AMPLICON_PREFIX = "/amplicon"
+PATH_AMPLICON_FEATURE_TABLE = "/{processing_idx}/feature-table"
+
+URL_AMPLICON_PREFIX = f"{API_PREFIX}{PATH_AMPLICON_PREFIX}"
+URL_AMPLICON_FEATURE_TABLE = f"{URL_AMPLICON_PREFIX}{PATH_AMPLICON_FEATURE_TABLE}"
 
 
 # =============================================================================

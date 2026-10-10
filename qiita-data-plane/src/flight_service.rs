@@ -357,6 +357,15 @@ const ALLOWED_TABLES: &[&str] = &[
     // the MINTED namespace, which is the join into the shared feature space this
     // table cannot make.
     "bin_quality",
+    // One amplicon run's ASVs over a cohort, for the amplicon feature table. 16S
+    // amplicon output, not host sequence and not reads: per-sample ASV counts, and
+    // the ASV bytes themselves. Every form is scoped to exactly one run
+    // (`processing_idx`) over a non-empty `prep_sample_idx` set and nothing else
+    // (`build_amplicon_run_query`); the sequence tables carry no prep_sample_idx, so
+    // their scope resolves through `amplicon_membership`.
+    "amplicon_membership",
+    "amplicon_sequence",
+    "amplicon_sequence_chunks",
 ];
 
 /// Allowed column names for filter clauses. All identifier columns that can
@@ -3661,6 +3670,14 @@ fn is_bin_quality_surface(table: &str) -> bool {
     table == "bin_quality"
 }
 
+/// The DoGet surfaces whose scope is one amplicon RUN over a cohort.
+fn is_amplicon_run_surface(table: &str) -> bool {
+    matches!(
+        table,
+        "amplicon_membership" | "amplicon_sequence" | "amplicon_sequence_chunks"
+    )
+}
+
 /// Build a SQL query for the given table and filter.
 ///
 /// SQL injection defense model:
@@ -3714,6 +3731,12 @@ fn build_query(
     // Scoped by a run it carries itself, and refused outright without one.
     if is_bin_quality_surface(table) {
         return build_bin_quality_query(filter);
+    }
+
+    // One amplicon run over a cohort; the sequence tables resolve it through
+    // membership.
+    if is_amplicon_run_surface(table) {
+        return build_amplicon_run_query(table, filter);
     }
 
     if filter.is_empty() {
@@ -3948,6 +3971,44 @@ fn build_bin_quality_query(filter: &auth::TicketFilter) -> Result<(String, Strin
         ),
         full_table,
     ))
+}
+
+/// Build the run-scoped SELECT for an amplicon surface.
+///
+/// Exactly one `processing_idx`, a non-empty `prep_sample_idx` set, and nothing
+/// else — the same two-halves rule as `build_bin_quality_query`, for the same
+/// reason: either half alone widens past the run. `amplicon_membership` carries
+/// both columns; the ASV sequence tables are keyed by the content-deduped
+/// `feature_idx` an ASV shares with every run that found it, so "this run's ASVs"
+/// is read from membership, as `build_assembly_run_query` reads contigs.
+fn build_amplicon_run_query(
+    table: &str,
+    filter: &auth::TicketFilter,
+) -> Result<(String, String), Status> {
+    let processing_idx = single_i64_filter(filter, "processing_idx")?;
+    let prep_sample_idx = i64_list_filter(filter, "prep_sample_idx")?;
+    if filter.len() != 2 {
+        return Err(Status::invalid_argument(format!(
+            "{table} accepts only prep_sample_idx and processing_idx, got {} columns",
+            filter.len()
+        )));
+    }
+    let full_table = format!("qiita_lake.{table}");
+    let preps = prep_sample_idx
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let run_scope = format!("processing_idx = {processing_idx} AND prep_sample_idx IN ({preps})");
+    let sql = if table == "amplicon_membership" {
+        format!("SELECT * FROM {full_table} WHERE {run_scope}")
+    } else {
+        format!(
+            "SELECT * FROM {full_table} WHERE feature_idx IN (\
+             SELECT feature_idx FROM qiita_lake.amplicon_membership WHERE {run_scope})"
+        )
+    };
+    Ok((sql, full_table))
 }
 
 /// Build the SELECT for a block-read DoGet (`read_block` / `read_masked_block`).
