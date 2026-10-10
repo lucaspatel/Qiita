@@ -8,6 +8,7 @@ from qiita_common.models import HealthResponse, HealthStatus
 
 from .backend import ComputeBackend
 from .backends.local import LocalBackend
+from .backends.local_container import DockerRuntime
 from .backends.slurm import SlurmBackend
 from .config import BACKEND_LOCAL, BACKEND_SLURM, Settings, install_settings
 from .jobs import scan_native_jobs
@@ -20,7 +21,7 @@ _log = logging.getLogger(__name__)
 
 def _build_backend(settings: Settings) -> ComputeBackend:
     if settings.backend_type == BACKEND_LOCAL:
-        return LocalBackend()
+        return LocalBackend(container_runtime=DockerRuntime.from_env())
     if settings.backend_type == BACKEND_SLURM:
         if settings.slurm is None:
             # config.from_env() refuses to construct Settings with

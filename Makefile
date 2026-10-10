@@ -1,4 +1,4 @@
-.PHONY: build test test-python test-rust test-integration test-workflows lint lint-python lint-rust deploy migrate sync-actions clean verify-health verify-deploy preflight redeploy lake-shell dev-setup install-hooks
+.PHONY: build test test-python test-rust test-integration test-workflows lint lint-python lint-rust deploy migrate sync-actions clean verify-health verify-deploy preflight redeploy lake-shell dev-setup install-hooks local-up local-down local-status
 .PHONY: build-common build-control-plane build-data-plane build-data-plane-debug build-compute-orchestrator build-integration build-workflows
 .PHONY: test-common test-control-plane-without-db test-control-plane-with-db test-data-plane test-compute-orchestrator
 .PHONY: lint-common lint-control-plane lint-data-plane lint-compute-orchestrator
@@ -313,6 +313,17 @@ redeploy:
 # group-reads the operator already grants. `bash scripts/lake-shell.sh --help`.
 lake-shell:
 	@bash scripts/lake-shell.sh
+
+# A whole stack on this machine (own Postgres container, DP + CP + CO on the
+# local backend). See docs/runbooks/local-stack.md.
+local-up: build-data-plane-debug build-control-plane build-compute-orchestrator $(DBMATE_BIN)
+	@bash scripts/local-stack.sh up
+
+local-down:
+	@bash scripts/local-stack.sh down
+
+local-status:
+	@bash scripts/local-stack.sh status
 
 # Check developer tool prerequisites and print install instructions only for missing ones
 dev-setup:

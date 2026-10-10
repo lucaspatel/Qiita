@@ -37,11 +37,15 @@ _None yet._
 
 ### 3. Migrations
 
-_None yet._
+- `[operator]` `make migrate` applies `work_ticket_follow_on` (follow-on columns on
+  `qiita.work_ticket`) and `exported_identifier_processing` (amplicon QM identifiers).
+  Both are additive; no out-of-band step.
 
 ### 4. Deploy
 
-_None yet._
+- `[operator]` The actions sync registers **`amplicon` 1.1.0** (1.0.0 stays registered):
+  it adds the `mint-amplicon-identifiers` tail step. Submit amplicon runs against 1.1.0
+  so their samples get QM identifiers and their feature table is servable.
 
 ### 5. Verify
 

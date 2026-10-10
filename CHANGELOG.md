@@ -21,6 +21,13 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **A local stack: `make local-up`.** A private Postgres container, the data
+  plane, control plane and orchestrator on its local backend, rooted under
+  `~/.qiita-local/stack`, with a local-only admin and compute token bootstrap
+  (docs/runbooks/local-stack.md). The local backend now runs `container:` steps
+  under Docker when `LOCAL_CONTAINER_IMAGES` maps their SIF to a local image,
+  following the same container contract as apptainer.
+
 - **Amplicon samples get their public QM identifiers when a run loads.**
   `exported_identifier` gains its second processing kind, a `qiita.processing`
   run, and amplicon 1.1.0 ends with `mint-amplicon-identifiers`, which mints one
@@ -2172,6 +2179,12 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
     yet parse stays recoverable without a re-ingest.
 
 ### Fixed
+
+- **bcl-convert 4.x accepts the amplicon dummy sample sheet.** It refuses
+  `CreateFastqForIndexReads` on a sheet with no index, so every amplicon run failed
+  at bcl_convert. The sheet now declares the Golay read as a 12-cycle index and one
+  placeholder sample whose index (`AAAAAAAAAAAA`) is beyond the Golay decoder's
+  correctable radius, so every decodable read still reaches Undetermined with its I1.
 
 - **The amplicon dummy sample sheet follows RunInfo.xml's read order.**
   bcl-convert reads `OverrideCycles` segments in the order RunInfo.xml lists the
