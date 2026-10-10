@@ -33,6 +33,7 @@ from .dispatch import (
     reconcile_inflight_tickets,
 )
 from .ena_import.batch import build_ena_import_study_semaphore, reconcile_inflight_batches
+from .follow_on import reconcile_follow_ons
 from .health import aggregate_health
 from .landing import router as landing_router
 from .notify import build_transport, run_sweeper
@@ -93,6 +94,10 @@ async def lifespan(app: FastAPI):
     # the first route, or in the fan-out pump where a raise strands a released
     # ticket that no later pump counts.
     dispatch_semaphore(app)
+    # Submit the follow-on of any ticket that completed with no hook to see it.
+    # Before the re-attach below, so no live completion hook holds a claim the
+    # reconcile resets (see follow_on).
+    await reconcile_follow_ons(app)
     # Re-attach any tickets left in non-terminal state by a previous CP
     # process — they have no live owner. Resumed in-place (re-attach to a
     # live SLURM job, finalize one that finished while we were down, or fail

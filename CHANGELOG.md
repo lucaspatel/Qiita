@@ -21,6 +21,15 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **A work ticket can carry a follow-on (`on_success`).** `POST /work-ticket`
+  accepts an `on_success` action and context; when the ticket completes, the
+  control plane submits it as the same user on the same scope target. The
+  follow-on is checked against its own action when the parent is submitted, so one
+  that could never run is refused up front (`"on_success was refused"`). The
+  created ticket's idx, or the reason a submission at completion was refused, is
+  recorded on the parent (`follow_on_work_ticket_idx` / `follow_on_error`). A
+  restart re-drives any follow-on left without an outcome. Human callers only.
+
 - **`POST /biosample/resolve-roster` resolves a pool roster by matrix tube or
   accession.** One call takes every pool row (a matrix tube, or biosample and
   bioproject accessions) and returns each row's `biosample_idx` with its primary
