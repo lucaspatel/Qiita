@@ -274,6 +274,27 @@ def test_read_run_reads_rejects_missing_reads(tmp_path):
         read_run_reads(bcl_input_dir)
 
 
+def test_build_amplicon_dummy_sample_sheet_follows_runinfo_read_order():
+    """bcl-convert reads OverrideCycles segments in RunInfo.xml order. A run that
+    lists its index reads first (as MiSeq i100 RunInfo.xml files do) must mask
+    those leading segments, not the first template read."""
+    reads = (
+        IlluminaRead(12, True),
+        IlluminaRead(8, True),
+        IlluminaRead(151, False),
+        IlluminaRead(151, False),
+    )
+    sheet = build_amplicon_dummy_sample_sheet(reads, "run_SMPL1")
+    assert "OverrideCycles,N12;N8;Y151;Y151" in sheet
+
+
+def test_build_amplicon_dummy_sample_sheet_keeps_unequal_template_lengths():
+    reads = (IlluminaRead(151, False), IlluminaRead(12, True), IlluminaRead(101, False))
+    sheet = build_amplicon_dummy_sample_sheet(reads, "run_SMPL1")
+    assert "OverrideCycles,Y151;N12;Y101" in sheet
+    assert "[Reads]\n151\n101\n" in sheet
+
+
 def test_build_amplicon_dummy_sample_sheet_mirrors_spp():
     reads = (IlluminaRead(151, False), IlluminaRead(12, True), IlluminaRead(151, False))
     sheet = build_amplicon_dummy_sample_sheet(reads, "run_SMPL1")

@@ -140,9 +140,10 @@ def build_amplicon_dummy_sample_sheet(reads: tuple[IlluminaRead, ...], sample_id
 
     Mirrors qp-knight-lab-processing's ``generate_dummy_sample_sheet``: one
     placeholder sample with empty indices (so every read lands in Undetermined),
-    the two template reads' cycle counts, and OverrideCycles that mask the index
-    cycles while ``CreateFastqForIndexReads`` still emits them as a FASTQ, which is
-    what carries the in-index Golay barcode out to golay_demux.
+    the two template reads' cycle counts, and OverrideCycles (in RunInfo.xml read
+    order) that mask the index cycles while ``CreateFastqForIndexReads`` still
+    emits them as a FASTQ, which is what carries the in-index Golay barcode out
+    to golay_demux.
     """
     template = [r for r in reads if not r.is_indexed]
     index = [r for r in reads if r.is_indexed]
@@ -150,9 +151,9 @@ def build_amplicon_dummy_sample_sheet(reads: tuple[IlluminaRead, ...], sample_id
         raise ValueError(
             f"expected 2 template reads and 1-2 index reads, got {len(template)} and {len(index)}"
         )
-    non_index_cycles = template[0].num_cycles
-    masked = ";".join(f"N{r.num_cycles}" for r in index)
-    override_cycles = f"Y{non_index_cycles};{masked};Y{non_index_cycles}"
+    # bcl-convert reads OverrideCycles segments in RunInfo.xml read order, which
+    # is not always R1/I1/I2/R2 (MiSeq i100 lists its index reads first).
+    override_cycles = ";".join(f"{'N' if r.is_indexed else 'Y'}{r.num_cycles}" for r in reads)
     lines = [
         "[Header]",
         "IEMFileVersion,4",
@@ -160,8 +161,8 @@ def build_amplicon_dummy_sample_sheet(reads: tuple[IlluminaRead, ...], sample_id
         "Application,FASTQ Only",
         "",
         "[Reads]",
-        str(non_index_cycles),
-        str(non_index_cycles),
+        str(template[0].num_cycles),
+        str(template[1].num_cycles),
         "",
         "[Settings]",
         f"OverrideCycles,{override_cycles}",
