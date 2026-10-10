@@ -42,6 +42,12 @@ see [`getting-started.md`](getting-started.md).
   one differs in any sample, barcode or orientation, or if the pool stores no
   preflight to check against; it then materializes it to a parquet (the
   orchestrator has no DB access). Loads per-sample reads into `read`.
+- A pre-flight built straight from the pre-prep sheet identifies each sample by
+  its matrix tube and carries no accessions; the submit accepts it. Each tube must
+  belong to a registered biosample (`biosample create --matrix-tube-id`, or
+  `biosample patch --matrix-tube-id` on an existing one) in exactly one study (or the row names the
+  study's bioproject accession), and a tube may appear only once per sheet.
+  Secondary projects on a shared plate still need their bioproject accessions.
 
 ## Submit amplicon (denoise)
 

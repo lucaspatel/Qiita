@@ -154,6 +154,7 @@ def _resolve_roster(
     *,
     pool_item_id: Callable[[Any], str],
     row_label: Callable[[Any], str],
+    row_tube: Callable[[Any], str | None],
 ) -> dict[str, RosterResolvedRow]:
     """Resolve every preflight row to its biosample and studies in one
     `POST /biosample/resolve-roster` call, keyed by pool item id. The route owns
@@ -165,6 +166,7 @@ def _resolve_roster(
         rows=[
             RosterResolveRow(
                 item_id=pool_item_id(row),
+                matrix_tube_id=row_tube(row),
                 biosample_accession=row.biosample_accession,
                 primary_project_accession=row.primary_project_accession,
                 secondary_project_accessions=list(row.secondary_project_accessions),
@@ -238,6 +240,7 @@ def _provision_run_pool_roster(
     prep_protocol_idx: int,
     pool_item_id: Callable[[Any], str],
     row_label: Callable[[Any], str],
+    row_tube: Callable[[Any], str | None] = lambda _row: None,
 ) -> _RunPoolProvision:
     """Shared run → pool → sequenced-sample provisioning for the bundled submit
     gestures.
@@ -247,9 +250,10 @@ def _provision_run_pool_roster(
     afterwards. Everything in between — resolve the caller's principal, resolve +
     fail-fast on the roster (`_resolve_roster`), POST the run, POST the pool, and
     populate the per-sample roster — is identical, so it lives here once. The
-    caller parameterizes the per-row `pool_item_id` (e.g. illumina_sample_idx) and
-    the `row_label` for the unresolved-row report, and builds its own summary +
-    ticket tail from the returned roster.
+    caller parameterizes the per-row `pool_item_id` (e.g. illumina_sample_idx), the
+    `row_label` for the unresolved-row report and, for a sheet that identifies
+    samples by matrix tube, `row_tube`; it builds its own summary + ticket tail
+    from the returned roster.
 
     Roster creation is CREATE-MISSING, not blind-create: it GETs the pool roster
     first and reuses samples already present, POSTing only the absent ones. So a
@@ -267,7 +271,12 @@ def _provision_run_pool_roster(
     # Resolve every row before any side effect, so a fixable preflight leaves
     # nothing behind.
     resolution = _resolve_roster(
-        base_url, token, preflight_rows, pool_item_id=pool_item_id, row_label=row_label
+        base_url,
+        token,
+        preflight_rows,
+        pool_item_id=pool_item_id,
+        row_label=row_label,
+        row_tube=row_tube,
     )
 
     run_resp, run_status = _common.call_with_status(

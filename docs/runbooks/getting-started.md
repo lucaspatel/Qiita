@@ -12,9 +12,11 @@ account, hand the last step to someone who does.
 
 **Do the steps in order.** The submit reads a **pre-flight file** — the sheet
 describing your run — and for every row in it looks up a biosample and a study that
-must already be in Qiita. It matches them on accessions, and if it cannot find
-one it tells you which and stops without creating anything. So the study comes
-first, then its biosamples, then a pre-flight file naming both by accession, then
+must already be in Qiita. It matches them on accessions (an amplicon sheet may
+instead identify a sample by its matrix tube; see
+[`amplicon-ingest.md`](amplicon-ingest.md)), and if it cannot find one it tells
+you which and stops without creating anything. So the study comes
+first, then its biosamples, then a pre-flight file naming both, then
 the submit.
 
 You build the pre-flight file yourself, outside Qiita (step 4).

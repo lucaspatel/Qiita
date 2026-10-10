@@ -49,16 +49,18 @@ class _AmpliconPreflightRow(NamedTuple):
     `sequenced_pool_item_id`. `barcode` + `barcodes_are_rc` are the Golay roster the
     demux job matches each read's index against; `barcodes_are_rc` is per-sample
     provenance (whether the stored barcode is the reverse complement of the read
-    index). The project accessions are ENA **bioproject** accessions that
-    resolve-roster resolves, matching the Illumina/PacBio rows;
-    `secondary_project_accessions` is populated for controls.
+    index). `matrix_tube_id`, when present, identifies the sample on its own and
+    the accessions are optional cross-checks; otherwise the ENA **bioproject**
+    accessions identify it, as on the Illumina/PacBio rows. resolve-roster
+    resolves either. `secondary_project_accessions` is populated for controls.
     """
 
     prepped_sample_idx: int
     barcode: str
     barcodes_are_rc: bool
-    biosample_accession: str
-    primary_project_accession: str
+    matrix_tube_id: str | None
+    biosample_accession: str | None
+    primary_project_accession: str | None
     secondary_project_accessions: list[str]
 
 
@@ -70,9 +72,9 @@ def _read_amplicon_preflight_rows(
     Validation is `preflight.amplicon_samples`, the same check the runner applies
     to the pool's stored blob, so a sheet the CLI accepts is one the runner
     accepts. Every refusal (not a SQLite, not an amplicon sheet, no samples, a
-    missing barcode or accession) raises via parser.error so the CLI surfaces one
-    stderr line and exits 2 before any network call — matching
-    `pool.py::_read_preflight_rows`.
+    missing barcode, a sample with neither a tube nor its accessions) raises via
+    parser.error so the CLI surfaces one stderr line and exits 2 before any
+    network call — matching `pool.py::_read_preflight_rows`.
     """
     from run_preflight import load_file  # noqa: PLC0415
 
@@ -100,6 +102,7 @@ def _read_amplicon_preflight_rows(
             prepped_sample_idx=sample.prepped_sample_idx,
             barcode=sample.barcode,
             barcodes_are_rc=sample.barcodes_are_rc,
+            matrix_tube_id=sample.matrix_tube_id,
             biosample_accession=sample.biosample_accession,
             primary_project_accession=sample.primary_bioproject_accession,
             secondary_project_accessions=list(sample.secondary_bioproject_accessions),
@@ -168,6 +171,7 @@ def _handle_submit_golay_demux(args: argparse.Namespace, parser: argparse.Argume
             prep_protocol_idx=args.prep_protocol_idx,
             pool_item_id=lambda row: str(row.prepped_sample_idx),
             row_label=lambda row: f"prepped_sample_idx={row.prepped_sample_idx}",
+            row_tube=lambda row: row.matrix_tube_id,
         )
         sequencing_run_idx = provision.sequencing_run_idx
         sequenced_pool_idx = provision.sequenced_pool_idx
@@ -185,6 +189,7 @@ def _handle_submit_golay_demux(args: argparse.Namespace, parser: argparse.Argume
         per_sample_results = [
             {
                 "prepped_sample_idx": s.row.prepped_sample_idx,
+                "matrix_tube_id": s.row.matrix_tube_id,
                 "biosample_accession": s.row.biosample_accession,
                 "biosample_idx": s.biosample_idx,
                 "primary_study_idx": s.primary_study_idx,

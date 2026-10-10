@@ -715,7 +715,7 @@ def test_resolve_barcode_map_needs_the_pools_preflight(monkeypatch, tmp_path):
 def test_resolve_barcode_map_refuses_a_preflight_the_cli_would_refuse(
     monkeypatch, tmp_path, build_amplicon_preflight
 ):
-    blob = build_amplicon_preflight(populate_accessions=False).read_bytes()
+    blob = build_amplicon_preflight(populate_accessions=False, clear_tubes=True).read_bytes()
     _pool_with_preflight(monkeypatch, blob, {"1": 5})
     roster = [{"prep_sample_idx": 5, "barcode": "ACGT", "barcodes_are_rc": True}]
     assert "cannot supply a barcode roster" in _bad_input(roster, tmp_path)

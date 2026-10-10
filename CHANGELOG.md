@@ -38,6 +38,11 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   of the two lookups, so their unresolved-row report lists each row and its
   problem rather than grouping the missing accessions, and they need a control
   plane that serves the route.
+- **`submit-golay-demux` accepts a pre-flight identified by matrix tube.** A
+  pre-flight built straight from the pre-prep sheet carries each sample's tube and
+  no accessions. The CLI now sends each sample's tube to `resolve-roster`, and the
+  runner's barcode-roster check accepts the same sheets. run-preflight is bumped
+  to the commit that adds `accept_tube_identity`.
 
 - **golay-demux checks its submitted barcode roster against the pool's stored
   pre-flight (#657).** The CLI builds `barcode_map` client-side; a transposed roster
