@@ -28,6 +28,7 @@ from qiita_common.models import (
     SequencedPoolCreateRequest,
     SequencingRunCreateRequest,
     WorkTicketCreateRequest,
+    WorkTicketFollowOn,
 )
 
 from ...preflight import AmpliconPreflightError, amplicon_samples
@@ -39,6 +40,10 @@ from .pool import _provision_run_pool_roster
 # in lockstep with workflows/golay-demux/1.0.0.yaml.
 _GOLAY_DEMUX_ACTION_ID = "golay-demux"
 _GOLAY_DEMUX_ACTION_VERSION = "1.0.0"
+# The denoise run a golay-demux submit can queue to follow it (`--denoise-*`);
+# pinned like the golay-demux pair above, to workflows/amplicon/<version>.yaml.
+_AMPLICON_ACTION_ID = "amplicon"
+_AMPLICON_ACTION_VERSION = "1.0.0"
 
 
 class _AmpliconPreflightRow(NamedTuple):
@@ -108,6 +113,27 @@ def _read_amplicon_preflight_rows(
     ]
 
 
+def _denoise_follow_on(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> WorkTicketFollowOn | None:
+    """The amplicon denoise run to submit once golay-demux completes, from the
+    `--denoise-*` options, or None when none was asked for.
+
+    The control plane submits it on the same pool as the same user. The server
+    checks it against the amplicon action when golay-demux is submitted.
+    """
+    trim, reference_idx = args.denoise_trim, args.denoise_sortmerna_reference_idx
+    if trim is None and reference_idx is None:
+        return None
+    if trim is None or reference_idx is None:
+        parser.error("--denoise-trim and --denoise-sortmerna-reference-idx go together")
+    return WorkTicketFollowOn(
+        action_id=_AMPLICON_ACTION_ID,
+        action_version=_AMPLICON_ACTION_VERSION,
+        action_context={"trim": trim, "sortmerna_reference_idx": reference_idx},
+    )
+
+
 def _handle_submit_golay_demux(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     """Bundle the golay-demux submission into one operator gesture.
 
@@ -127,6 +153,7 @@ def _handle_submit_golay_demux(args: argparse.Namespace, parser: argparse.Argume
     """
     if not args.preflight_blob.is_file():
         parser.error(f"--preflight-blob {args.preflight_blob} is not a regular file")
+    denoise = _denoise_follow_on(args, parser)
     blob_bytes = args.preflight_blob.read_bytes()
     if not blob_bytes:
         parser.error(f"--preflight-blob {args.preflight_blob} is empty")
@@ -217,6 +244,7 @@ def _handle_submit_golay_demux(args: argparse.Namespace, parser: argparse.Argume
             },
             action_context=action_context,
             force=args.force,
+            **({"on_success": denoise} if denoise is not None else {}),
         ).model_dump(exclude_unset=True, mode="json")
         ticket_resp, _ticket_status = _common.call_with_status(
             "POST",

@@ -177,6 +177,75 @@ def test_submit_golay_demux_builds_barcode_map_and_one_ticket(
     assert run_posts[0]["json"]["instrument_model"] == "Illumina MiSeq i100"
 
 
+def _golay_argv(db, *extra: str) -> list[str]:
+    return [
+        "--base-url",
+        "https://q.example.test",
+        "submit-golay-demux",
+        "--instrument-run-id",
+        _RUN_ID,
+        "--preflight-blob",
+        str(db),
+        "--prep-protocol-idx",
+        "5",
+        *extra,
+    ]
+
+
+def _golay_ticket_body(captured: dict) -> dict:
+    (post,) = [
+        r
+        for r in captured["requests"]
+        if r["method"] == "POST" and r["url"].endswith("/work-ticket")
+    ]
+    return post["json"]
+
+
+def test_submit_golay_demux_alone_queues_no_denoise(monkeypatch, build_amplicon_preflight):
+    captured: dict = {}
+    _stub_submit_flow(monkeypatch, captured)
+    assert main(_golay_argv(build_amplicon_preflight())) == 0
+    assert "on_success" not in _golay_ticket_body(captured)
+
+
+def test_submit_golay_demux_queues_a_denoise_follow_on(monkeypatch, build_amplicon_preflight):
+    """With --denoise-*, the golay-demux ticket carries the amplicon run as its
+    follow-on, so one command takes the run to ASV counts."""
+    captured: dict = {}
+    _stub_submit_flow(monkeypatch, captured)
+    argv = _golay_argv(
+        build_amplicon_preflight(),
+        "--denoise-trim",
+        "150",
+        "--denoise-sortmerna-reference-idx",
+        "4",
+    )
+    assert main(argv) == 0
+    assert _golay_ticket_body(captured)["on_success"] == {
+        "action_id": "amplicon",
+        "action_version": "1.0.0",
+        "action_context": {"trim": 150, "sortmerna_reference_idx": 4},
+    }
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [("--denoise-trim", "150"), ("--denoise-sortmerna-reference-idx", "4")],
+    ids=["trim-only", "reference-only"],
+)
+def test_submit_golay_demux_refuses_a_partial_denoise(
+    monkeypatch, build_amplicon_preflight, capsys, extra
+):
+    """An incomplete --denoise-* set is refused before any network call."""
+    captured: dict = {}
+    _stub_submit_flow(monkeypatch, captured)
+    with pytest.raises(SystemExit) as exc:
+        main(_golay_argv(build_amplicon_preflight(), *extra))
+    assert exc.value.code == 2
+    assert "--denoise-" in capsys.readouterr().err
+    assert captured["requests"] == []
+
+
 def test_submit_golay_demux_requires_run_id(monkeypatch, build_amplicon_preflight):
     """--instrument-run-id is required; without it argparse exits 2 before any
     network call (there is no run folder to resolve otherwise)."""

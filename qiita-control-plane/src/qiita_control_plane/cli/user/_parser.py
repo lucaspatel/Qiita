@@ -2084,6 +2084,23 @@ def _build_parser() -> argparse.ArgumentParser:
             " DuckLake has no uniqueness). Requires wet_lab_admin or system_admin."
         ),
     )
+    denoise = p_submit_golay.add_argument_group(
+        "denoise afterwards",
+        "Queue an amplicon denoise run on this pool, submitted by the control plane"
+        " as you once golay-demux completes, so one command takes the run to a"
+        " feature table. Omit to demultiplex only; denoise an already-ingested pool"
+        " later with `qiita ticket submit --action-id amplicon`.",
+    )
+    denoise.add_argument(
+        "--denoise-trim",
+        type=int,
+        help="Read truncation length for denoising (e.g. 150 for the GG2 V4 catalog).",
+    )
+    denoise.add_argument(
+        "--denoise-sortmerna-reference-idx",
+        type=int,
+        help="reference_idx of the loaded SortMeRNA 16S pre-filter reference.",
+    )
     p_submit_golay.set_defaults(handler=_handle_submit_golay_demux)
 
     p_delete_pool = sub.add_parser(

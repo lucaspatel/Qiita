@@ -43,6 +43,13 @@ see [`getting-started.md`](getting-started.md).
   preflight to check against; it then materializes it to a parquet (the
   orchestrator has no DB access). Loads per-sample reads into `read`.
 
+- To take the run straight on to ASV counts, add `--denoise-trim <n>
+  --denoise-sortmerna-reference-idx <idx>`. The golay-demux ticket then carries the amplicon run
+  as its follow-on: the control plane submits it, as you, on the same pool once
+  demux completes. The follow-on is validated when golay-demux is submitted;
+  `GET /work-ticket/{idx}` on the golay-demux ticket shows the amplicon ticket it
+  created (`follow_on_work_ticket_idx`) or why it was refused (`follow_on_error`).
+
 ## Submit amplicon (denoise)
 
 - _(TODO)_ context: `sortmerna_reference_idx`, `trim`, optional `primer` /
