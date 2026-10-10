@@ -37,7 +37,9 @@ from qiita_control_plane.preflight import (
     AmpliconBarcode,
     AmpliconPreflightError,
     amplicon_barcode_from_blob,
+    amplicon_samples,
     is_pacbio_sheet_type,
+    open_blob,
     pacbio_protocol_from_blob,
 )
 
@@ -80,12 +82,13 @@ def test_cli_and_server_amplicon_readers_agree(build_amplicon_preflight, barcode
             "carries no Golay barcode",
         ),
         (
-            "UPDATE input_sample SET biosample_accession = ''"
+            "UPDATE input_sample SET biosample_accession = '', matrix_tube_id = NULL"
             " WHERE rowid = (SELECT min(rowid) FROM input_sample)",
-            "carries no biosample_accession",
+            "carries neither a matrix tube nor a biosample_accession",
         ),
         (
-            "UPDATE project SET bioproject_accession = ''",
+            "UPDATE project SET bioproject_accession = '';"
+            " UPDATE input_sample SET matrix_tube_id = NULL",
             "no primary bioproject",
         ),
         ("DELETE FROM amplicon_sample", "no amplicon_sample rows"),
@@ -96,7 +99,7 @@ def test_amplicon_samples_refuse_what_the_cli_refuses(build_amplicon_preflight, 
     CLI does, with the same message, naming the sample."""
     db = build_amplicon_preflight()
     conn = sqlite3.connect(db)
-    conn.execute(sql)
+    conn.executescript(sql)
     conn.commit()
     conn.close()
     with pytest.raises(AmpliconPreflightError, match=message):
@@ -116,14 +119,28 @@ def test_amplicon_samples_refuse_a_non_amplicon_preflight(build_case5_preflight)
         amplicon_barcode_from_blob(build_case5_preflight().read_bytes())
 
 
-def test_amplicon_barcode_raises_on_missing_accession(build_amplicon_preflight):
-    """`get_amplicon_sample_info` REQUIRES the accessioned state, so the barcode
-    lookup asks for the same pre-flight the submission does. The accessor's
-    "missing required accession" is surfaced as `AmpliconPreflightError` (bad
-    pre-flight content), not a bare `ValueError` that "not a SQLite file" also is."""
-    blob = build_amplicon_preflight(populate_accessions=False).read_bytes()
+def test_amplicon_barcode_raises_on_missing_identity(build_amplicon_preflight):
+    """A sample with neither a matrix tube nor accessions cannot be registered,
+    so the barcode lookup refuses the same pre-flight the submission does. The
+    accessor's "missing required accession" is surfaced as `AmpliconPreflightError`
+    (bad pre-flight content), not a bare `ValueError` that "not a SQLite file" also is."""
+    blob = build_amplicon_preflight(populate_accessions=False, clear_tubes=True).read_bytes()
     with pytest.raises(AmpliconPreflightError, match="missing required accession"):
         amplicon_barcode_from_blob(blob)
+
+
+def test_amplicon_samples_accept_tube_identity(build_amplicon_preflight):
+    """A sheet whose samples carry matrix tubes needs no accessions: the tube
+    identifies each sample, and the samples report it."""
+    db = build_amplicon_preflight(populate_accessions=False)
+    with open_blob(db.read_bytes()) as conn:
+        samples = amplicon_samples(conn)
+    assert len(samples) == 181
+    assert all(s.matrix_tube_id for s in samples)
+    assert all(s.biosample_accession is None for s in samples)
+    assert all(s.primary_bioproject_accession is None for s in samples)
+    # The barcode lookup the runner makes accepts the same sheet.
+    assert len(amplicon_barcode_from_blob(db.read_bytes())) == 181
 
 
 def test_amplicon_barcode_raises_on_unreadable_blob():

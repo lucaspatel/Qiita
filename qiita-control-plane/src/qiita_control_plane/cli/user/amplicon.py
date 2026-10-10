@@ -49,16 +49,18 @@ class _AmpliconPreflightRow(NamedTuple):
     `sequenced_pool_item_id`. `barcode` + `barcodes_are_rc` are the Golay roster the
     demux job matches each read's index against; `barcodes_are_rc` is per-sample
     provenance (whether the stored barcode is the reverse complement of the read
-    index). The project accessions are ENA **bioproject** accessions the study
-    lookup route resolves, matching the Illumina/PacBio rows;
-    `secondary_project_accessions` is populated for controls.
+    index). `matrix_tube_id`, when present, identifies the sample on its own; the
+    accessions are then optional cross-checks. The project accessions are
+    **bioproject** accessions; `secondary_project_accessions` is populated for
+    controls.
     """
 
     prepped_sample_idx: int
     barcode: str
     barcodes_are_rc: bool
-    biosample_accession: str
-    primary_project_accession: str
+    matrix_tube_id: str | None
+    biosample_accession: str | None
+    primary_project_accession: str | None
     secondary_project_accessions: list[str]
 
 
@@ -100,6 +102,7 @@ def _read_amplicon_preflight_rows(
             prepped_sample_idx=sample.prepped_sample_idx,
             barcode=sample.barcode,
             barcodes_are_rc=sample.barcodes_are_rc,
+            matrix_tube_id=sample.matrix_tube_id,
             biosample_accession=sample.biosample_accession,
             primary_project_accession=sample.primary_bioproject_accession,
             secondary_project_accessions=list(sample.secondary_bioproject_accessions),
@@ -169,6 +172,9 @@ def _handle_submit_golay_demux(args: argparse.Namespace, parser: argparse.Argume
             pool_item_id=lambda row: str(row.prepped_sample_idx),
             row_label=lambda row: f"prepped_sample_idx={row.prepped_sample_idx}",
             row_noun="amplicon_sample",
+            # A sheet straight from the pre-prep file carries matrix tubes and no
+            # accessions; the roster route resolves either.
+            resolve_by_roster=True,
         )
         sequencing_run_idx = provision.sequencing_run_idx
         sequenced_pool_idx = provision.sequenced_pool_idx
@@ -186,6 +192,7 @@ def _handle_submit_golay_demux(args: argparse.Namespace, parser: argparse.Argume
         per_sample_results = [
             {
                 "prepped_sample_idx": s.row.prepped_sample_idx,
+                "matrix_tube_id": s.row.matrix_tube_id,
                 "biosample_accession": s.row.biosample_accession,
                 "biosample_idx": s.biosample_idx,
                 "primary_study_idx": s.primary_study_idx,

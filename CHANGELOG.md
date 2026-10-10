@@ -31,6 +31,12 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   roster with a 422 whose `detail` lists every problem (`malformed_tube`,
   `duplicate_tube`, `unknown_tube`, `identity_conflict`, `study_mismatch`,
   `no_study`, `ambiguous_study`, `no_identity`, `unknown_*_accession`).
+- **`submit-golay-demux` accepts a pre-flight identified by matrix tube.** A
+  pre-flight built straight from the pre-prep sheet carries each sample's tube and
+  no accessions; the CLI now resolves its roster through `resolve-roster` and
+  prints every problem against the sheet's `prepped_sample_idx`. The runner's
+  roster check (`preflight.amplicon_samples`) accepts the same sheets. Needs
+  run-preflight's `accept_tube_identity`, so the pin moves.
 
 - **golay-demux checks its submitted barcode roster against the pool's stored
   pre-flight (#657).** The CLI builds `barcode_map` client-side; a transposed roster
@@ -2152,7 +2158,6 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   unpacked each `PlatformSampleInfo` as four values; the library returns more, so
   every real pre-flight failed with "too many values to unpack". It reads the
   record's fields by name, and the CLI tests stub the library's own record type.
-
 
 - **CI pins the Python interpreter to 3.14.** `requires-python` is open-ended
   (`>=3.14`), so once CPython 3.15.0 was published `uv` began downloading it in

@@ -18,6 +18,7 @@ from qiita_common.actions import READ_MASK_ACTION_ID
 from qiita_common.api_paths import (
     PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION,
     PATH_BIOSAMPLE_PREFIX,
+    PATH_BIOSAMPLE_RESOLVE_ROSTER,
     PATH_REFERENCE_BY_IDX,
     PATH_REFERENCE_INDEX,
     PATH_REFERENCE_PREFIX,
@@ -48,6 +49,10 @@ from qiita_common.models import (
     HostFilterResolution,
     Platform,
     ReferenceStatus,
+    RosterResolveFailure,
+    RosterResolveRequest,
+    RosterResolveResponse,
+    RosterResolveRow,
     ScopeTargetKind,
     SequencedPoolCreateRequest,
     SequencedSampleCreateRequest,
@@ -276,6 +281,118 @@ def _print_missing_accession_error(
     )
 
 
+class _RowResolution(NamedTuple):
+    """Where one preflight row's prep_sample goes: its biosample and studies."""
+
+    biosample_idx: int
+    primary_study_idx: int
+    secondary_study_idxs: list[int]
+
+
+def _resolve_by_roster_route(
+    base_url: str,
+    token: str,
+    preflight_rows: list[Any],
+    *,
+    pool_item_id: Callable[[Any], str],
+    row_label: Callable[[Any], str],
+) -> dict[str, _RowResolution]:
+    """Resolve every row in ONE `POST /biosample/resolve-roster` call, keyed by
+    pool item id. A row is identified by its matrix tube when it carries one,
+    else by its accessions; the route owns the rules.
+
+    On a 422 prints the route's message and every problem against the sheet's own
+    row label, then raises SystemExit(1) — before any run or pool exists."""
+    rows = [
+        RosterResolveRow(
+            item_id=pool_item_id(row),
+            matrix_tube_id=getattr(row, "matrix_tube_id", None),
+            biosample_accession=row.biosample_accession,
+            primary_project_accession=row.primary_project_accession,
+            secondary_project_accessions=list(row.secondary_project_accessions),
+        )
+        for row in preflight_rows
+    ]
+    body = RosterResolveRequest(rows=rows).model_dump(mode="json", exclude_none=True)
+    try:
+        resp = _common.call(
+            "POST",
+            base_url,
+            token,
+            f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_RESOLVE_ROSTER}",
+            json=body,
+        )
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code != 422:
+            raise
+        detail = exc.response.json().get("detail")
+        if not isinstance(detail, dict) or "problems" not in detail:
+            raise  # a request-shape 422, not a roster verdict
+        failure = RosterResolveFailure.model_validate(detail)
+        label_by_item = {pool_item_id(row): row_label(row) for row in preflight_rows}
+        lines = [f"error: {failure.message}:"]
+        for p in failure.problems:
+            value = f" ({p.value})" if p.value is not None else ""
+            lines.append(
+                f"  - {label_by_item.get(p.item_id, p.item_id)}: {p.code}{value} — {p.message}"
+            )
+        lines.append("fix the registry or the preflight and re-run.")
+        print("\n".join(lines), file=sys.stderr)
+        raise SystemExit(1) from exc
+    resolved = RosterResolveResponse.model_validate(resp)
+    return {
+        r.item_id: _RowResolution(r.biosample_idx, r.primary_study_idx, r.secondary_study_idxs)
+        for r in resolved.rows
+    }
+
+
+def _resolve_by_accession(
+    base_url: str,
+    token: str,
+    preflight_rows: list[Any],
+    *,
+    pool_item_id: Callable[[Any], str],
+    row_label: Callable[[Any], str],
+    row_noun: str,
+) -> dict[str, _RowResolution]:
+    """Resolve every row by biosample + bioproject accession, keyed by pool item
+    id. Both lookups always run so the operator sees biosample + study misses in
+    a single round trip; any miss prints one combined block and raises
+    SystemExit(1)."""
+    unique_biosamples, unique_studies = _dedup_accessions(preflight_rows)
+    resolved_biosamples, missing_biosamples = _lookup_accessions(
+        base_url,
+        token,
+        f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION}",
+        unique_biosamples,
+        BiosampleLookupByAccessionRequest,
+    )
+    resolved_studies, missing_studies = _lookup_accessions(
+        base_url,
+        token,
+        f"{PATH_STUDY_PREFIX}{PATH_STUDY_LOOKUP_BY_ACCESSION}",
+        unique_studies,
+        StudyLookupByAccessionRequest,
+    )
+    if missing_biosamples or missing_studies:
+        _print_missing_accession_error(
+            preflight_rows,
+            missing_biosamples,
+            missing_studies,
+            row_label=row_label,
+            row_noun=row_noun,
+        )
+        raise SystemExit(1)
+    return {
+        pool_item_id(row): _RowResolution(
+            resolved_biosamples[row.biosample_accession],
+            resolved_studies[row.primary_project_accession],
+            [resolved_studies[a] for a in row.secondary_project_accessions],
+        )
+        for row in preflight_rows
+    }
+
+
 class _ProvisionedSample(NamedTuple):
     """One sample the shared provisioner resolved/created in the pool roster.
 
@@ -317,6 +434,7 @@ def _provision_run_pool_roster(
     pool_item_id: Callable[[Any], str],
     row_label: Callable[[Any], str],
     row_noun: str,
+    resolve_by_roster: bool = False,
 ) -> _RunPoolProvision:
     """Shared run → pool → sequenced-sample provisioning for the bundled submit
     gestures (`submit-bcl-convert`, `submit-pacbio-ingest`).
@@ -329,7 +447,9 @@ def _provision_run_pool_roster(
     caller parameterizes the per-row `pool_item_id` (Illumina: illumina_sample_idx;
     PacBio: pacbio_sample_idx) and the `row_label`/`row_noun` for the
     missing-accession report, and builds its own summary + ticket tail from the
-    returned roster.
+    returned roster. `resolve_by_roster` resolves through
+    `POST /biosample/resolve-roster` (matrix tube or accession per row) instead
+    of the two accession lookups.
 
     Roster creation is CREATE-MISSING, not blind-create: it GETs the pool roster
     first and reuses samples already present, POSTing only the absent ones. So a
@@ -338,38 +458,26 @@ def _provision_run_pool_roster(
     the roster is empty and every sample is created.
 
     Raises SystemExit(1) (after printing one combined block to stderr) if any
-    biosample or study accession is unresolved — before the run/pool are created,
-    so a fixable preflight leaves nothing behind."""
+    row is unresolved — before the run/pool are created, so a fixable preflight
+    leaves nothing behind."""
     # Resolve the caller's principal_idx once for the per-sample owner_idx — the
     # composer requires it and the route does not auto-fill it server-side.
     owner_idx = _common.whoami(base_url, token)["principal_idx"]
 
-    # Resolve every accession before any side effect; both lookups always run so
-    # the operator sees biosample + study misses in a single round trip.
-    unique_biosamples, unique_studies = _dedup_accessions(preflight_rows)
-    resolved_biosamples, missing_biosamples = _lookup_accessions(
-        base_url,
-        token,
-        f"{PATH_BIOSAMPLE_PREFIX}{PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION}",
-        unique_biosamples,
-        BiosampleLookupByAccessionRequest,
-    )
-    resolved_studies, missing_studies = _lookup_accessions(
-        base_url,
-        token,
-        f"{PATH_STUDY_PREFIX}{PATH_STUDY_LOOKUP_BY_ACCESSION}",
-        unique_studies,
-        StudyLookupByAccessionRequest,
-    )
-    if missing_biosamples or missing_studies:
-        _print_missing_accession_error(
+    # Resolve every row before any side effect.
+    if resolve_by_roster:
+        resolution = _resolve_by_roster_route(
+            base_url, token, preflight_rows, pool_item_id=pool_item_id, row_label=row_label
+        )
+    else:
+        resolution = _resolve_by_accession(
+            base_url,
+            token,
             preflight_rows,
-            missing_biosamples,
-            missing_studies,
+            pool_item_id=pool_item_id,
             row_label=row_label,
             row_noun=row_noun,
         )
-        raise SystemExit(1)
 
     run_resp, run_status = _common.call_with_status(
         "POST", base_url, token, PATH_SEQUENCING_RUN_PREFIX, json=run_body
@@ -401,9 +509,7 @@ def _provision_run_pool_roster(
     samples: list[_ProvisionedSample] = []
     for row in preflight_rows:
         item_id = pool_item_id(row)
-        biosample_idx = resolved_biosamples[row.biosample_accession]
-        primary_study_idx = resolved_studies[row.primary_project_accession]
-        secondary_study_idxs = [resolved_studies[a] for a in row.secondary_project_accessions]
+        biosample_idx, primary_study_idx, secondary_study_idxs = resolution[item_id]
         existing = existing_by_item_id.get(item_id)
         if existing is not None:
             # Reuse is convergent, NOT a silent overwrite: a re-run cannot change an
