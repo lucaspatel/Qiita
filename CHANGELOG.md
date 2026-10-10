@@ -21,6 +21,17 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **`POST /biosample/resolve-roster` resolves a pool roster by matrix tube or
+  accession.** One call takes every pool row (a matrix tube, or biosample and
+  bioproject accessions) and returns each row's `biosample_idx` with its primary
+  and secondary study. A tube resolves on its own, since tubes are unique across
+  Qiita; its study comes from the biosample's active study links, and a project
+  accession on the row must name one of them. A sheet's tube that lost its leading
+  zero resolves to the stored 10-digit form. Any unresolved row refuses the whole
+  roster with a 422 whose `detail` lists every problem (`malformed_tube`,
+  `duplicate_tube`, `unknown_tube`, `identity_conflict`, `study_mismatch`,
+  `no_study`, `ambiguous_study`, `no_identity`, `unknown_*_accession`).
+
 - **golay-demux checks its submitted barcode roster against the pool's stored
   pre-flight (#657).** The CLI builds `barcode_map` client-side; a transposed roster
   would route one sample's reads under another's `prep_sample_idx` with nothing
