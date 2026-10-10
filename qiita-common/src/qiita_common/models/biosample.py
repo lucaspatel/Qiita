@@ -2,6 +2,7 @@
 lookups, the shared bulk-idx / list response envelopes, and the biosample
 PATCH body."""
 
+from collections import Counter
 from datetime import date
 from decimal import Decimal
 from enum import StrEnum
@@ -721,6 +722,116 @@ class StudyLookupByAccessionResponse(BaseModel):
 
     resolved: dict[str, Annotated[int, Field(gt=0)]]
     missing: list[str]
+
+
+_MATRIX_TUBE_ID_WIDTH = 10
+
+
+def normalize_matrix_tube_id(raw: str) -> str:
+    """The stored form of a matrix tube id: digits only, left-padded to the
+    width MATRIX_TUBE_ID_PATTERN fixes.
+
+    Sheets that pass through a spreadsheet lose the leading zero, so a tube
+    written with fewer digits is the same tube. RAISES ValueError for anything
+    that is not 1..10 digits once surrounding whitespace is stripped.
+    """
+    value = raw.strip()
+    if not value.isascii() or not value.isdigit() or len(value) > _MATRIX_TUBE_ID_WIDTH:
+        raise ValueError(f"{raw!r} is not a matrix tube id (1 to 10 digits)")
+    return value.zfill(_MATRIX_TUBE_ID_WIDTH)
+
+
+class RosterResolveRow(BaseModel):
+    """One pool row to resolve to a biosample and its studies.
+
+    A row with a `matrix_tube_id` resolves by the tube, and its studies come
+    from the biosample's study links (a project accession, when present, must
+    name one of them). A row without one resolves by `biosample_accession` and
+    the project accessions. `matrix_tube_id` is free text on the wire so a
+    malformed tube is reported as that row's problem with every other one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: NonBlankText
+    matrix_tube_id: Annotated[NonBlankText, Field(max_length=50)] | None = None
+    biosample_accession: AccessionText | None = None
+    primary_project_accession: AccessionText | None = None
+    secondary_project_accessions: list[AccessionText] = Field(default_factory=list)
+
+
+class RosterResolveRequest(BaseModel):
+    """Body for POST /api/v1/biosample/resolve-roster."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rows: list[RosterResolveRow] = Field(min_length=1, max_length=10_000)
+
+    @model_validator(mode="after")
+    def _unique_item_ids(self) -> RosterResolveRequest:
+        counts = Counter(r.item_id for r in self.rows)
+        dups = sorted(item_id for item_id, n in counts.items() if n > 1)
+        if dups:
+            raise ValueError(f"duplicate item_id(s): {dups}")
+        return self
+
+
+class RosterResolvedRow(BaseModel):
+    """One row's resolution: the biosample and the studies its prep_sample
+    links to."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: str
+    biosample_idx: Annotated[int, Field(gt=0)]
+    primary_study_idx: Annotated[int, Field(gt=0)]
+    secondary_study_idxs: list[Annotated[int, Field(gt=0)]]
+
+
+class RosterResolveResponse(BaseModel):
+    """Returned by POST /api/v1/biosample/resolve-roster when every row
+    resolved, in request order."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rows: list[RosterResolvedRow]
+
+
+class RosterProblemCode(StrEnum):
+    """Why one roster row did not resolve."""
+
+    MALFORMED_TUBE = "malformed_tube"
+    DUPLICATE_TUBE = "duplicate_tube"
+    UNKNOWN_TUBE = "unknown_tube"
+    NO_IDENTITY = "no_identity"
+    UNKNOWN_BIOSAMPLE_ACCESSION = "unknown_biosample_accession"
+    IDENTITY_CONFLICT = "identity_conflict"
+    UNKNOWN_STUDY_ACCESSION = "unknown_study_accession"
+    STUDY_MISMATCH = "study_mismatch"
+    NO_STUDY = "no_study"
+    AMBIGUOUS_STUDY = "ambiguous_study"
+
+
+class RosterProblem(BaseModel):
+    """One row's problem. `value` is the offending input (the tube or
+    accession), when there is one."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: str
+    code: RosterProblemCode
+    value: str | None = None
+    message: str
+
+
+class RosterResolveFailure(BaseModel):
+    """The 422 `detail` of POST /api/v1/biosample/resolve-roster: every
+    problem across the roster, so one round trip names them all."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    message: str
+    problems: list[RosterProblem] = Field(min_length=1)
 
 
 class BiosamplePatchRequest(PatchRequestModel):
