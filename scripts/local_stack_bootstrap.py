@@ -8,7 +8,7 @@ every `up`; it is idempotent on the principals and mints new tokens each time.
   * `local-admin` — a system_admin human with a complete profile; its token is
     what the CLI and the web UI use (`QIITA_TOKEN`).
   * `local-compute` — the orchestrator's service account (CO→CP callbacks), with
-    the scopes the compute-service-account runbook grants.
+    the whole service-account scope ceiling.
 
 Usage: python local_stack_bootstrap.py <admin-token-path> <compute-token-path>
 (DATABASE_URL from the environment). Refuses any database whose name does not
@@ -22,14 +22,15 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import asyncpg
-from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, Scope, SystemRole
+from qiita_common.auth_constants import SYSTEM_PRINCIPAL_IDX, SystemRole
 
-from qiita_control_plane.auth.scopes import role_ceiling
+from qiita_control_plane.auth.scopes import SERVICE_ACCOUNT_SCOPE_CEILING, role_ceiling
 from qiita_control_plane.auth.token import mint_api_token
 
 ADMIN_EMAIL = "local-admin@localhost.localdomain"
 COMPUTE_NAME = "local-compute"
-COMPUTE_SCOPES = [Scope.SEQUENCE_RANGE_MINT, Scope.TICKET_DOGET]
+# Every worker scope: the local orchestrator runs every workflow's callbacks.
+COMPUTE_SCOPES = sorted(SERVICE_ACCOUNT_SCOPE_CEILING)
 LOCAL_DB_PREFIX = "qiita_local"
 
 

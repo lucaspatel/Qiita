@@ -84,3 +84,10 @@ for e in httpfs ducklake postgres_scanner; do
 done
 cp $D/{ducklake,postgres_scanner}.duckdb_extension ~/.duckdb/extensions/$V/$P/
 ```
+
+## Retrying a failed ticket
+
+`qiita ticket run <idx>` resumes past completed steps by re-reading their output
+manifests, which only SLURM steps leave behind; a local step's outputs come back
+empty and the next step that needs one fails with a `KeyError`. Locally, submit a
+fresh ticket instead (a pool ticket that failed does not block a resubmission).

@@ -1,8 +1,8 @@
 """Amplicon processed samples get their public QM identifiers at load time.
 
 `mint-amplicon-identifiers` runs after the amplicon workflow's register-files and
-mints one `qiita.exported_identifier` per (processing_idx, prep_sample) the run's
-`amplicon_membership` names, so a feature table never needs a mint on read.
+mints one `qiita.exported_identifier` per (processing_idx, prep_sample) denoise
+counted, so a feature table never needs a mint on read.
 """
 
 import uuid
@@ -11,7 +11,6 @@ from pathlib import Path
 import duckdb
 import pytest
 from qiita_common.actions import PROCESSING_IDX_BINDING, WorkflowAction
-from qiita_common.amplicon_constants import AMPLICON_MEMBERSHIP_BASENAME
 
 from qiita_control_plane.actions.library import mint_amplicon_identifiers
 from qiita_control_plane.repositories.exported_identifier import (
@@ -67,20 +66,16 @@ async def run(postgres_pool):
     await delete_principal(postgres_pool, [principal_idx])
 
 
-def _write_membership(staging: Path, processing_idx: int, prep_sample_idxs: list[int]) -> Path:
-    """The amplicon_membership parquet amplicon_load stages: two ASVs per sample."""
-    staging.mkdir(parents=True, exist_ok=True)
-    out = staging / AMPLICON_MEMBERSHIP_BASENAME
+def _write_asv_counts(dir_: Path, prep_sample_idxs: list[int]) -> Path:
+    """The asv_counts parquet denoise writes: two ASVs per sample."""
+    dir_.mkdir(parents=True, exist_ok=True)
+    out = dir_ / "asv_counts.parquet"
     rows = ", ".join(
-        f"({ps}::BIGINT, {processing_idx}::BIGINT, {f}::BIGINT, 3::BIGINT)"
-        for ps in prep_sample_idxs
-        for f in (101, 102)
+        f"({ps}::BIGINT, uuid(), 3::BIGINT)" for ps in prep_sample_idxs for _ in range(2)
     )
     duckdb.sql(
-        "COPY (SELECT * FROM (VALUES "
-        + rows
-        + ") t(prep_sample_idx, processing_idx, feature_idx, count))"
-        + f" TO '{out}' (FORMAT parquet)"
+        f"COPY (SELECT * FROM (VALUES {rows}) t(prep_sample_idx, sequence_hash, count))"
+        f" TO '{out}' (FORMAT parquet)"
     )
     return out
 
@@ -129,14 +124,12 @@ async def test_repository_mint_reissues_a_retired_tuple(postgres_pool, run):
     assert len(rows) == 2
 
 
-async def test_mint_amplicon_identifiers_from_membership(postgres_pool, run, tmp_path):
-    membership = _write_membership(
-        tmp_path / "staging", run["processing_idx"], run["prep_sample_idxs"]
-    )
+async def test_mint_amplicon_identifiers_from_asv_counts(postgres_pool, run, tmp_path):
+    counts = _write_asv_counts(tmp_path / "denoise", run["prep_sample_idxs"])
     minted = await mint_amplicon_identifiers(
         postgres_pool,
         processing_idx=run["processing_idx"],
-        membership_path=membership,
+        asv_counts_path=counts,
         created_by_idx=run["principal_idx"],
     )
     assert minted == 2
@@ -146,22 +139,6 @@ async def test_mint_amplicon_identifiers_from_membership(postgres_pool, run, tmp
         run["processing_idx"],
     )
     assert [r["prep_sample_idx"] for r in rows] == run["prep_sample_idxs"]
-
-
-async def test_mint_amplicon_identifiers_refuses_a_foreign_processing_idx(
-    postgres_pool, run, tmp_path
-):
-    """Membership stamped by another run means the staging dir is not this run's."""
-    membership = _write_membership(
-        tmp_path / "staging", run["processing_idx"] + 1, run["prep_sample_idxs"]
-    )
-    with pytest.raises(RuntimeError, match="processing_idx"):
-        await mint_amplicon_identifiers(
-            postgres_pool,
-            processing_idx=run["processing_idx"],
-            membership_path=membership,
-            created_by_idx=run["principal_idx"],
-        )
 
 
 async def test_runner_arm_mints_as_the_ticket_originator(postgres_pool, run, tmp_path):
@@ -191,14 +168,13 @@ async def test_runner_arm_mints_as_the_ticket_originator(postgres_pool, run, tmp
         pool_idx,
     )
     try:
-        staging = tmp_path / "staging"
-        _write_membership(staging, run["processing_idx"], run["prep_sample_idxs"])
+        counts = _write_asv_counts(tmp_path / "denoise", run["prep_sample_idxs"])
         out = await _run_action_primitive(
             postgres_pool,
             WorkflowAction(
-                kind="action", name="mint-amplicon-identifiers", inputs=["staging_dir"], outputs=[]
+                kind="action", name="mint-amplicon-identifiers", inputs=["asv_counts"], outputs=[]
             ),
-            {"staging_dir": str(staging), PROCESSING_IDX_BINDING: run["processing_idx"]},
+            {"asv_counts": str(counts), PROCESSING_IDX_BINDING: run["processing_idx"]},
             tmp_path,
             {
                 "kind": "sequenced_pool",

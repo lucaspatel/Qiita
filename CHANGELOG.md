@@ -36,7 +36,9 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
   as TSV.** Rows are ASV sequences, columns the samples' QM identifiers; access is
   all-or-nothing over the run's samples, and `study_idx` narrows the table to one
   study's share of a pool. The data plane serves `amplicon_membership` and the ASV
-  sequence tables, scoped to one run over a cohort.
+  sequence tables, scoped to one run over a cohort. The identifiers are minted
+  from denoise's `asv_counts`, since register-files has moved the staged
+  membership into the lake by the time the tail step runs.
 
 - **A work ticket can carry a follow-on (`on_success`).** `POST /work-ticket`
   accepts an `on_success` action and context; when the ticket completes, the

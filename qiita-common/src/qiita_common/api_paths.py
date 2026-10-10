@@ -237,7 +237,7 @@ class LibraryPrimitive(StrEnum):
     # qiita_control_plane.actions.library.finalize_alignment_sample_gate.
     FINALIZE_ALIGNMENT_SAMPLE = "finalize-alignment-sample"
     # Amplicon: mint the public QM identifier of every processed sample the run's
-    # staged amplicon_membership names, as the ticket's originator. Runs after
+    # denoise step counted, as the ticket's originator. Runs after
     # register-files, so an identifier never names data that did not land. See
     # qiita_control_plane.actions.library.mint_amplicon_identifiers.
     MINT_AMPLICON_IDENTIFIERS = "mint-amplicon-identifiers"
