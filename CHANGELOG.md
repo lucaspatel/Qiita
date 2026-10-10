@@ -2154,6 +2154,13 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Fixed
 
+- **The amplicon dummy sample sheet follows RunInfo.xml's read order.**
+  bcl-convert reads `OverrideCycles` segments in the order RunInfo.xml lists the
+  reads, but the sheet always wrote template/index/template, so a run that lists
+  its index reads first (MiSeq i100) would mask its first template read and emit
+  the index cycles as reads. The segments now follow the run's own order, and
+  `[Reads]` carries each template read's own length.
+
 - **`submit-bcl-convert` no longer crashes reading a real pre-flight.** The reader
   unpacked each `PlatformSampleInfo` as four values; the library returns more, so
   every real pre-flight failed with "too many values to unpack". It reads the
