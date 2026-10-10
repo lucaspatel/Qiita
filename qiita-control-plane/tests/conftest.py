@@ -194,14 +194,17 @@ def build_amplicon_preflight(tmp_path):
     it never migrates a classic prep template) and populates the biosample + project
     **bioproject** accessions `get_amplicon_sample_info` REQUIRES (left NULL by the
     fixture, set upstream in production): biosample -> BIO_<name>; each project's
-    bioproject -> PRJNA<external_project_id>. `barcodes_are_rc` overrides the
-    fixture's run-level orientation (it is True, the EMP 515rcbc set).
+    bioproject -> PRJNA<external_project_id>. Every input sample also carries a
+    matrix tube, which identifies it without accessions; `clear_tubes` drops them.
+    `barcodes_are_rc` overrides the fixture's run-level orientation (it is True, the
+    EMP 515rcbc set).
     """
     import gzip
 
     def _build(
         *,
         populate_accessions: bool = True,
+        clear_tubes: bool = False,
         barcodes_are_rc: bool | None = None,
         name: str = "amplicon_v1.db",
     ) -> Path:
@@ -211,6 +214,10 @@ def build_amplicon_preflight(tmp_path):
         if populate_accessions:
             conn.execute("UPDATE input_sample SET biosample_accession = 'BIO_' || sample_name")
             conn.execute("UPDATE project SET bioproject_accession = 'PRJNA' || external_project_id")
+        if clear_tubes:
+            # The fixture carries a matrix tube on every input sample; a sheet
+            # without them has only accessions to identify its samples by.
+            conn.execute("UPDATE input_sample SET matrix_tube_id = NULL")
         if barcodes_are_rc is not None:
             # Run-level: amplicon_run carries it; run_amplicon_sample stamps it per row.
             conn.execute("UPDATE amplicon_run SET barcodes_are_rc = ?", (int(barcodes_are_rc),))

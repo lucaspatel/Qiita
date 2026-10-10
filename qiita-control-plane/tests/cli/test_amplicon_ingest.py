@@ -53,12 +53,22 @@ def test_read_amplicon_preflight_rows_v1(build_amplicon_preflight):
     assert len({r.prepped_sample_idx for r in rows}) == len(rows)
 
 
-def test_read_amplicon_preflight_rows_fails_on_missing_accession(build_amplicon_preflight):
-    """A preflight without the required biosample/bioproject accessions fails
-    fast: `get_amplicon_sample_info` raises and the CLI surfaces its message."""
-    db = build_amplicon_preflight(populate_accessions=False)
-    with pytest.raises(_RaisingParser.Error):
+def test_read_amplicon_preflight_rows_fails_on_missing_identity(build_amplicon_preflight):
+    """A preflight with neither matrix tubes nor accessions fails fast:
+    `get_amplicon_sample_info` raises and the CLI surfaces its message."""
+    db = build_amplicon_preflight(populate_accessions=False, clear_tubes=True)
+    with pytest.raises(_RaisingParser.Error, match="missing required accession"):
         _read_amplicon_preflight_rows(db, _RaisingParser())
+
+
+def test_read_amplicon_preflight_rows_by_tube(build_amplicon_preflight):
+    """A preflight straight from the pre-prep sheet carries tubes and no
+    accessions; every row is read with its tube."""
+    db = build_amplicon_preflight(populate_accessions=False)
+    rows = _read_amplicon_preflight_rows(db, _RaisingParser())
+    assert len(rows) == 181
+    assert all(r.matrix_tube_id for r in rows)
+    assert all(r.biosample_accession is None for r in rows)
 
 
 def test_read_amplicon_preflight_rows_rejects_non_sqlite(tmp_path):
@@ -73,11 +83,12 @@ def test_read_amplicon_preflight_rows_rejects_non_sqlite(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _stub_submit_flow(monkeypatch, captured: dict) -> None:
+def _stub_submit_flow(monkeypatch, captured: dict, roster_failure: dict | None = None) -> None:
     """Route each POST/GET of the submit flow to a canned response, recording every
     request. /run-folder/inspect resolves the run id to a bcl_input_dir + instrument
-    facts; accession lookups resolve everything; the pool roster starts empty so
-    every sample is created."""
+    facts; /biosample/resolve-roster resolves every row (biosample 1000+i, study 3)
+    unless `roster_failure` is given, which it returns as the 422 detail; the pool
+    roster starts empty so every sample is created."""
     captured["requests"] = []
     counter = {"sample": 0}
 
@@ -101,9 +112,24 @@ def _stub_submit_flow(monkeypatch, captured: dict) -> None:
                     },
                 },
             )
-        if url.endswith("/lookup-by-accession"):  # biosample or study
-            accs = (json or {}).get("accessions", [])
-            return resp(200, {"resolved": {a: 1000 + i for i, a in enumerate(accs)}, "missing": []})
+        if url.endswith("/biosample/resolve-roster"):
+            if roster_failure is not None:
+                return resp(422, {"detail": roster_failure})
+            rows = (json or {})["rows"]
+            return resp(
+                200,
+                {
+                    "rows": [
+                        {
+                            "item_id": r["item_id"],
+                            "biosample_idx": 1000 + i,
+                            "primary_study_idx": 3,
+                            "secondary_study_idxs": [],
+                        }
+                        for i, r in enumerate(rows)
+                    ]
+                },
+            )
         if url.endswith("/sequenced-pool"):
             return resp(201, {"sequenced_pool_idx": 50})
         if url.rstrip("/").endswith("/sequencing-run"):
@@ -199,3 +225,92 @@ def test_submit_golay_demux_requires_run_id(monkeypatch, build_amplicon_prefligh
         )
     assert ei.value.code == 2  # argparse required-arg exit code
     assert captured["requests"] == []
+
+
+def _submit_argv(db) -> list[str]:
+    return [
+        "--base-url",
+        "https://q.example.test",
+        "submit-golay-demux",
+        "--instrument-run-id",
+        _RUN_ID,
+        "--preflight-blob",
+        str(db),
+        "--prep-protocol-idx",
+        "5",
+    ]
+
+
+def test_submit_golay_demux_by_tube_resolves_through_the_roster_route(
+    monkeypatch, build_amplicon_preflight
+):
+    """A sheet with tubes and no accessions resolves every sample through ONE
+    resolve-roster call, and each prep_sample is created on the biosample and
+    study it returned."""
+    db = build_amplicon_preflight(populate_accessions=False)
+    captured: dict = {}
+    _stub_submit_flow(monkeypatch, captured)
+
+    assert main(_submit_argv(db)) == 0
+
+    urls = [r["url"] for r in captured["requests"]]
+    assert not any(u.endswith("/lookup-by-accession") for u in urls)
+    resolve_posts = [r for r in captured["requests"] if r["url"].endswith("/resolve-roster")]
+    assert len(resolve_posts) == 1
+    sent = resolve_posts[0]["json"]["rows"]
+    assert len(sent) == 181
+    assert all(r["matrix_tube_id"] for r in sent)
+    assert all("biosample_accession" not in r for r in sent)
+
+    creates = [
+        r["json"]
+        for r in captured["requests"]
+        if r["method"] == "POST"
+        and "/sequenced-pool/" in r["url"]
+        and r["url"].endswith("/sequenced-sample")
+    ]
+    assert len(creates) == 181
+    assert {c["biosample_idx"] for c in creates} == {1000 + i for i in range(181)}
+    assert {c["primary_study_idx"] for c in creates} == {3}
+
+
+def test_submit_golay_demux_reports_every_roster_problem(
+    monkeypatch, build_amplicon_preflight, capsys
+):
+    """A 422 from resolve-roster stops the submission before the run or pool
+    exists, printing every problem against the sheet's own row label."""
+    db = build_amplicon_preflight(populate_accessions=False)
+    captured: dict = {}
+    _stub_submit_flow(
+        monkeypatch,
+        captured,
+        roster_failure={
+            "message": "2 of 181 roster rows did not resolve",
+            "problems": [
+                {
+                    "item_id": "1",
+                    "code": "unknown_tube",
+                    "value": "0364353076",
+                    "message": "no biosample has matrix tube 0364353076; register it",
+                },
+                {
+                    "item_id": "2",
+                    "code": "ambiguous_study",
+                    "value": None,
+                    "message": "biosample 12 belongs to studies [3, 4]",
+                },
+            ],
+        },
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        main(_submit_argv(db))
+    assert exc.value.code == 1
+
+    err = capsys.readouterr().err
+    assert "2 of 181 roster rows did not resolve" in err
+    assert "prepped_sample_idx=1: unknown_tube (0364353076)" in err
+    assert "prepped_sample_idx=2: ambiguous_study" in err
+    urls = [r["url"] for r in captured["requests"]]
+    assert not any(u.rstrip("/").endswith("/sequencing-run") for u in urls)
+    assert not any(u.endswith("/sequenced-pool") for u in urls)

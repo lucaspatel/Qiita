@@ -163,7 +163,8 @@ def pacbio_protocol_from_blob(blob: bytes) -> dict[str, PacbioProtocol]:
 
 class AmpliconPreflightError(ValueError):
     """An amplicon pre-flight that cannot supply a demux roster: not an amplicon
-    sheet, no samples, or a sample missing its barcode or a required accession.
+    sheet, no samples, or a sample missing its barcode or any identity (a matrix
+    tube, or the accessions).
     The message names the sample by `prepped_sample_idx`, its id on the sheet."""
 
 
@@ -175,8 +176,11 @@ class AmpliconSample:
     barcode: str
     # Run-level in the pre-flight (inferred from the primer), stamped per row.
     barcodes_are_rc: bool
-    biosample_accession: str
-    primary_bioproject_accession: str
+    # A sample is identified by its matrix tube when it has one; the accessions
+    # are then optional. Without a tube both accessions are present.
+    matrix_tube_id: str | None
+    biosample_accession: str | None
+    primary_bioproject_accession: str | None
     secondary_bioproject_accessions: tuple[str, ...]
 
 
@@ -190,13 +194,14 @@ def amplicon_samples(conn: sqlite3.Connection) -> list[AmpliconSample]:
     `barcode_map` (`runner/_read_ingest.py`), so the two cannot accept different
     sheets. Reads kl-run-preflight's own `get_amplicon_sample_info`.
 
-    Accessions are required even though the roster itself uses only the barcode:
-    `get_amplicon_sample_info` refuses a NULL biosample or bioproject accession,
-    and a sample without them cannot be registered anyway, so the barcode lookup
-    asks for the same accessioned pre-flight the submission does.
+    Every sample needs an identity even though the roster itself uses only the
+    barcode, because a sample without one cannot be registered: a matrix tube
+    (resolved through `POST /biosample/resolve-roster`), or else the biosample
+    and bioproject accessions. The barcode lookup asks for the same pre-flight
+    the submission does.
 
     RAISES `AmpliconPreflightError` for a non-amplicon sheet, an empty sample set,
-    or a sample with an empty or NULL barcode or accession — the accessor's
+    or a sample with an empty or NULL barcode or no identity — the accessor's
     "missing required accession" (a NULL accession) is re-raised as this type too,
     so a pre-flight whose CONTENT cannot supply a roster is one exception kind.
     `sqlite3.DatabaseError` / `ValueError` still surface for a pre-flight that
@@ -209,7 +214,7 @@ def amplicon_samples(conn: sqlite3.Connection) -> list[AmpliconSample]:
     if sheet_type != SHEET_TYPE_AMPLICON:
         raise AmpliconPreflightError(f"not an amplicon pre-flight (sheet_type {sheet_type!r})")
     try:
-        infos = get_amplicon_sample_info(conn)
+        infos = get_amplicon_sample_info(conn, accept_tube_identity=True)
     except ValueError as exc:
         # The accessor refuses a NULL accession with "missing required accession".
         # run_sheet_type already confirmed a readable amplicon sheet above, so a
@@ -230,12 +235,13 @@ def amplicon_samples(conn: sqlite3.Connection) -> list[AmpliconSample]:
                 f"prepped_sample_idx {info.sample_idx} carries no Golay barcode; a sample"
                 " cannot be demultiplexed without it"
             )
-        if not info.biosample_accession:
+        tube = info.matrix_tube_id or None
+        if tube is None and not info.biosample_accession:
             raise AmpliconPreflightError(
-                f"prepped_sample_idx {info.sample_idx} carries no biosample_accession;"
-                " populate upstream before re-submitting"
+                f"prepped_sample_idx {info.sample_idx} carries neither a matrix tube nor a"
+                " biosample_accession; populate one upstream before re-submitting"
             )
-        if not info.primary_bioproject_accession:
+        if tube is None and not info.primary_bioproject_accession:
             raise AmpliconPreflightError(
                 f"prepped_sample_idx {info.sample_idx} carries no primary bioproject"
                 " accession; populate upstream before re-submitting"
@@ -245,8 +251,9 @@ def amplicon_samples(conn: sqlite3.Connection) -> list[AmpliconSample]:
                 prepped_sample_idx=info.sample_idx,
                 barcode=row.barcode,
                 barcodes_are_rc=bool(row.barcodes_are_rc),
-                biosample_accession=info.biosample_accession,
-                primary_bioproject_accession=info.primary_bioproject_accession,
+                matrix_tube_id=tube,
+                biosample_accession=info.biosample_accession or None,
+                primary_bioproject_accession=info.primary_bioproject_accession or None,
                 secondary_bioproject_accessions=tuple(info.secondary_bioproject_accessions),
             )
         )
