@@ -289,9 +289,9 @@ def test_load_actions_loads_on_disk_amplicon_yaml():
     from qiita_control_plane.actions import load_actions
 
     actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
-    by_id = {a.action_id: a for a in actions}
-    assert "amplicon" in by_id, "workflows/amplicon/1.0.0.yaml must load"
-    amplicon = by_id["amplicon"]
+    by_key = {(a.action_id, a.version): a for a in actions}
+    assert ("amplicon", "1.0.0") in by_key, "workflows/amplicon/1.0.0.yaml must load"
+    amplicon = by_key[("amplicon", "1.0.0")]
 
     # sequenced_pool scope subjects a re-submit to the pool COMPLETED gate; a
     # --force re-run is safe because amplicon_membership is replace-keyed on
@@ -1628,3 +1628,22 @@ def test_load_actions_orders_a_two_digit_minor_after_a_one_digit_one(tmp_path):
     versions = [a.version for a in load_actions(tmp_path)]
 
     assert versions == ["1.9.0", "1.10.0"], versions
+
+
+def test_load_actions_loads_amplicon_1_1_0_with_the_identifier_tail():
+    """amplicon 1.1.0 is 1.0.0 plus `mint-amplicon-identifiers` after
+    register-files, reading denoise's asv_counts (register-files has moved the
+    staged membership into the lake by then)."""
+    from pathlib import Path
+
+    from qiita_control_plane.actions import load_actions
+
+    actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    by_key = {(a.action_id, a.version): a for a in actions}
+    old, new = by_key[("amplicon", "1.0.0")], by_key[("amplicon", "1.1.0")]
+    assert [s.name for s in new.steps] == [
+        *(s.name for s in old.steps),
+        "mint-amplicon-identifiers",
+    ]
+    assert new.steps[-1].inputs == ["asv_counts"]
+    assert new.context_schema == old.context_schema

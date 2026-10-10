@@ -3236,32 +3236,25 @@ async def mint_amplicon_identifiers(
     pool: asyncpg.Pool,
     *,
     processing_idx: int,
-    membership_path: Path,
+    asv_counts_path: Path,
     created_by_idx: int,
 ) -> int:
-    """Mint the QM identifier of every processed sample in an amplicon run's
-    staged `amplicon_membership`, and return how many samples it covers.
+    """Mint the QM identifier of every processed sample in an amplicon run, and
+    return how many samples it covers.
 
-    Reads the staged file rather than the lake: it is exactly what register-files
-    just loaded, and it needs no data-plane round trip. Every row must carry this
-    run's `processing_idx`; anything else means the staging dir is not this
-    run's, and minting from it would publish identifiers for the wrong run."""
+    The samples are the ones denoise counted ASVs for (`asv_counts`), which is the
+    sample set amplicon_load wrote to `amplicon_membership`: membership is that
+    file joined to the feature map, and the join drops no row. Read from the
+    denoise output rather than the staged membership because register-files moves
+    staged files into the lake, so after it runs there is no staged copy left."""
     with duckdb.connect() as duck:
-        stamped = duck.execute(
-            "SELECT DISTINCT processing_idx FROM read_parquet(?)", [str(membership_path)]
-        ).fetchall()
         prep_sample_idxs = [
             row[0]
             for row in duck.execute(
                 "SELECT DISTINCT prep_sample_idx FROM read_parquet(?) ORDER BY 1",
-                [str(membership_path)],
+                [str(asv_counts_path)],
             ).fetchall()
         ]
-    if stamped and stamped != [(processing_idx,)]:
-        raise RuntimeError(
-            f"{membership_path} is stamped processing_idx {sorted(r[0] for r in stamped)},"
-            f" not this run's {processing_idx}"
-        )
     if not prep_sample_idxs:
         return 0
     async with pool.acquire() as conn, conn.transaction():

@@ -14,7 +14,6 @@ from qiita_common.actions import (
     WorkflowAction,
     WorkflowStep,
 )
-from qiita_common.amplicon_constants import AMPLICON_MEMBERSHIP_BASENAME
 from qiita_common.api_paths import (
     LibraryPrimitive,
 )
@@ -505,13 +504,13 @@ async def _run_action_primitive(
         return {}
 
     if entry.name == LibraryPrimitive.MINT_AMPLICON_IDENTIFIERS:
-        # After register-files: the staged membership names every processed sample
-        # that landed. processing_idx from `bound`, the run identity the runner
-        # minted before the loop; created_by is the ticket's originator, the person
-        # the identifiers are minted for.
-        if set(entry.inputs) != {"staging_dir"}:
+        # After register-files, so an identifier never names data that did not
+        # land. processing_idx from `bound`, the run identity the runner minted
+        # before the loop; created_by is the ticket's originator, the person the
+        # identifiers are minted for.
+        if set(entry.inputs) != {"asv_counts"}:
             raise RuntimeError(
-                f"mint-amplicon-identifiers expects inputs [staging_dir]; got {entry.inputs!r}"
+                f"mint-amplicon-identifiers expects inputs [asv_counts]; got {entry.inputs!r}"
             )
         originator_idx = await pool.fetchval(
             "SELECT originator_principal_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
@@ -522,7 +521,7 @@ async def _run_action_primitive(
         await LIBRARY[LibraryPrimitive.MINT_AMPLICON_IDENTIFIERS](
             pool,
             processing_idx=bound[PROCESSING_IDX_BINDING],
-            membership_path=Path(bound["staging_dir"]) / AMPLICON_MEMBERSHIP_BASENAME,
+            asv_counts_path=Path(bound["asv_counts"]),
             created_by_idx=originator_idx,
         )
         return {}

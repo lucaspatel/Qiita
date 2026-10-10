@@ -97,12 +97,12 @@ steps:
     inputs: [staging_dir]
     outputs: []
 
-  # mint the public QM identifier of every processed sample the staged
-  # membership names, so a feature table built from this run can label its
-  # samples without exposing prep_sample_idx. after register-files: an
-  # identifier never names data that did not land.
+  # mint the public QM identifier of every processed sample denoise counted, so
+  # a feature table built from this run can label its samples without exposing
+  # prep_sample_idx. after register-files: an identifier never names data that
+  # did not land.
   - action: mint-amplicon-identifiers
-    inputs: [staging_dir]
+    inputs: [asv_counts]
     outputs: []
 
 action_ceiling:
