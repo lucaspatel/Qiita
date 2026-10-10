@@ -747,20 +747,22 @@ async def _resolve_cancel_filter(pool: asyncpg.Pool, body: WorkTicketCancelReque
 # =============================================================================
 
 
-async def submit_work_ticket_core(
+async def _gate_submission(
     *,
-    app: FastAPI,
+    pool: asyncpg.Pool,
+    settings: Settings,
     principal: Principal,
     body: WorkTicketCreateRequest,
-) -> WorkTicketResponse:
-    """Gate, INSERT, and dispatch one work ticket for `principal`.
+) -> dict[str, Any]:
+    """Every submission gate that reads only the request and stored state, not
+    the scope's in-flight tickets: action, audience, scopes, privileged knobs,
+    target kind, prep_sample access, context schema, host paths. Returns the
+    scope target as a JSON dict.
 
-    Takes `app` rather than a `Request` so in-process callers get the same gates
-    as `POST /work-ticket`, including the action's audience check.
+    The in-flight / completed dedupe is left to the caller because a follow-on
+    is gated here at its parent's submission, when that dedupe would be asking
+    the wrong question.
     """
-    require_compute_backend_client(app)
-    pool: asyncpg.Pool = app.state.pool
-    settings: Settings = app.state.settings
 
     action = await _fetch_action_for_submission(pool, body.action_id, body.action_version)
     if action is None:
@@ -890,6 +892,64 @@ async def submit_work_ticket_core(
             principal_idx=principal.principal_idx,
         )
 
+    return scope_target
+
+
+async def _gate_follow_on(
+    *,
+    pool: asyncpg.Pool,
+    settings: Settings,
+    principal: Principal,
+    parent: WorkTicketCreateRequest,
+) -> None:
+    """Gate `parent.on_success` as though it were submitted now, on the parent's
+    scope target, so a follow-on that could never run is refused up front
+    instead of at the parent's completion.
+
+    Human callers only: the completion hook re-loads the originator with
+    `load_human_user`, and there is no equivalent for a service account."""
+    assert parent.on_success is not None
+    if not isinstance(principal, HumanUser):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"reason": "on_success is only accepted from a human caller"},
+        )
+    follow_on = WorkTicketCreateRequest(
+        action_id=parent.on_success.action_id,
+        action_version=parent.on_success.action_version,
+        scope_target=parent.scope_target,
+        action_context=parent.on_success.action_context,
+    )
+    try:
+        await _gate_submission(pool=pool, settings=settings, principal=principal, body=follow_on)
+    except HTTPException as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"reason": "on_success was refused", "on_success_detail": exc.detail},
+        ) from exc
+
+
+async def submit_work_ticket_core(
+    *,
+    app: FastAPI,
+    principal: Principal,
+    body: WorkTicketCreateRequest,
+) -> WorkTicketResponse:
+    """Gate, INSERT, and dispatch one work ticket for `principal`.
+
+    Takes `app` rather than a `Request` so in-process callers get the same gates
+    as `POST /work-ticket`, including the action's audience check.
+    """
+    require_compute_backend_client(app)
+    pool: asyncpg.Pool = app.state.pool
+    settings: Settings = app.state.settings
+
+    scope_target = await _gate_submission(
+        pool=pool, settings=settings, principal=principal, body=body
+    )
+    if body.on_success is not None:
+        await _gate_follow_on(pool=pool, settings=settings, principal=principal, parent=body)
+
     await _check_disallow_without_delete(
         pool, body.action_id, body.action_version, scope_target, force=body.force
     )
@@ -922,9 +982,9 @@ async def submit_work_ticket_core(
                 "  action_id, action_version, originator_principal_idx,"
                 "  scope_target_kind, study_idx, prep_idx, reference_idx,"
                 "  prep_sample_idx, sequenced_pool_idx, block_idx, action_context,"
-                "  resource_override"
+                "  resource_override, on_success"
                 ") VALUES ($1, $2, $3, $4::qiita.scope_target_kind,"
-                "          $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb)"
+                "          $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb, $13::jsonb)"
                 " RETURNING work_ticket_idx",
                 body.action_id,
                 body.action_version,
@@ -940,6 +1000,7 @@ async def submit_work_ticket_core(
                 json.dumps(body.resource_override.model_dump())
                 if body.resource_override is not None
                 else None,
+                body.on_success.model_dump_json() if body.on_success is not None else None,
             )
             await _reset_failed_reference_scope_for_dispatch(
                 conn,
@@ -1005,6 +1066,7 @@ _WORK_TICKET_COLUMNS = (
     " wt.action_context, wt.state, wt.retry_count, wt.max_retries,"
     " wt.failure_type, wt.failure_stage, wt.failure_step_name, wt.failure_reason,"
     " wt.transient_reason, wt.transient_since,"
+    " wt.on_success, wt.follow_on_work_ticket_idx, wt.follow_on_error,"
     " wt.created_at, wt.updated_at"
 )
 _WORK_TICKET_FROM = (
@@ -1105,6 +1167,8 @@ def _shape_work_ticket_columns(data: dict[str, Any]) -> dict[str, Any]:
         sequencing_run_idx=data.pop("sequencing_run_idx", None),
     )
     data["action_context"] = json.loads(data["action_context"])
+    if data.get("on_success") is not None:
+        data["on_success"] = json.loads(data["on_success"])
     return data
 
 
@@ -1115,6 +1179,16 @@ def _row_to_work_ticket(row: asyncpg.Record) -> WorkTicket:
     sequenced_pool row — selected upstream so the assembly stays a pure
     transformation."""
     return WorkTicket.model_validate(_shape_work_ticket_columns(dict(row)))
+
+
+async def fetch_work_ticket(pool: asyncpg.Pool, work_ticket_idx: int) -> WorkTicket | None:
+    """Read one ticket with no caller gate, for in-process callers that already
+    own it (the follow-on hook). Routes gate before calling this."""
+    row = await pool.fetchrow(
+        f"SELECT {_WORK_TICKET_COLUMNS}{_WORK_TICKET_FROM} WHERE wt.work_ticket_idx = $1",
+        work_ticket_idx,
+    )
+    return None if row is None else _row_to_work_ticket(row)
 
 
 def _row_to_work_ticket_summary(row: asyncpg.Record) -> WorkTicketSummary:
@@ -1334,17 +1408,14 @@ async def get_work_ticket(
         status_code=status.HTTP_404_NOT_FOUND,
         detail=f"work_ticket {work_ticket_idx} not found",
     )
-    row = await pool.fetchrow(
-        f"SELECT {_WORK_TICKET_COLUMNS}{_WORK_TICKET_FROM} WHERE wt.work_ticket_idx = $1",
-        work_ticket_idx,
-    )
-    if row is None:
+    ticket = await fetch_work_ticket(pool, work_ticket_idx)
+    if ticket is None:
         raise not_found
-    is_originator = row["originator_principal_idx"] == principal.principal_idx
+    is_originator = ticket.originator_principal_idx == principal.principal_idx
     is_bypass = principal.has_role_at_least(SystemRole.WET_LAB_ADMIN)
     if not (is_originator or is_bypass):
         raise not_found
-    return _row_to_work_ticket(row)
+    return ticket
 
 
 @router.get(
