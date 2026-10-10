@@ -55,6 +55,7 @@ from conftest import ducklake_connect
 
 _REPO_ROOT = Path(__file__).parent.parent.parent
 _WORKFLOWS = _REPO_ROOT / "workflows"
+_AMPLICON_VERSION = "1.1.0"
 _FIXTURE = Path(__file__).parent.parent / "data" / "amplicon_e2e"
 
 # The four EMP Golay barcodes as they appear in I1 (first 12 nt); each RC is a
@@ -190,15 +191,15 @@ action_ceiling:
 
 
 async def _sync_workflow_yaml(
-    postgres_pool, tmp_dir: Path, name: str, content: str
+    postgres_pool, tmp_dir: Path, name: str, content: str, *, version: str = "1.0.0"
 ) -> None:
-    """Write `content` as workflows/<name>/1.0.0.yaml under a temp tree and sync it
-    into qiita.action."""
+    """Write `content` as workflows/<name>/<version>.yaml under a temp tree and sync
+    it into qiita.action."""
     from qiita_control_plane.actions import load_actions, sync_actions
 
     dest = tmp_dir / "workflows" / name
     dest.mkdir(parents=True)
-    (dest / "1.0.0.yaml").write_text(content)
+    (dest / f"{version}.yaml").write_text(content)
     actions = load_actions(tmp_dir / "workflows")
     async with postgres_pool.acquire() as conn:
         await sync_actions(conn, actions)
@@ -215,7 +216,8 @@ async def synced_amplicon_actions(postgres_pool, tmp_path):
         postgres_pool,
         tmp_path / "amp",
         "amplicon",
-        (_WORKFLOWS / "amplicon" / "1.0.0.yaml").read_text(),
+        (_WORKFLOWS / "amplicon" / f"{_AMPLICON_VERSION}.yaml").read_text(),
+        version=_AMPLICON_VERSION,
     )
     yield
     for action_id in ("golay-demux", "amplicon"):
@@ -422,7 +424,14 @@ def _build_convert_dir(dest: Path) -> Path:
 
 
 async def _run(
-    postgres_pool, data_plane, *, action_id, pool_idx, owner, action_context
+    postgres_pool,
+    data_plane,
+    *,
+    action_id,
+    pool_idx,
+    owner,
+    action_context,
+    action_version="1.0.0",
 ) -> int:
     """Seed a sequenced_pool work_ticket and drive it through the runner."""
     from qiita_control_plane.runner import run_workflow
@@ -431,12 +440,13 @@ async def _run(
         "INSERT INTO qiita.work_ticket ("
         "  action_id, action_version, originator_principal_idx,"
         "  scope_target_kind, sequenced_pool_idx, action_context"
-        ") VALUES ($1, '1.0.0', $2, 'sequenced_pool', $3, $4::jsonb)"
+        ") VALUES ($1, $5, $2, 'sequenced_pool', $3, $4::jsonb)"
         " RETURNING work_ticket_idx",
         action_id,
         owner,
         pool_idx,
         json.dumps(action_context),
+        action_version,
     )
     await run_workflow(
         work_ticket_idx,
@@ -524,6 +534,7 @@ async def test_golay_demux_then_amplicon(
         postgres_pool,
         data_plane,
         action_id="amplicon",
+        action_version=_AMPLICON_VERSION,
         pool_idx=pool_idx,
         owner=owner,
         action_context={
@@ -557,3 +568,15 @@ async def test_golay_demux_then_amplicon(
     assert {r[0] for r in rows} == set(prep_idxs)
     assert len({r[1] for r in rows}) == 1  # one processing_idx for the whole run
     assert all(r[3] > 0 for r in rows)
+
+    # Every processed sample got its public QM identifier at load time, minted for
+    # the submitter and keyed on the run's processing_idx.
+    (processing_idx,) = {r[1] for r in rows}
+    identifiers = await postgres_pool.fetch(
+        "SELECT prep_sample_idx, export_id, created_by_idx FROM qiita.exported_identifier"
+        " WHERE processing_idx = $1 AND NOT retired",
+        processing_idx,
+    )
+    assert {r["prep_sample_idx"] for r in identifiers} == set(prep_idxs)
+    assert all(r["export_id"].startswith("QM") for r in identifiers)
+    assert {r["created_by_idx"] for r in identifiers} == {owner}

@@ -14,6 +14,7 @@ from qiita_common.actions import (
     WorkflowAction,
     WorkflowStep,
 )
+from qiita_common.amplicon_constants import AMPLICON_MEMBERSHIP_BASENAME
 from qiita_common.api_paths import (
     LibraryPrimitive,
 )
@@ -500,6 +501,29 @@ async def _run_action_primitive(
             work_ticket_idx=work_ticket_idx,
             signing_key=signing_key,
             data_plane_url=data_plane_url,
+        )
+        return {}
+
+    if entry.name == LibraryPrimitive.MINT_AMPLICON_IDENTIFIERS:
+        # After register-files: the staged membership names every processed sample
+        # that landed. processing_idx from `bound`, the run identity the runner
+        # minted before the loop; created_by is the ticket's originator, the person
+        # the identifiers are minted for.
+        if set(entry.inputs) != {"staging_dir"}:
+            raise RuntimeError(
+                f"mint-amplicon-identifiers expects inputs [staging_dir]; got {entry.inputs!r}"
+            )
+        originator_idx = await pool.fetchval(
+            "SELECT originator_principal_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+            work_ticket_idx,
+        )
+        if originator_idx is None:
+            raise RuntimeError(f"work_ticket {work_ticket_idx} not found")
+        await LIBRARY[LibraryPrimitive.MINT_AMPLICON_IDENTIFIERS](
+            pool,
+            processing_idx=bound[PROCESSING_IDX_BINDING],
+            membership_path=Path(bound["staging_dir"]) / AMPLICON_MEMBERSHIP_BASENAME,
+            created_by_idx=originator_idx,
         )
         return {}
 

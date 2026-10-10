@@ -256,3 +256,92 @@ def test_missing_from_reports_the_gap():
     assert _missing_from([], [5]) == [5]
     # Deduped input must not report a phantom gap.
     assert _missing_from(rows, [4, 4, 9]) == []
+
+
+# ---------------------------------------------------------------------------
+# The processing kind (amplicon): (processing_idx, prep_sample_idx)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def processing_probe(postgres_pool, probe):
+    """A qiita.processing run beside `probe`'s alignment, on the same sample."""
+    from qiita_control_plane.repositories.processing import mint_processing
+
+    async with postgres_pool.acquire() as conn:
+        row = await mint_processing(
+            conn,
+            workflow="amplicon",
+            version="1.1.0",
+            params={"workflow": "amplicon", "version": "1.1.0", "probe": str(uuid.uuid4())},
+        )
+    processing_idx = row["processing_idx"]
+    yield {**probe, "processing_idx": processing_idx}
+    await postgres_pool.execute(
+        "DELETE FROM qiita.exported_identifier WHERE prep_sample_idx = $1",
+        probe["prep_sample_idx"],
+    )
+    await postgres_pool.execute(
+        "DELETE FROM qiita.processing WHERE processing_idx = $1", processing_idx
+    )
+
+
+async def _mint_processing_kind(postgres_pool, p) -> asyncpg.Record:
+    return await postgres_pool.fetchrow(
+        "INSERT INTO qiita.exported_identifier"
+        "       (processing_idx, prep_sample_idx, created_by_idx)"
+        " VALUES ($1, $2, $3) RETURNING idx, export_id, retired",
+        p["processing_idx"],
+        p["prep_sample_idx"],
+        p["principal_idx"],
+    )
+
+
+async def test_a_processing_run_names_a_processed_sample(postgres_pool, processing_probe):
+    row = await _mint_processing_kind(postgres_pool, processing_probe)
+    assert row["export_id"] == f"QM{row['idx']}"
+
+
+async def test_alignment_and_processing_on_one_row_is_refused(postgres_pool, processing_probe):
+    with pytest.raises(asyncpg.CheckViolationError, match="one_processing"):
+        await postgres_pool.execute(
+            "INSERT INTO qiita.exported_identifier"
+            "       (alignment_idx, processing_idx, prep_sample_idx, created_by_idx)"
+            " VALUES ($1, $2, $3, $4)",
+            processing_probe["alignment_idx"],
+            processing_probe["processing_idx"],
+            processing_probe["prep_sample_idx"],
+            processing_probe["principal_idx"],
+        )
+
+
+async def test_one_live_identifier_per_processing_sample(postgres_pool, processing_probe):
+    """The processing kind's own partial index: the alignment one cannot cover a
+    row whose alignment_idx is NULL."""
+    await _mint_processing_kind(postgres_pool, processing_probe)
+    with pytest.raises(asyncpg.UniqueViolationError):
+        await _mint_processing_kind(postgres_pool, processing_probe)
+
+
+async def test_both_kinds_coexist_for_one_sample(postgres_pool, processing_probe):
+    """One sample aligned and denoised is two processed samples, two identifiers."""
+    a = await _mint(postgres_pool, processing_probe)
+    b = await _mint_processing_kind(postgres_pool, processing_probe)
+    assert a["export_id"] != b["export_id"]
+
+
+async def test_deleting_the_processing_retires_the_identifier(postgres_pool, processing_probe):
+    row = await _mint_processing_kind(postgres_pool, processing_probe)
+    await postgres_pool.execute(
+        "DELETE FROM qiita.processing WHERE processing_idx = $1",
+        processing_probe["processing_idx"],
+    )
+    after = await postgres_pool.fetchrow(
+        "SELECT export_id, processing_idx, retired, retire_reason"
+        " FROM qiita.exported_identifier WHERE idx = $1",
+        row["idx"],
+    )
+    assert after["export_id"] == row["export_id"]
+    assert after["processing_idx"] is None
+    assert after["retired"] is True
+    assert f"processing {processing_probe['processing_idx']} was deleted" in after["retire_reason"]

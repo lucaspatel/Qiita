@@ -21,6 +21,16 @@ live in [`docs/changelog-archive/`](docs/changelog-archive/).
 
 ### Added
 
+- **Amplicon samples get their public QM identifiers when a run loads.**
+  `exported_identifier` gains its second processing kind, a `qiita.processing`
+  run, and amplicon 1.1.0 ends with `mint-amplicon-identifiers`, which mints one
+  per processed sample the run registered, as the submitter.
+- **`GET /amplicon/{processing_idx}/feature-table` serves an amplicon run's table
+  as TSV.** Rows are ASV sequences, columns the samples' QM identifiers; access is
+  all-or-nothing over the run's samples, and `study_idx` narrows the table to one
+  study's share of a pool. The data plane serves `amplicon_membership` and the ASV
+  sequence tables, scoped to one run over a cohort.
+
 - **A work ticket can carry a follow-on (`on_success`).** `POST /work-ticket`
   accepts an `on_success` action and context; when the ticket completes, the
   control plane submits it as the same user on the same scope target. The
