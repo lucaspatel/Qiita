@@ -44,7 +44,9 @@ def test_amplicon_samples_form_run_reads_asvs_feature_table():
     assert group.prep_protocol == "short_read_amplicon"
     nodes = {n.id: n for n in group.nodes}
     assert list(nodes) == ["run", "reads", "processing:11", "feature_table:11"]
-    assert nodes["reads"].label == "golay-demux → reads"
+    assert [n.label for n in nodes.values()] == ["Run", "Reads", "ASVs", "Feature table"]
+    assert nodes["reads"].detail == "golay-demux"
+    assert nodes["processing:11"].detail == "amplicon 1.1.0"
     assert nodes["reads"].counts == {"completed": 2, "no_data": 1}
     assert nodes["processing:11"].counts == {"completed": 1, "no_data": 1, "not_started": 1}
     assert nodes["processing:11"].value_label == "ASVs"

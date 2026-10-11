@@ -26,7 +26,10 @@ class LineageNode(BaseModel):
 
     id: str
     kind: LineageNodeKind
+    # What the node is ("Reads", "ASVs"); `detail` says what produced it
+    # ("golay-demux", "amplicon 1.1.0").
     label: str
+    detail: str | None = None
     # The workflow a processing node ran; absent on run, reads and product nodes.
     action_id: str | None = None
     processing_idx: int | None = None

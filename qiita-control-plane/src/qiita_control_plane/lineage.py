@@ -131,7 +131,7 @@ def build_study_lineage(study_idx: int, rows: dict[str, list[Any]]) -> StudyLine
             if not any(e.source == source and e.target == target for e in edges):
                 edges.append(LineageEdge(source=source, target=target))
 
-        node(RUN_NODE, kind="run", label="Sequencing run")
+        node(RUN_NODE, kind="run", label="Run")
         ingest_actions = sorted(
             {
                 ingest_by_pool[s["sequenced_pool_idx"]]["action_id"]
@@ -142,7 +142,8 @@ def build_study_lineage(study_idx: int, rows: dict[str, list[Any]]) -> StudyLine
         node(
             READS_NODE,
             kind="reads",
-            label=f"{' / '.join(ingest_actions)} → reads" if ingest_actions else "Reads",
+            label="Reads",
+            detail=" / ".join(ingest_actions) or None,
             value_label="Reads",
         )
         edge(RUN_NODE, READS_NODE)
@@ -160,7 +161,13 @@ def build_study_lineage(study_idx: int, rows: dict[str, list[Any]]) -> StudyLine
             if r["prep_sample_idx"] not in idxs:
                 continue
             node_id = f"mask:{r['mask_idx']}"
-            node(node_id, kind="mask", label=f"Read mask #{r['mask_idx']}", mask_idx=r["mask_idx"])
+            node(
+                node_id,
+                kind="mask",
+                label="Processed reads",
+                detail=f"read mask #{r['mask_idx']}",
+                mask_idx=r["mask_idx"],
+            )
             edge(READS_NODE, node_id)
             cells[r["prep_sample_idx"]][node_id] = LineageCell(state=r["state"])
 
@@ -171,7 +178,8 @@ def build_study_lineage(study_idx: int, rows: dict[str, list[Any]]) -> StudyLine
             node(
                 node_id,
                 kind="processing",
-                label=f"{r['workflow']} {r['version']}",
+                label="Assembly",
+                detail=f"{r['workflow']} {r['version']}",
                 action_id=r["workflow"],
                 processing_idx=r["processing_idx"],
             )
@@ -187,7 +195,8 @@ def build_study_lineage(study_idx: int, rows: dict[str, list[Any]]) -> StudyLine
             node(
                 node_id,
                 kind="processing",
-                label=f"{r['workflow']} {r['version']} → ASVs",
+                label="ASVs",
+                detail=f"{r['workflow']} {r['version']}",
                 action_id=AMPLICON_ACTION_ID,
                 processing_idx=r["processing_idx"],
                 value_label="ASVs",
