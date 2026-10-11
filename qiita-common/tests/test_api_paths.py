@@ -364,6 +364,7 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_STUDY_PREFIX",
         "PATH_SEQUENCED_POOL_BY_STUDY",
     ),
+    ("URL_STUDY_LINEAGE", "PATH_STUDY_PREFIX", "PATH_STUDY_LINEAGE"),
     (
         "URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX",
         "PATH_STUDY_PREFIX",

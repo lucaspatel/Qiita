@@ -159,6 +159,10 @@ PER_SAMPLE_MASK_ACTION_IDS = (READ_MASK_ACTION_ID, FASTQ_TO_PARQUET_ACTION_ID)
 # which bcl-convert version produced it.
 BCL_CONVERT_ACTION_ID = "bcl-convert"
 
+# The Golay demultiplexer's bare id (workflows/golay-demux/<version>.yaml): the
+# other pool-scoped action that lands a pool's reads, alongside bcl-convert.
+GOLAY_DEMUX_ACTION_ID = "golay-demux"
+
 # The two BLOCK-scoped actions' bare ids (their YAML lives at
 # workflows/read-mask-block/<version>.yaml and workflows/align/<version>.yaml).
 # Bare ids for the same reason as the two above — and here the version-agnosticism
@@ -195,6 +199,10 @@ LONG_READ_ASSEMBLY_ACTION_ID = "long-read-assembly"
 # `read_masked` pass-set named by its action_context `align_mask_idx` — so the same
 # readers that key on the constant above key on this one.
 ALIGN_DENOVO_ACTION_ID = "align-denovo"
+
+# The amplicon denoise action's bare id (workflows/amplicon/<version>.yaml), and so
+# the `qiita.processing.workflow` of every amplicon run.
+AMPLICON_ACTION_ID = "amplicon"
 
 
 class Audience(BaseModel):

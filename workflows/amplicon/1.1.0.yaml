@@ -105,6 +105,13 @@ steps:
     inputs: [asv_counts]
     outputs: []
 
+  # close the run's per-sample gate (qiita.amplicon_sample): 'completed' with its
+  # ASV count for each sample denoise counted, 'no_data' for the rest of the pool.
+  # the runner materialized the pool's 'pending' rows when it minted the run.
+  - action: finalize-amplicon-sample
+    inputs: [asv_counts]
+    outputs: []
+
 action_ceiling:
   # mem_gb above the denoise baseline so a memory retry can escalate.
   cpu: 8

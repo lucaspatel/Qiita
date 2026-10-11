@@ -1630,10 +1630,11 @@ def test_load_actions_orders_a_two_digit_minor_after_a_one_digit_one(tmp_path):
     assert versions == ["1.9.0", "1.10.0"], versions
 
 
-def test_load_actions_loads_amplicon_1_1_0_with_the_identifier_tail():
-    """amplicon 1.1.0 is 1.0.0 plus `mint-amplicon-identifiers` after
-    register-files, reading denoise's asv_counts (register-files has moved the
-    staged membership into the lake by then)."""
+def test_load_actions_loads_amplicon_1_1_0_with_the_identifier_and_gate_tail():
+    """amplicon 1.1.0 is 1.0.0 plus `mint-amplicon-identifiers` and
+    `finalize-amplicon-sample` after register-files, both reading denoise's
+    asv_counts (register-files has moved the staged membership into the lake by
+    then)."""
     from pathlib import Path
 
     from qiita_control_plane.actions import load_actions
@@ -1644,6 +1645,7 @@ def test_load_actions_loads_amplicon_1_1_0_with_the_identifier_tail():
     assert [s.name for s in new.steps] == [
         *(s.name for s in old.steps),
         "mint-amplicon-identifiers",
+        "finalize-amplicon-sample",
     ]
-    assert new.steps[-1].inputs == ["asv_counts"]
+    assert new.steps[-2].inputs == new.steps[-1].inputs == ["asv_counts"]
     assert new.context_schema == old.context_schema

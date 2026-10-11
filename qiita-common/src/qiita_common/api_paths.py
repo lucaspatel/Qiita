@@ -241,6 +241,11 @@ class LibraryPrimitive(StrEnum):
     # register-files, so an identifier never names data that did not land. See
     # qiita_control_plane.actions.library.mint_amplicon_identifiers.
     MINT_AMPLICON_IDENTIFIERS = "mint-amplicon-identifiers"
+    # Amplicon: close the run's qiita.amplicon_sample gate — 'completed' with an
+    # ASV count for each sample denoise counted, 'no_data' for the rest of the
+    # pool. The runner materializes the 'pending' rows for any workflow that
+    # declares it. See qiita_control_plane.actions.library.finalize_amplicon_sample.
+    FINALIZE_AMPLICON_SAMPLE = "finalize-amplicon-sample"
 
 
 # =============================================================================
@@ -996,6 +1001,8 @@ PATH_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX = "/{study_idx}/sequenced-sample/{sequenc
 PATH_SEQUENCED_SAMPLE_METADATA_BY_STUDY = (
     "/{study_idx}/sequenced-sample/{sequenced_sample_idx}/metadata"
 )
+# Every sample's provenance in the study, grouped into one DAG per prep protocol.
+PATH_STUDY_LINEAGE = "/{study_idx}/lineage"
 # The distinct sequenced_pools a study's samples sit in — the study-first join
 # the run-centric pool routes never expose. Composes under PATH_STUDY_PREFIX.
 PATH_SEQUENCED_POOL_BY_STUDY = "/{study_idx}/sequenced-pool"
@@ -1017,6 +1024,7 @@ URL_SEQUENCED_SAMPLE_LIST_BY_RUN_FULL = (
 )
 URL_SEQUENCED_SAMPLE_LIST_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_SEQUENCED_SAMPLE_LIST_BY_STUDY}"
 URL_SEQUENCED_POOL_BY_STUDY = f"{URL_STUDY_PREFIX}{PATH_SEQUENCED_POOL_BY_STUDY}"
+URL_STUDY_LINEAGE = f"{URL_STUDY_PREFIX}{PATH_STUDY_LINEAGE}"
 URL_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX = (
     f"{URL_STUDY_PREFIX}{PATH_SEQUENCED_SAMPLE_BY_STUDY_AND_IDX}"
 )

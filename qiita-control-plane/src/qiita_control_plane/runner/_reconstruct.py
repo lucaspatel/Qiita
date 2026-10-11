@@ -526,6 +526,21 @@ async def _run_action_primitive(
         )
         return {}
 
+    if entry.name == LibraryPrimitive.FINALIZE_AMPLICON_SAMPLE:
+        # After register-files; processing_idx from `bound`, the run identity the
+        # runner minted (and materialized the pool's 'pending' rows under) before
+        # the loop.
+        if set(entry.inputs) != {"asv_counts"}:
+            raise RuntimeError(
+                f"finalize-amplicon-sample expects inputs [asv_counts]; got {entry.inputs!r}"
+            )
+        await LIBRARY[LibraryPrimitive.FINALIZE_AMPLICON_SAMPLE](
+            pool,
+            processing_idx=bound[PROCESSING_IDX_BINDING],
+            asv_counts_path=Path(bound["asv_counts"]),
+        )
+        return {}
+
     if entry.name == LibraryPrimitive.REGISTER_INDEX:
         # Native step outputs are paths (StepResultResponse.outputs is
         # dict[str, str]), so an index builder can't hand back the build params

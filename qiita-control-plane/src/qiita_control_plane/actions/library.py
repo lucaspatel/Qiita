@@ -60,6 +60,7 @@ from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE, genome_lineage_select_s
 
 from ..auth.tickets import run_signed_flight_call, sign_action, sign_ticket
 from ..miint import duckdb_connect
+from ..repositories.amplicon import close_amplicon_samples
 from ..repositories.assembly import (
     ASSEMBLY_GENOME_MAP_PAIRS_SQL,
     ASSEMBLY_GENOME_MAP_ROWS_SQL,
@@ -3267,6 +3268,31 @@ async def mint_amplicon_identifiers(
     return len(prep_sample_idxs)
 
 
+async def finalize_amplicon_sample(
+    pool: asyncpg.Pool,
+    *,
+    processing_idx: int,
+    asv_counts_path: Path,
+) -> tuple[int, int]:
+    """Close an amplicon run's qiita.amplicon_sample gate from denoise's
+    `asv_counts` (one row per counted (prep_sample, ASV)), and return how many
+    samples were written (completed, no_data).
+
+    Runs after register-files, so 'completed' never names a sample whose ASVs did
+    not land. Read from the denoise output for the reason on
+    `mint_amplicon_identifiers`: after register-files no staged copy is left."""
+    with duckdb.connect() as duck:
+        counts = dict(
+            duck.execute(
+                "SELECT prep_sample_idx, count(*)::INTEGER FROM read_parquet(?)"
+                " GROUP BY prep_sample_idx",
+                [str(asv_counts_path)],
+            ).fetchall()
+        )
+    async with pool.acquire() as conn, conn.transaction():
+        return await close_amplicon_samples(conn, processing_idx=processing_idx, asv_counts=counts)
+
+
 LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.MINT_FEATURES: mint_features,
     LibraryPrimitive.MINT_ANNOTATION_FEATURES: mint_annotation_features,
@@ -3289,4 +3315,5 @@ LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.RECONCILE_ALIGNMENT_BLOCK: reconcile_alignment_block,
     LibraryPrimitive.SYNC_REFERENCE_EXCLUSION: sync_reference_exclusion,
     LibraryPrimitive.MINT_AMPLICON_IDENTIFIERS: mint_amplicon_identifiers,
+    LibraryPrimitive.FINALIZE_AMPLICON_SAMPLE: finalize_amplicon_sample,
 }
