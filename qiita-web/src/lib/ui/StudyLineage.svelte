@@ -231,14 +231,20 @@
       return;
     }
     try {
-      const pcoa = await pyworker.pcoa(table.data);
-      pcoaFor = { ...pcoaFor, [processingIdx]: { state: 'ok', table: table.data, pcoa, busy: false } };
-      // Restore the last depth, if a sample still has exactly that depth.
+      let pcoa = await pyworker.pcoa(table.data);
+      // Restore the last depth, if a sample still has exactly that depth, before
+      // anything is shown, so the plot draws once at the depth it will stay at.
       const saved = loadPlotPrefs(studyIdx, protocol).pcoaDepth;
       if (saved != null) {
-        if (pcoa.depths.includes(saved)) await rarefy(processingIdx, saved, protocol);
-        else savePlotPrefs(studyIdx, protocol, { pcoaDepth: null });
+        try {
+          if (!pcoa.depths.includes(saved)) throw new Error('no sample has that depth any more');
+          pcoa = await pyworker.pcoa(table.data, saved);
+        } catch (e) {
+          savePlotPrefs(studyIdx, protocol, { pcoaDepth: null });
+          console.warn(`Saved PCoA depth ${saved} not restored:`, e);
+        }
       }
+      pcoaFor = { ...pcoaFor, [processingIdx]: { state: 'ok', table: table.data, pcoa, busy: false } };
     } catch (e) {
       pcoaFor = { ...pcoaFor, [processingIdx]: { state: 'error', message: `PCoA: ${String(e)}` } };
     }
@@ -528,7 +534,9 @@
               {@const shaping = pc?.state === 'ok' ? shapingFor(g, pc.pcoa.samples, bio) : null}
               <div class="grid grid-cols-1 gap-x-2 pt-4 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
                 <div>
-                  {#if pc?.state === 'ok'}
+                  <!-- Held until the metadata is in too, so the restored colours and
+                       shapes are on the first draw rather than repainted over it. -->
+                  {#if pc?.state === 'ok' && meta?.state === 'ok'}
                     <PcoaPlot
                       pcoa={pc.pcoa}
                       busy={pc.busy}
@@ -544,10 +552,10 @@
                   {:else if pc?.state === 'error'}
                     <p class="px-4 py-12 text-center text-sm text-amber-800 sm:px-6">{pc.message}</p>
                   {:else}
-                    <Spinner label="Computing PCoA…" />
+                    <Spinner label={pc?.state === 'ok' ? 'Loading sample metadata…' : 'Computing PCoA…'} />
                   {/if}
                 </div>
-                {#if pc?.state === 'ok'}
+                {#if pc?.state === 'ok' && meta?.state === 'ok'}
                   <div class="lg:pt-6">
                     <ColorPanel
                       variables={meta?.state === 'ok' ? variablesOf(meta.byLabel) : []}
@@ -579,13 +587,17 @@
               {@const coloring = coloringFor(g, labels)}
               {@const shaping = shapingFor(g, labels)}
               <div class="grid grid-cols-1 gap-x-2 pt-4 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
-                <ValueScatter
-                  {...sc}
-                  colorOf={coloring?.colorOf ?? null}
-                  symbolOf={shaping?.symbolOf ?? null}
-                  initialDepth={loadPlotPrefs(studyIdx, g.prep_protocol).asvDepth ?? null}
-                  onDepthChange={(d) => savePlotPrefs(studyIdx, g.prep_protocol, { asvDepth: d })}
-                />
+                {#if meta?.state === 'ok'}
+                  <ValueScatter
+                    {...sc}
+                    colorOf={coloring?.colorOf ?? null}
+                    symbolOf={shaping?.symbolOf ?? null}
+                    initialDepth={loadPlotPrefs(studyIdx, g.prep_protocol).asvDepth ?? null}
+                    onDepthChange={(d) => savePlotPrefs(studyIdx, g.prep_protocol, { asvDepth: d })}
+                  />
+                {:else}
+                  <Spinner label="Loading sample metadata…" />
+                {/if}
                 <div class="lg:pt-6">
                   <ColorPanel
                     variables={meta?.state === 'ok' ? variablesOf(meta.byLabel) : []}
