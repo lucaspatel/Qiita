@@ -48,6 +48,17 @@ _INGEST_STATE: dict[str, LineageState] = {
 }
 
 
+def _sample_label(sample: Any) -> str:
+    """The sample's public name: its biosample's BioSample accession, else its ENA
+    sample accession, else its minted QB. Every biosample has a QB from the
+    insert that created it, so a missing label is a broken invariant."""
+    if sample["label"] is None:
+        raise RuntimeError(
+            f"prep_sample_idx {sample['prep_sample_idx']} has no accession and no QB"
+        )
+    return sample["label"]
+
+
 async def fetch_study_lineage(pool: asyncpg.Pool, study_idx: int) -> dict[str, list[Any]]:
     """The rows `build_study_lineage` needs for the study's live samples: the same
     population the study's sequenced-sample listing returns (live links, live
@@ -55,12 +66,14 @@ async def fetch_study_lineage(pool: asyncpg.Pool, study_idx: int) -> dict[str, l
     samples = await pool.fetch(
         "SELECT ps.idx AS prep_sample_idx, pp.name AS prep_protocol,"
         "       ss.sequenced_pool_idx, sp.sequencing_run_idx, ss.sequenced_pool_item_id,"
-        "       COALESCE(b.biosample_accession, b.ena_sample_accession) AS accession,"
+        "       COALESCE(b.biosample_accession, b.ena_sample_accession, ee.export_entity_id)"
+        "         AS label,"
         "       sr.sequence_idx_stop - sr.sequence_idx_start + 1 AS read_count"
         "  FROM qiita.prep_sample_to_study pst"
         "  JOIN qiita.prep_sample ps ON ps.idx = pst.prep_sample_idx"
         "  JOIN qiita.prep_protocol pp ON pp.idx = ps.prep_protocol_idx"
         "  JOIN qiita.biosample b ON b.idx = ps.biosample_idx"
+        "  LEFT JOIN qiita.exported_entity ee ON ee.biosample_idx = b.idx"
         "  LEFT JOIN qiita.sequenced_sample ss ON ss.prep_sample_idx = ps.idx"
         "  LEFT JOIN qiita.sequenced_pool sp ON sp.idx = ss.sequenced_pool_idx"
         "  LEFT JOIN qiita.sequence_range sr ON sr.prep_sample_idx = ps.idx"
@@ -234,8 +247,7 @@ def build_study_lineage(study_idx: int, rows: dict[str, list[Any]]) -> StudyLine
                 samples=[
                     LineageSample(
                         prep_sample_idx=s["prep_sample_idx"],
-                        label=s["accession"]
-                        or f"pool item {s['sequenced_pool_item_id'] or s['prep_sample_idx']}",
+                        label=_sample_label(s),
                         sequencing_run_idx=s["sequencing_run_idx"],
                         sequenced_pool_idx=s["sequenced_pool_idx"],
                         cells=cells[s["prep_sample_idx"]],

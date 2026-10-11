@@ -59,7 +59,7 @@ class LineageSample(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     prep_sample_idx: int
-    # The biosample's accession where it has one, else the pool item id.
+    # The biosample's accession where it has one, else its QB.
     label: str
     sequencing_run_idx: int | None
     sequenced_pool_idx: int | None
