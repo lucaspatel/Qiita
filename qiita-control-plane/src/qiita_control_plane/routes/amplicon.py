@@ -1,7 +1,8 @@
 """An amplicon run's feature table over REST.
 
 `GET /amplicon/{processing_idx}/feature-table` serves the table a completed
-amplicon run produced, as TSV: ASV sequences by the samples' QM identifiers. A
+amplicon run produced, as TSV: ASV sequences by the samples' public names (see
+`_run_labels`). A
 REST route rather than a ticket mint because its consumers include the web UI,
 which cannot speak Flight, and because the table is small (a pool's ASVs).
 
@@ -41,11 +42,23 @@ TSV_MEDIA_TYPE = "text/tab-separated-values"
 async def _run_labels(
     pool: asyncpg.Pool, processing_idx: int, study_idx: int | None
 ) -> dict[int, str]:
-    """prep_sample_idx -> export_id for the run's live identifiers, ascending,
-    optionally only those linked (unretired) to `study_idx`."""
+    """prep_sample_idx -> column name for the run's samples (those holding a live
+    QM identifier), ascending, optionally only those linked (unretired) to
+    `study_idx`.
+
+    The column name is the biosample's public name, as the study lineage labels
+    it: its BioSample accession, else its ENA sample accession, else its QB. Two
+    samples of one biosample in a run would share a name, which could not say
+    which one a count came from, so that is refused.
+    """
     rows = await pool.fetch(
-        "SELECT ei.prep_sample_idx, ei.export_id"
+        "SELECT ei.prep_sample_idx,"
+        "       COALESCE(b.biosample_accession, b.ena_sample_accession, ee.export_entity_id)"
+        "         AS label"
         "  FROM qiita.exported_identifier ei"
+        "  JOIN qiita.prep_sample ps ON ps.idx = ei.prep_sample_idx"
+        "  JOIN qiita.biosample b ON b.idx = ps.biosample_idx"
+        "  LEFT JOIN qiita.exported_entity ee ON ee.biosample_idx = b.idx"
         " WHERE ei.processing_idx = $1 AND NOT ei.retired"
         "   AND ($2::bigint IS NULL OR EXISTS ("
         "     SELECT 1 FROM qiita.prep_sample_to_study pst"
@@ -55,7 +68,23 @@ async def _run_labels(
         processing_idx,
         study_idx,
     )
-    return {row["prep_sample_idx"]: row["export_id"] for row in rows}
+    unnamed = [row["prep_sample_idx"] for row in rows if row["label"] is None]
+    if unnamed:
+        raise RuntimeError(f"prep_sample_idx {unnamed[:5]} have no accession and no QB")
+    owners: dict[str, list[int]] = {}
+    for row in rows:
+        owners.setdefault(row["label"], []).append(row["prep_sample_idx"])
+    shared = {label: idxs for label, idxs in owners.items() if len(idxs) > 1}
+    if shared:
+        label, idxs = min(shared.items())
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{len(shared)} biosample name(s) would head more than one column,"
+                f" e.g. {label!r} (prep_sample_idx {idxs[:5]})"
+            ),
+        )
+    return {row["prep_sample_idx"]: row["label"] for row in rows}
 
 
 @router.get(PATH_AMPLICON_FEATURE_TABLE, response_class=PlainTextResponse)

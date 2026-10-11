@@ -1,6 +1,7 @@
 """Route tests for GET /amplicon/{processing_idx}/feature-table.
 
-The run's cohort is the samples it minted QM identifiers for at load. Access is
+The run's cohort is the samples it minted QM identifiers for at load; columns
+are named by each biosample's accession, else its QB. Access is
 all-or-nothing over that cohort (or over the slice a `study_idx` names), in the
 order the other cohort routes use: the run exists → access → content. The
 data-plane read is stubbed; its scope is pinned by the data plane's own tests.
@@ -67,13 +68,20 @@ async def amplicon_run(role_keyed_clients, pool_alignment_seed, monkeypatch):
     await db.execute("DELETE FROM qiita.processing WHERE processing_idx = $1", processing_idx)
 
 
-async def _export_ids(db, processing_idx, prep_sample_idxs):
+async def _column_names(db, processing_idx, prep_sample_idxs):
+    """The run's samples' public names (accession, else QB), in column order."""
     rows = await db.fetch(
-        "SELECT prep_sample_idx, export_id FROM qiita.exported_identifier"
-        " WHERE processing_idx = $1 ORDER BY prep_sample_idx",
+        "SELECT ei.prep_sample_idx,"
+        "       COALESCE(b.biosample_accession, b.ena_sample_accession, ee.export_entity_id)"
+        "         AS label"
+        "  FROM qiita.exported_identifier ei"
+        "  JOIN qiita.prep_sample ps ON ps.idx = ei.prep_sample_idx"
+        "  JOIN qiita.biosample b ON b.idx = ps.biosample_idx"
+        "  JOIN qiita.exported_entity ee ON ee.biosample_idx = b.idx"
+        " WHERE ei.processing_idx = $1 ORDER BY ei.prep_sample_idx",
         processing_idx,
     )
-    return [r["export_id"] for r in rows if r["prep_sample_idx"] in prep_sample_idxs]
+    return [r["label"] for r in rows if r["prep_sample_idx"] in prep_sample_idxs]
 
 
 async def test_serves_the_whole_run_as_tsv(role_keyed_clients, amplicon_run):
@@ -84,7 +92,7 @@ async def test_serves_the_whole_run_as_tsv(role_keyed_clients, amplicon_run):
     assert resp.status_code == 200, resp.text
     assert resp.headers["content-type"].startswith("text/tab-separated-values")
     cohort = sorted([run["ps_a"], run["ps_b"], run["ps_c"]])
-    labels = await _export_ids(db, run["processing_idx"], cohort)
+    labels = await _column_names(db, run["processing_idx"], cohort)
     assert resp.text.splitlines() == ["#OTU ID\t" + "\t".join(labels), "ACGTACGT\t1\t2\t3"]
     assert run["fetched"] == [cohort]
 
@@ -134,7 +142,7 @@ async def test_study_idx_narrows_to_that_studys_samples(role_keyed_clients, ampl
     )
     assert resp.status_code == 200, resp.text
     cohort = sorted([run["ps_a"], run["ps_c"]])
-    labels = await _export_ids(db, run["processing_idx"], cohort)
+    labels = await _column_names(db, run["processing_idx"], cohort)
     assert resp.text.splitlines()[0] == "#OTU ID\t" + "\t".join(labels)
     assert run["fetched"] == [cohort]
 
