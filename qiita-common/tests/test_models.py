@@ -82,6 +82,21 @@ def test_reference_create_request_accepts_artifact_sequence_set_kind():
     assert req.kind == "artifact_sequence_set"
 
 
+def test_reference_file_register_request_reads_the_format_from_the_suffix():
+    import pytest
+    from pydantic import ValidationError
+
+    from qiita_common.models import ReferenceFileRegisterRequest
+
+    base = {"name": "wol3", "version": "rc4", "sha256": "a" * 64, "size_bytes": 1}
+    two = ReferenceFileRegisterRequest(fs_path="/db/wol3.syl2db", **base)
+    one = ReferenceFileRegisterRequest(fs_path="/db/wol3.syldb", **base)
+    assert (two.format, one.format, two.index_type) == ("syl2db", "syldb", "sylph")
+    for bad in ("db/wol3.syl2db", "/db/wol3.fa"):
+        with pytest.raises(ValidationError):
+            ReferenceFileRegisterRequest(fs_path=bad, **base)
+
+
 def test_reference_create_request_rejects_unknown_kind():
     """A kind outside the Literal is rejected at the model boundary."""
     import pytest

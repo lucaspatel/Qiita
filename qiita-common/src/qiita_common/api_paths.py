@@ -66,6 +66,9 @@ PATH_REFERENCE_EXCLUSION = "/exclusion"
 # sync / rebuilt catalog / fresh data plane). A longer literal than /exclusion, so
 # unambiguous; still a literal, registered before the `/{reference_idx}` routes.
 PATH_REFERENCE_EXCLUSION_SYNC = "/exclusion/sync"
+# Admin registration of a prebuilt profiling database (a sylph file) where it
+# already sits on disk. Literal segment, registered before `/{reference_idx}`.
+PATH_REFERENCE_FILE = "/file"
 # Reference-scoped read of what the blocklist filters from one reference.
 PATH_REFERENCE_EXCLUSION_BY_IDX = "/{reference_idx}/exclusion"
 # Resolve a genome to its member features (feature_idx + accession) within one
@@ -95,6 +98,7 @@ URL_REFERENCE_PREFIX = f"{API_PREFIX}{PATH_REFERENCE_PREFIX}"
 URL_REFERENCE_BY_IDX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_BY_IDX}"
 URL_REFERENCE_STATUS = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_STATUS}"
 URL_REFERENCE_INDEX = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_INDEX}"
+URL_REFERENCE_FILE = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_FILE}"
 URL_REFERENCE_SHARD_INDEX_STATUS = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_SHARD_INDEX_STATUS}"
 URL_REFERENCE_DOGET = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_DOGET}"
 URL_REFERENCE_EXCLUSION = f"{URL_REFERENCE_PREFIX}{PATH_REFERENCE_EXCLUSION}"

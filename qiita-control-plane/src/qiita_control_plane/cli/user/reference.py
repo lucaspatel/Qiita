@@ -7,6 +7,7 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import hashlib
 import json
 import os
 import sys
@@ -15,6 +16,7 @@ from typing import Any
 
 from qiita_common.api_paths import (
     PATH_REFERENCE_DOGET,
+    PATH_REFERENCE_FILE,
     PATH_REFERENCE_GENOME_MEMBER,
     PATH_REFERENCE_INDEX,
     PATH_REFERENCE_PREFIX,
@@ -30,6 +32,38 @@ from .. import _common
 # The reference_sequence_chunks columns the DoGet stream carries. The FASTA
 # writer reassembles chunk_data ordered by chunk_index per feature_idx.
 _CHUNKS_TABLE = "reference_sequence_chunks"
+
+
+def _sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for block in iter(lambda: fh.read(1 << 24), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _handle_reference_register_file(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> int:
+    """Register a prebuilt profiling database (a sylph `.syl2db`/`.syldb`) where
+    it sits on disk. Hashes the file here, so run it on a host that sees the
+    same path the control plane and the compute nodes do."""
+    path = Path(args.path).resolve()
+    if not path.is_file():
+        parser.error(f"--path {args.path}: not a file")
+    body = {
+        "name": args.name,
+        "version": args.version,
+        "index_type": args.index_type,
+        "fs_path": str(path),
+        "sha256": _sha256_of(path),
+        "size_bytes": path.stat().st_size,
+    }
+    return _common.run_http_subcommand(
+        lambda token: _common.call(
+            "POST", args.base_url, token, f"{PATH_REFERENCE_PREFIX}{PATH_REFERENCE_FILE}", json=body
+        )
+    )
 
 
 def _handle_reference_list(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:

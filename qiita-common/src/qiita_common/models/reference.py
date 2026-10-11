@@ -9,6 +9,7 @@ from uuid import UUID
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 from qiita_common.auth_constants import MAX_NAME_LENGTH, MAX_VERSION_LENGTH
+from qiita_common.models.upload import SHA256_HEX_PATTERN
 
 
 class ReferenceStatus(StrEnum):
@@ -214,12 +215,17 @@ class Tier(StrEnum):
 STORABLE_ACCESS_TIERS: frozenset[Tier] = frozenset({Tier.VIEWER, Tier.MEMBER, Tier.ADMIN})
 
 
-ReferenceKind = Literal["sequence_reference", "taxonomy_authority", "artifact_sequence_set"]
+ReferenceKind = Literal[
+    "sequence_reference", "taxonomy_authority", "artifact_sequence_set", "profiling_database"
+]
 """Kinds of reference, mirroring the `qiita.reference.kind` TEXT/CHECK column
 (NOT a Postgres ENUM — see the reference migrations). `artifact_sequence_set` is
 an indexless set of artifact sequences (e.g. the canonical adapter set the QC
 step trims against): ingested through the same kind-agnostic reference-add flow,
-but carries no taxonomy and builds no rype/minimap2 index."""
+but carries no taxonomy and builds no rype/minimap2 index. `profiling_database`
+is a prebuilt file a profiler reads whole (a sylph database), registered where
+an operator staged it (`ReferenceFileRegisterRequest`) rather than ingested: it
+has no sequences, only its one index row naming the file."""
 
 
 class ReferenceCreateRequest(BaseModel):
@@ -298,6 +304,17 @@ INDEX_TYPE_BOWTIE2 = "bowtie2"
 # carried it yet.
 INDEX_TYPE_RYPE_ROUTER = "rype_router"
 
+# A sylph database (`.syl2db`, or a plain `.syldb`): the one index row of a
+# `profiling_database` reference, recording a file an operator staged rather
+# than one a workflow built. Its params are the file's format, sha256 and size,
+# which a profiling run's identity carries so a file replaced in place is a new
+# run. Admitted by 20261011000000_profiling_database_reference.sql.
+INDEX_TYPE_SYLPH = "sylph"
+
+# The sylph database formats, by file suffix. miint reads either and tells them
+# apart by content; the suffix is what the registration records.
+SYLPH_DATABASE_SUFFIXES = {".syl2db": "syl2db", ".syldb": "syldb"}
+
 
 class ReferenceIndex(BaseModel):
     """A built search index for a reference (e.g. a rype `.ryxdi` directory).
@@ -320,6 +337,44 @@ class ReferenceIndex(BaseModel):
     params: dict[str, Any]
     created_at: AwareDatetime
     shard_id: int | None = None
+
+
+class ReferenceFileRegisterRequest(BaseModel):
+    """Register a prebuilt profiling database where it already sits on disk: one
+    `profiling_database` reference, active at once, and its `sylph` index row.
+
+    The caller (the CLI, on a host that sees the file) hashes it; the control
+    plane checks the path is an absolute, readable file of `size_bytes` before
+    recording it, and does not re-hash a multi-gigabyte file in a request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
+    version: str = Field(min_length=1, max_length=MAX_VERSION_LENGTH)
+    index_type: Literal["sylph"] = INDEX_TYPE_SYLPH
+    fs_path: str = Field(min_length=2, max_length=4096)
+    sha256: str = Field(pattern=SHA256_HEX_PATTERN)
+    size_bytes: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _absolute_with_a_known_suffix(self) -> ReferenceFileRegisterRequest:
+        if not self.fs_path.startswith("/"):
+            raise ValueError(f"fs_path must be absolute, got {self.fs_path!r}")
+        if not any(self.fs_path.endswith(sfx) for sfx in SYLPH_DATABASE_SUFFIXES):
+            raise ValueError(
+                f"fs_path must end in one of {sorted(SYLPH_DATABASE_SUFFIXES)},"
+                f" got {self.fs_path!r}"
+            )
+        return self
+
+    @property
+    def format(self) -> str:
+        return next(f for sfx, f in SYLPH_DATABASE_SUFFIXES.items() if self.fs_path.endswith(sfx))
+
+
+class ReferenceFileRegisterResponse(BaseModel):
+    reference: ReferenceResponse
+    index: ReferenceIndex
 
 
 class ReferenceShardIndexStatus(BaseModel):

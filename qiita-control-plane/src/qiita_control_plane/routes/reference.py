@@ -34,6 +34,7 @@ from qiita_common.api_paths import (
     PATH_REFERENCE_EXCLUSION,
     PATH_REFERENCE_EXCLUSION_BY_IDX,
     PATH_REFERENCE_EXCLUSION_SYNC,
+    PATH_REFERENCE_FILE,
     PATH_REFERENCE_GENOME_MAP,
     PATH_REFERENCE_GENOME_MAP_PARQUET,
     PATH_REFERENCE_GENOME_MEMBER,
@@ -49,7 +50,7 @@ from qiita_common.assembly_constants import (
     ASSEMBLED_SEQUENCE_TABLE,
     BIN_QUALITY_TABLE,
 )
-from qiita_common.auth_constants import Scope
+from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
     DoGetTicketRequest,
     DoGetTicketResponse,
@@ -61,6 +62,8 @@ from qiita_common.models import (
     ReferenceExclusionListItem,
     ReferenceExclusionMutationResponse,
     ReferenceExclusionSyncResponse,
+    ReferenceFileRegisterRequest,
+    ReferenceFileRegisterResponse,
     ReferenceGenomeMember,
     ReferenceIndex,
     ReferenceKind,
@@ -91,6 +94,7 @@ from ..actions.reference import (
 from ..auth.guards import (
     require_any_scope,
     require_complete_profile,
+    require_human_with_role,
     require_scope,
 )
 from ..auth.principal import (
@@ -171,6 +175,77 @@ async def create_reference(
     except asyncpg.PostgresError as exc:
         raise HTTPException(status_code=500, detail="Database error") from exc
     return ReferenceResponse(**dict(row))
+
+
+def _check_staged_file(fs_path: str, size_bytes: int) -> None:
+    """The file a registration names must be a regular file this host can read,
+    of the size the caller measured; 422 naming the path otherwise. The control
+    plane sees the same shared filesystem the profiling jobs read it from."""
+    path = Path(fs_path)
+    try:
+        st = path.stat()
+    except OSError as exc:
+        raise HTTPException(status_code=422, detail=f"{fs_path}: cannot stat ({exc.strerror})")
+    if not path.is_file():
+        raise HTTPException(status_code=422, detail=f"{fs_path}: not a regular file")
+    if st.st_size != size_bytes:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{fs_path}: is {st.st_size} bytes, the request says {size_bytes}",
+        )
+    try:
+        with path.open("rb") as fh:
+            fh.read(1)
+    except OSError as exc:
+        raise HTTPException(status_code=422, detail=f"{fs_path}: not readable ({exc.strerror})")
+
+
+@router.post(PATH_REFERENCE_FILE, status_code=201)
+async def register_reference_file(
+    body: ReferenceFileRegisterRequest,
+    pool: asyncpg.Pool = Depends(get_db_pool),
+    user: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
+    _scope: Principal = Depends(require_scope(Scope.REFERENCE_WRITE)),
+) -> ReferenceFileRegisterResponse:
+    """Register a prebuilt profiling database where an operator staged it: a
+    `profiling_database` reference, active at once (there is nothing to ingest),
+    and its one index row recording the path, format, sha256 and size. System
+    admin only, because it records an arbitrary server path."""
+    _check_staged_file(body.fs_path, body.size_bytes)
+    params = {"format": body.format, "sha256": body.sha256, "size_bytes": body.size_bytes}
+    try:
+        async with pool.acquire() as conn, conn.transaction():
+            ref = await conn.fetchrow(
+                "INSERT INTO qiita.reference"
+                "  (name, version, kind, status, is_host, created_by_idx)"
+                " VALUES ($1, $2, 'profiling_database', $3, false, $4)"
+                f" RETURNING {_REFERENCE_RETURNING}",
+                body.name,
+                body.version,
+                ReferenceStatus.ACTIVE.value,
+                user.principal_idx,
+            )
+            idx = await conn.fetchrow(
+                "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params)"
+                " VALUES ($1, $2, $3, $4::jsonb)"
+                " RETURNING reference_index_idx, reference_idx, index_type, fs_path, params,"
+                "           created_at, shard_id",
+                ref["reference_idx"],
+                body.index_type,
+                body.fs_path,
+                json.dumps(params),
+            )
+    except asyncpg.UniqueViolationError:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Reference ({body.name!r}, {body.version!r}) already exists",
+        )
+    index = dict(idx)
+    if isinstance(index["params"], str):
+        index["params"] = json.loads(index["params"])
+    return ReferenceFileRegisterResponse(
+        reference=ReferenceResponse(**dict(ref)), index=ReferenceIndex(**index)
+    )
 
 
 @router.get(PATH_REFERENCE_ROOT)

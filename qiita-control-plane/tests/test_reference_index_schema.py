@@ -140,6 +140,36 @@ async def test_reference_index_accepts_bowtie2_type(postgres_pool):
         await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
 
 
+async def test_reference_index_accepts_sylph_on_a_profiling_database(postgres_pool):
+    """A `profiling_database` reference carries one 'sylph' index row naming the
+    staged file, with its format, sha256 and size."""
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
+        " VALUES ('schema-refindex-sylph', '1', 'profiling_database', 'active', 1)"
+        " RETURNING reference_idx"
+    )
+    try:
+        rii = await postgres_pool.fetchval(
+            "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params)"
+            " VALUES ($1, 'sylph', '/srv/db/wol3.syl2db', $2::jsonb)"
+            " RETURNING reference_index_idx",
+            idx,
+            '{"format": "syl2db", "sha256": "' + "0" * 64 + '", "size_bytes": 1}',
+        )
+        assert (
+            await postgres_pool.fetchval(
+                "SELECT index_type FROM qiita.reference_index WHERE reference_index_idx = $1",
+                rii,
+            )
+            == "sylph"
+        )
+    finally:
+        await postgres_pool.execute(
+            "DELETE FROM qiita.reference_index WHERE reference_idx = $1", idx
+        )
+        await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
+
+
 async def test_reference_index_rejects_unknown_type(postgres_pool):
     idx = await _make_reference(postgres_pool, "schema-refindex-badtype")
     try:
