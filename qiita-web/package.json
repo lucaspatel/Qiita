@@ -29,7 +29,9 @@
   },
   "dependencies": {
     "@vincjo/datatables": "^2.8.1",
+    "apache-arrow": "^21.2.0",
     "leaflet": "^1.9.4",
-    "openapi-fetch": "^0.13.0"
+    "openapi-fetch": "^0.13.0",
+    "svelteplot": "^0.14.2"
   }
 }

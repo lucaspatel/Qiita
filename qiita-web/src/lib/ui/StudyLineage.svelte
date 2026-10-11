@@ -1,8 +1,31 @@
 <script lang="ts">
-  import { api, type StudyLineage, type LineageNode } from '$lib/api';
-  import { STATE_CLASS } from '$lib/tickets';
+  // The study's processing lineage: one DAG per prep protocol, straight from
+  // `GET /study/{idx}/lineage`. The server sends nodes, edges and every sample's
+  // state at each node; this only lays the graph out (columns by depth from the
+  // roots) and lists a clicked node's samples.
+  import {
+    api,
+    type LineageGroup,
+    type LineageNode,
+    type LineageState,
+    type StudyLineage
+  } from '$lib/api';
   import Card from './Card.svelte';
   import DataTable from './DataTable.svelte';
+  import { untrack } from 'svelte';
+  import { labelHeader } from '$lib/samples';
+  import ValueScatter from './ValueScatter.svelte';
+  import PcoaPlot from './PcoaPlot.svelte';
+  import Spinner from './Spinner.svelte';
+  import { pyworker, type Pcoa, type Permanova } from '$lib/pyodide/pyodide.svelte';
+  import FeatureTableGrid from './FeatureTableGrid.svelte';
+  import { loadFeatureTable, type FeatureTable } from '$lib/featureTable';
+  import ColorPanel from './ColorPanel.svelte';
+  import { colorBy, fieldValue, natural, shapeBy } from '$lib/colorBy';
+  import { metadataFields } from '$lib/samples';
+  import type { MetaField } from '$lib/api';
+  import { studyMetadata } from '$lib/studyMetadata.svelte';
+  import { loadPlotPrefs, savePlotPrefs } from '$lib/plotPrefs';
 
   let { studyIdx }: { studyIdx: number } = $props();
 
@@ -10,7 +33,8 @@
   let loading = $state(false);
   let error = $state('');
   let unsupported = $state(false);
-  let selected = $state<string | null>(null);
+  // Selected node per group (keyed by prep protocol).
+  let selected = $state<Record<string, string | null>>({});
   let loadedFor = -1;
 
   $effect(() => {
@@ -33,203 +57,588 @@
       return;
     }
     data = r.data;
-    if (selected && !r.data.nodes.some((n) => n.id === selected)) selected = null;
-  }
-
-  async function queueSample(prepSampleIdx: number) {
-    await api.processSample(studyIdx, prepSampleIdx);
-    await load(studyIdx); // reflect the advanced state in counts/bars/table
-  }
-
-  // --- fixed DAG layout (ids are a known shape) ---
-  const NODE_W = 150;
-  const NODE_H = 72;
-  const COL_GAP = 66;
-  const ROW_GAP = 22;
-  const POS: Record<string, { c: number; r: number }> = {
-    raw_reads: { c: 0, r: 1 },
-    processed_reads: { c: 1, r: 1 },
-    assemblies: { c: 2, r: 1 },
-    bins: { c: 3, r: 1 },
-    mag: { c: 4, r: 0 },
-    lcg: { c: 4, r: 1 },
-    unbinned: { c: 4, r: 2 },
-    feature_table: { c: 5, r: 0.5 }
-  };
-  const colX = (c: number) => c * (NODE_W + COL_GAP);
-  const rowY = (r: number) => r * (NODE_H + ROW_GAP);
-  const boardW = colX(5) + NODE_W;
-  const boardH = rowY(2) + NODE_H;
-  const rightMid = (id: string) => ({ x: colX(POS[id].c) + NODE_W, y: rowY(POS[id].r) + NODE_H / 2 });
-  const leftMid = (id: string) => ({ x: colX(POS[id].c), y: rowY(POS[id].r) + NODE_H / 2 });
-
-  const selectedNode = $derived(
-    data && selected ? (data.nodes.find((n) => n.id === selected) ?? null) : null
-  );
-
-  const chip = (state: string) =>
-    STATE_CLASS[state as keyof typeof STATE_CLASS] ?? 'bg-gray-50 text-gray-600 ring-gray-500/10';
-  const stateLabel = (s: string) =>
-    s === 'not_started' ? 'not started' : s === 'no_data' ? 'no data' : s.replace('_', ' ');
-
-  // Completion bar segmented by sample state, out of the node's total.
-  function segments(n: LineageNode) {
-    const total = n.completion.total || 1;
-    let completed = 0;
-    let processing = 0;
-    let failed = 0;
-    for (const s of n.samples) {
-      if (s.state === 'completed') completed++;
-      else if (s.state === 'processing') processing++;
-      else if (s.state === 'failed') failed++;
+    // Pick up the last settings chosen here; each is checked against the data
+    // before it is used (see the validation effect and the depth restores).
+    const color: Record<string, string> = {};
+    const shape: Record<string, string> = {};
+    const cont: Record<string, boolean> = {};
+    for (const g of r.data.groups) {
+      const pr = loadPlotPrefs(idx, g.prep_protocol);
+      if (pr.colorVar) color[g.prep_protocol] = pr.colorVar;
+      if (pr.shapeVar) shape[g.prep_protocol] = pr.shapeVar;
+      if (pr.continuous) cont[g.prep_protocol] = pr.continuous;
     }
-    const remaining = Math.max(0, total - completed - processing - failed);
-    return [
-      { cls: 'bg-teal-500', n: completed },
-      { cls: 'bg-blue-500', n: processing },
-      { cls: 'bg-red-500', n: failed },
-      { cls: 'bg-gray-200', n: remaining }
-    ]
-      .filter((s) => s.n > 0)
-      .map((s) => ({ cls: s.cls, pct: (100 * s.n) / total }));
+    colorVar = color;
+    shapeVar = shape;
+    continuousFor = cont;
   }
 
-  // Per-node detail rows for DataTable: node columns + hidden state/idx for the action cell.
-  function detailRows(n: LineageNode) {
-    return n.samples.map((s) => ({
-      accession: s.accession,
-      ...s.values,
-      __state: s.state,
-      __idx: s.prep_sample_idx
+  const NODE_W = 170;
+  const NODE_H = 76;
+  const COL_GAP = 56;
+  const ROW_GAP = 20;
+
+  type Placed = { node: LineageNode; c: number; r: number };
+
+  /** Column = longest path from a root; rows stack within a column. */
+  function layout(g: LineageGroup) {
+    const incoming = new Map<string, string[]>();
+    for (const e of g.edges) incoming.set(e.target, [...(incoming.get(e.target) ?? []), e.source]);
+    const depth = new Map<string, number>();
+    const depthOf = (id: string, seen = new Set<string>()): number => {
+      if (depth.has(id)) return depth.get(id)!;
+      if (seen.has(id)) return 0; // a cycle would be a server bug; don't hang on it
+      seen.add(id);
+      const parents = incoming.get(id) ?? [];
+      const d = parents.length ? Math.max(...parents.map((p) => depthOf(p, seen))) + 1 : 0;
+      depth.set(id, d);
+      return d;
+    };
+    const rows = new Map<number, number>();
+    const placed: Placed[] = g.nodes.map((node) => {
+      const c = depthOf(node.id);
+      const r = rows.get(c) ?? 0;
+      rows.set(c, r + 1);
+      return { node, c, r };
+    });
+    const at = new Map(placed.map((p) => [p.node.id, p]));
+    const cols = Math.max(0, ...placed.map((p) => p.c)) + 1;
+    const maxRows = Math.max(1, ...rows.values());
+    return {
+      placed,
+      at,
+      width: cols * NODE_W + (cols - 1) * COL_GAP,
+      height: maxRows * NODE_H + (maxRows - 1) * ROW_GAP
+    };
+  }
+  const x = (c: number) => c * (NODE_W + COL_GAP);
+  const y = (r: number) => r * (NODE_H + ROW_GAP);
+
+  const STATE_ORDER: LineageState[] = [
+    'completed',
+    'processing',
+    'pending',
+    'failed',
+    'invalidated',
+    'no_data',
+    'not_started'
+  ];
+  const STATE_BAR: Record<LineageState, string> = {
+    completed: 'bg-teal-500',
+    processing: 'bg-blue-500',
+    pending: 'bg-amber-400',
+    failed: 'bg-red-500',
+    invalidated: 'bg-red-300',
+    no_data: 'bg-gray-400',
+    not_started: 'bg-gray-200'
+  };
+  const STATE_CHIP: Record<LineageState, string> = {
+    completed: 'bg-green-50 text-green-700 ring-green-600/20',
+    processing: 'bg-blue-50 text-blue-700 ring-blue-600/20',
+    pending: 'bg-amber-50 text-amber-800 ring-amber-600/20',
+    failed: 'bg-red-50 text-red-700 ring-red-600/10',
+    invalidated: 'bg-red-50 text-red-600 ring-red-600/10',
+    no_data: 'bg-gray-50 text-gray-600 ring-gray-500/10',
+    not_started: 'bg-gray-50 text-gray-400 ring-gray-400/10'
+  };
+  const stateLabel = (s: string) => s.replace('_', ' ');
+
+  function segments(n: LineageNode) {
+    const total = Object.values(n.counts).reduce((a, b) => a + (b ?? 0), 0) || 1;
+    return STATE_ORDER.filter((s) => n.counts[s]).map((s) => ({
+      cls: STATE_BAR[s],
+      pct: (100 * (n.counts[s] ?? 0)) / total
     }));
   }
+
+  /** One line under a node's label: a product says how many samples it holds;
+   *  a stage lists its non-zero states. */
+  function summary(n: LineageNode): string {
+    if (n.kind === 'product') {
+      const k = n.counts.completed ?? 0;
+      return `${k} sample${k === 1 ? '' : 's'}`;
+    }
+    return STATE_ORDER.filter((s) => n.counts[s])
+      .map((s) => `${n.counts[s]} ${stateLabel(s)}`)
+      .join(' · ');
+  }
+
+  /** The nodes from a root down to `n` (inclusive) that measure a per-sample
+   *  value, upstream first, so a node's table carries every count leading to it
+   *  (Reads, then ASVs, ...). */
+  function valueChain(g: LineageGroup, n: LineageNode): LineageNode[] {
+    const byId = new Map(g.nodes.map((x) => [x.id, x]));
+    const seen = new Set<string>();
+    const walk = (id: string) => {
+      if (seen.has(id)) return;
+      seen.add(id);
+      for (const e of g.edges) if (e.target === id) walk(e.source);
+    };
+    walk(n.id);
+    // Upstream first: an ancestor sits at a lower depth than what it feeds.
+    const depth = (id: string): number => {
+      const parents = g.edges.filter((e) => e.target === id).map((e) => e.source);
+      return parents.length ? Math.max(...parents.map(depth)) + 1 : 0;
+    };
+    return [...seen]
+      .map((id) => byId.get(id)!)
+      .filter((x) => x?.value_label)
+      .sort((a, b) => depth(a.id) - depth(b.id));
+  }
+
+  function detailColumns(g: LineageGroup, n: LineageNode) {
+    return [
+      { key: 'sample', label: labelHeader(g.samples.map((s) => s.label_source)) },
+      ...valueChain(g, n).map((v) => ({ key: `v:${v.id}`, label: v.value_label! }))
+    ];
+  }
+
+  /** The scatter of the first two counts on the way to `n`, over the rows the
+   *  table currently shows; rows lacking a positive value for either are counted. */
+  function scatter(g: LineageGroup, n: LineageNode, rows: Record<string, unknown>[]) {
+    const chain = valueChain(g, n);
+    if (chain.length < 2) return null;
+    const [a, b] = chain;
+    const points = rows.flatMap((r) => {
+      const x = Number(r[`v:${a.id}`]);
+      const y = Number(r[`v:${b.id}`]);
+      return x > 0 && y > 0 ? [{ label: String(r.sample), x, y }] : [];
+    });
+    return {
+      points,
+      xLabel: a.value_label!,
+      yLabel: b.value_label!,
+      omitted: rows.length - points.length
+    };
+  }
+
+  // A feature table's PCoA, by processing_idx: fetched and computed (in the
+  // Pyodide worker) the first time its node is selected, then kept; a new depth
+  // recomputes from the kept table.
+  type PcoaState =
+    | { state: 'loading' }
+    | { state: 'ok'; table: FeatureTable; pcoa: Pcoa; busy: boolean }
+    | { state: 'error'; message: string };
+  // Raw: entries are only ever replaced, and the feature table inside is posted to
+  // the worker, which cannot clone a reactive proxy.
+  let pcoaFor = $state.raw<Record<number, PcoaState>>({});
+
+  async function loadPcoa(processingIdx: number, protocol: string) {
+    pcoaFor = { ...pcoaFor, [processingIdx]: { state: 'loading' } };
+    const table = await loadFeatureTable({ processing_idx: [processingIdx], study_idx: studyIdx });
+    if (!table.ok) {
+      pcoaFor = { ...pcoaFor, [processingIdx]: { state: 'error', message: `feature table: ${table.detail}` } };
+      return;
+    }
+    try {
+      const pcoa = await pyworker.pcoa(table.data);
+      pcoaFor = { ...pcoaFor, [processingIdx]: { state: 'ok', table: table.data, pcoa, busy: false } };
+      // Restore the last depth, if a sample still has exactly that depth.
+      const saved = loadPlotPrefs(studyIdx, protocol).pcoaDepth;
+      if (saved != null) {
+        if (pcoa.depths.includes(saved)) await rarefy(processingIdx, saved, protocol);
+        else savePlotPrefs(studyIdx, protocol, { pcoaDepth: null });
+      }
+    } catch (e) {
+      pcoaFor = { ...pcoaFor, [processingIdx]: { state: 'error', message: `PCoA: ${String(e)}` } };
+    }
+  }
+
+  async function rarefy(processingIdx: number, depth: number | null, protocol: string) {
+    const cur = pcoaFor[processingIdx];
+    if (cur?.state !== 'ok') return;
+    pcoaFor = { ...pcoaFor, [processingIdx]: { ...cur, busy: true } };
+    try {
+      const pcoa = await pyworker.pcoa(cur.table, depth);
+      pcoaFor = { ...pcoaFor, [processingIdx]: { ...cur, pcoa, busy: false } };
+      savePlotPrefs(studyIdx, protocol, { pcoaDepth: depth });
+    } catch (e) {
+      // A depth that fails (e.g. too few samples reach it) is not remembered; the
+      // unrarefied ordination still stands.
+      savePlotPrefs(studyIdx, protocol, { pcoaDepth: null });
+      pcoaFor = { ...pcoaFor, [processingIdx]: { ...cur, busy: false } };
+      console.warn(`PCoA at depth ${depth} failed; kept the previous ordination:`, e);
+    }
+  }
+
+  // Sample metadata for colouring, by sample label, from the study's shared
+  // metadata (loaded once when the study opens).
+  type MetaState = { state: 'loading' } | { state: 'ok'; byLabel: Record<string, Record<string, MetaField>> };
+  const metaFor = $derived.by(() => {
+    const out: Record<string, MetaState> = {};
+    if (!data) return out;
+    const ready = studyMetadata.ready(studyIdx);
+    for (const g of data.groups) {
+      if (!ready) {
+        out[g.prep_protocol] = { state: 'loading' };
+        continue;
+      }
+      const byLabel: Record<string, Record<string, MetaField>> = {};
+      for (const s of g.samples) {
+        const b = studyMetadata.byIdx.get(s.biosample_idx);
+        if (b) byLabel[s.label] = metadataFields(b);
+      }
+      out[g.prep_protocol] = { state: 'ok', byLabel };
+    }
+    return out;
+  });
+  // The lineage can sit on a page that didn't start the load; this is a no-op
+  // when the study is already loaded or loading.
+  $effect(() => {
+    if (studyIdx) studyMetadata.load(studyIdx);
+  });
+
+  // The variable each group's ordination is coloured by, and whether its palette
+  // is continuous.
+  let colorVar = $state<Record<string, string>>({});
+  let continuousFor = $state<Record<string, boolean>>({});
+
+  function variablesOf(byLabel: Record<string, Record<string, MetaField>>): string[] {
+    const seen = new Set<string>();
+    for (const f of Object.values(byLabel)) for (const k of Object.keys(f)) seen.add(k);
+    return [...seen].sort(natural);
+  }
+
+  // `keys` are what the plot keys its markers by; `biosampleOf` maps a key to its
+  // biosample's public name, the metadata key (identity for lineage labels; the
+  // feature table's sidecar for its columns).
+  const same = (k: string) => k;
+
+  function coloringFor(g: LineageGroup, keys: string[], biosampleOf: (k: string) => string = same) {
+    const m = metaFor[g.prep_protocol];
+    const v = colorVar[g.prep_protocol];
+    if (m?.state !== 'ok' || !v) return null;
+    return colorBy(Object.fromEntries(keys.map((k) => [k, fieldValue(m.byLabel[biosampleOf(k)]?.[v])])), {
+      continuous: continuousFor[g.prep_protocol] ?? false
+    });
+  }
+
+  // The variable each group's markers are shaped by ('' for none).
+  let shapeVar = $state<Record<string, string>>({});
+
+  function shapingFor(g: LineageGroup, keys: string[], biosampleOf: (k: string) => string = same) {
+    const m = metaFor[g.prep_protocol];
+    const v = shapeVar[g.prep_protocol];
+    if (m?.state !== 'ok' || !v) return null;
+    return shapeBy(Object.fromEntries(keys.map((k) => [k, fieldValue(m.byLabel[biosampleOf(k)]?.[v])])));
+  }
+
+  // Settings restored from storage are checked once the metadata is in: a saved
+  // variable the study no longer has falls back to the default.
+  $effect(() => {
+    for (const g of data?.groups ?? []) {
+      const m = metaFor[g.prep_protocol];
+      if (m?.state !== 'ok') continue;
+      const vars = variablesOf(m.byLabel);
+      const key = g.prep_protocol;
+      const c = colorVar[key];
+      if (c && !vars.includes(c))
+        untrack(() => (colorVar = { ...colorVar, [key]: vars.includes('qiita_sample_type') ? 'qiita_sample_type' : (vars[0] ?? '') }));
+      const sh = shapeVar[key];
+      if (sh && !vars.includes(sh)) untrack(() => (shapeVar = { ...shapeVar, [key]: '' }));
+    }
+  });
+
+  // And saved whenever they change.
+  $effect(() => {
+    for (const g of data?.groups ?? []) {
+      const key = g.prep_protocol;
+      savePlotPrefs(studyIdx, key, {
+        colorVar: colorVar[key],
+        shapeVar: shapeVar[key] ?? '',
+        continuous: continuousFor[key] ?? false
+      });
+    }
+  });
+
+  // The PERMANOVA for each group's current (variable, depth), recomputed whenever
+  // either changes; a stale answer (an older request's) is dropped.
+  let permFor = $state<Record<string, Permanova | string | null>>({});
+  let permSeq = 0;
+  $effect(() => {
+    for (const g of data?.groups ?? []) {
+      const sel = selected[g.prep_protocol];
+      const node = sel ? g.nodes.find((n) => n.id === sel) : null;
+      const ft = node?.kind === 'product' ? node.processing_idx : null;
+      const pc = ft != null ? pcoaFor[ft] : undefined;
+      if (pc?.state !== 'ok' || pc.busy) continue;
+      const coloring = coloringFor(g, pc.pcoa.samples, (k) => pc.table.biosampleOf[k]);
+      if (!coloring) continue;
+      const key = g.prep_protocol;
+      if (!coloring.groups) {
+        untrack(() => (permFor = { ...permFor, [key]: 'A continuous variable has no groups to test.' }));
+        continue;
+      }
+      const seq = ++permSeq;
+      const groups = coloring.groups;
+      untrack(() => (permFor = { ...permFor, [key]: null }));
+      pyworker.permanova(groups).then(
+        (r) => seq === permSeq && (permFor = { ...permFor, [key]: r }),
+        (e) => seq === permSeq && (permFor = { ...permFor, [key]: `PERMANOVA failed: ${String(e)}` })
+      );
+    }
+  });
+
+  // Each group's table rows after its filter, which the scatter draws.
+  let visible = $state<Record<string, Record<string, unknown>[]>>({});
+
+  function detailRows(g: LineageGroup, n: LineageNode) {
+    const chain = valueChain(g, n);
+    return g.samples
+      .filter((s) => n.kind !== 'product' || s.cells[n.id])
+      .map((s) => ({
+        sample: s.label,
+        ...Object.fromEntries(chain.map((v) => [`v:${v.id}`, s.cells[v.id]?.value ?? '—'])),
+        __state: s.cells[n.id]?.state ?? 'not_started'
+      }));
+  }
+
+  // The action that produced a node, shown on hover over the arrow into it rather
+  // than on the node: the node says what the data is, the arrow how it got there.
+  const producedBy = (n: LineageNode) => (n.kind === 'product' ? '' : (n.detail ?? ''));
+  let edgeHover = $state<{ key: string; x: number; y: number; text: string } | null>(null);
 </script>
 
-<Card title="Processing lineage">
-  {#if loading && !data}
-    <p class="text-sm text-gray-500">Loading lineage…</p>
-  {:else if unsupported}
+{#if loading && !data}
+  <Card title="Processing lineage"><p class="text-sm text-gray-500">Loading lineage…</p></Card>
+{:else if unsupported}
+  <Card title="Processing lineage">
     <p class="text-sm text-gray-500">
       Lineage needs <code class="rounded bg-gray-100 px-1">GET /study/&lbrace;idx&rbrace;/lineage</code>,
       which this server doesn't have yet.
     </p>
-  {:else if error}
-    <p class="text-sm text-red-700">{error}</p>
-  {:else if data}
-    <!-- singular study DAG: pools converge; stages rail → Bins forks into MAG/LCG/Unbinned;
-         MAG & LCG feed a detached (dashed) feature table. px/pt padding keeps a selected
-         node's ring from being clipped by the scroll container (overflow-x:auto clips y too). -->
-    <div class="overflow-x-auto px-1 pt-2 pb-2">
-      <div class="relative" style="width:{boardW}px;height:{boardH}px">
-        <svg
-          class="pointer-events-none absolute inset-0"
-          width={boardW}
-          height={boardH}
-          aria-hidden="true"
-        >
-          <defs>
-            <marker id="lin-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-              <path d="M0 0L10 5L0 10z" fill="#9ca3af" />
-            </marker>
-          </defs>
-          {#each data.edges as [from, to, opt] (from + to)}
-            {#if POS[from] && POS[to]}
-              {@const a = rightMid(from)}
-              {@const b = leftMid(to)}
-              <line
-                x1={a.x}
-                y1={a.y}
-                x2={b.x}
-                y2={b.y}
-                stroke={opt?.dashed ? '#cbd5e1' : '#9ca3af'}
-                stroke-width="1.5"
-                stroke-dasharray={opt?.dashed ? '4 3' : undefined}
-                marker-end="url(#lin-arrow)"
-              />
-            {/if}
-          {/each}
-        </svg>
-
-        {#each data.nodes as n (n.id)}
-          {#if POS[n.id]}
-            {@const isFeature = n.kind === 'feature_table'}
-            <button
-              class="absolute flex flex-col overflow-hidden rounded-lg border text-center transition {selected ===
-              n.id
-                ? 'border-teal-500 ring-1 ring-teal-500'
-                : isFeature
-                  ? 'border-dashed border-teal-300 bg-teal-50/40 hover:border-teal-400'
-                  : 'border-gray-200 bg-white hover:border-gray-300'}"
-              style="left:{colX(POS[n.id].c)}px;top:{rowY(POS[n.id].r)}px;width:{NODE_W}px;height:{NODE_H}px"
-              onclick={() => (selected = selected === n.id ? null : n.id)}
-            >
-              <span class="flex flex-1 flex-col items-center justify-center gap-0.5 px-2">
-                <span class="text-sm leading-tight font-medium text-gray-900">{n.label}</span>
-                {#if isFeature}
-                  <span class="text-xs text-gray-500"
-                    >{data.feature_table_stats.tables.length} table{data.feature_table_stats.tables
-                      .length === 1
-                      ? ''
-                      : 's'}</span
-                  >
-                {:else}
-                  <span class="text-xs text-gray-500"
-                    ><span class="font-semibold text-gray-700">{n.completion.done}</span>/{n
-                      .completion.total} samples</span
-                  >
+  </Card>
+{:else if error}
+  <Card title="Processing lineage"><p class="text-sm text-red-700">{error}</p></Card>
+{:else if data && data.groups.length === 0}
+  <Card title="Processing lineage">
+    <p class="text-sm text-gray-500">No samples linked to this study yet.</p>
+  </Card>
+{:else if data}
+  <div class="space-y-4">
+    {#each data.groups as g (g.prep_protocol)}
+      {@const L = layout(g)}
+      {@const sel = selected[g.prep_protocol] ?? null}
+      {@const selNode = sel ? (g.nodes.find((n) => n.id === sel) ?? null) : null}
+      <Card bodyClass="" title={`Processing lineage — ${g.prep_protocol.replaceAll('_', ' ')} (${g.samples.length} samples)`}>
+        <div class="overflow-x-auto px-4 py-4 sm:px-6">
+          <div class="relative mx-auto" style="width:{L.width}px;height:{L.height}px">
+            <svg class="pointer-events-none absolute inset-0" width={L.width} height={L.height}>
+              <defs>
+                <marker id="lin-arrow-{g.prep_protocol}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                  <path d="M0 0L10 5L0 10z" fill="#9ca3af" />
+                </marker>
+              </defs>
+              {#each g.edges as e (e.source + '>' + e.target)}
+                {@const a = L.at.get(e.source)}
+                {@const b = L.at.get(e.target)}
+                {#if a && b}
+                  {@const key = `${g.prep_protocol}:${e.source}>${e.target}`}
+                  {@const x1 = x(a.c) + NODE_W}
+                  {@const y1 = y(a.r) + NODE_H / 2}
+                  {@const x2 = x(b.c)}
+                  {@const y2 = y(b.r) + NODE_H / 2}
+                  {@const action = producedBy(b.node)}
+                  <line
+                    {x1}
+                    {y1}
+                    {x2}
+                    {y2}
+                    stroke={edgeHover?.key === key
+                      ? '#0f766e'
+                      : b.node.kind === 'product'
+                        ? '#cbd5e1'
+                        : '#9ca3af'}
+                    stroke-width={edgeHover?.key === key ? 2.5 : 1.5}
+                    stroke-dasharray={b.node.kind === 'product' ? '4 3' : undefined}
+                    marker-end="url(#lin-arrow-{g.prep_protocol})"
+                  />
+                  {#if action}
+                    <!-- A wide, invisible hit area: a 1.5px arrow is too thin to hover. -->
+                    <line
+                      {x1}
+                      {y1}
+                      {x2}
+                      {y2}
+                      stroke="transparent"
+                      stroke-width="16"
+                      pointer-events="stroke"
+                      class="cursor-help"
+                      role="img"
+                      aria-label={action}
+                      onpointerenter={() =>
+                        (edgeHover = { key, x: (x1 + x2) / 2, y: (y1 + y2) / 2, text: action })}
+                      onpointerleave={() => (edgeHover = null)}
+                    />
+                  {/if}
                 {/if}
-              </span>
-              <!-- segmented completion bar -->
-              <div class="flex h-1.5 w-full bg-gray-100">
-                {#each segments(n) as seg}<div class={seg.cls} style="width:{seg.pct}%"></div>{/each}
-              </div>
-            </button>
-          {/if}
-        {/each}
-      </div>
-    </div>
+              {/each}
+            </svg>
 
-    {#if selectedNode}
-      <div class="mt-3 rounded-md ring-1 ring-gray-200">
-        {#if selectedNode.kind === 'feature_table'}
-          <DataTable
-            columns={[
-              { key: 'id', label: 'Feature table' },
-              { key: 'rows', label: 'Rows' },
-              { key: 'cols', label: 'Cols' },
-              { key: 'sparsity_pct', label: 'Sparsity %' },
-              { key: 'merged_sample_count', label: 'Merged samples' }
-            ]}
-            rows={data.feature_table_stats.tables}
-          />
-          <p class="px-3 py-2 text-xs text-gray-400">
-            Merged sample count may be fewer than samples processed, and a feature table may span
-            pools or studies.
-          </p>
-        {:else}
-          <DataTable
-            columns={[{ key: 'accession', label: 'Sample' }, ...selectedNode.columns]}
-            rows={detailRows(selectedNode)}
-            filterPlaceholder="filter samples…"
-          >
-            {#snippet actions(r)}
-              {@const st = String(r.__state)}
-              <span
-                class="inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium capitalize ring-1 ring-inset {chip(st)}"
-                >{stateLabel(st)}</span
+            {#each L.placed as p (p.node.id)}
+              {@const isProduct = p.node.kind === 'product'}
+              <button
+                class="absolute flex flex-col overflow-hidden rounded-lg border text-center transition {sel === p.node.id
+                  ? 'border-teal-500 ring-1 ring-teal-500'
+                  : isProduct
+                    ? 'border-dashed border-teal-300 bg-teal-50/40 hover:border-teal-400'
+                    : 'border-gray-200 bg-white hover:border-gray-300'}"
+                style="left:{x(p.c)}px;top:{y(p.r)}px;width:{NODE_W}px;height:{NODE_H}px"
+                onclick={() => {
+                  selected = { ...selected, [g.prep_protocol]: sel === p.node.id ? null : p.node.id };
+                  const ft = p.node.kind === 'product' ? p.node.processing_idx : null;
+                  if (ft != null && !pcoaFor[ft]) loadPcoa(ft, g.prep_protocol);
+                  // A node with a plot (a feature table, or two counts) colours by metadata.
+                  if (ft != null || valueChain(g, p.node).length >= 2) {
+                    if (!colorVar[g.prep_protocol])
+                      colorVar = { ...colorVar, [g.prep_protocol]: 'qiita_sample_type' };
+                  }
+                }}
               >
-              {#if selectedNode?.action_id && st === 'not_started'}
-                <button
-                  class="ml-2 rounded-md bg-teal-700 px-2.5 py-0.5 text-xs font-semibold text-white hover:bg-teal-600"
-                  onclick={() => queueSample(Number(r.__idx))}>Queue</button
-                >
-              {/if}
-            {/snippet}
-          </DataTable>
+                <span class="flex flex-1 flex-col items-center justify-center gap-0.5 px-2">
+                  <span class="text-sm leading-tight font-medium text-gray-900">{p.node.label}</span>
+                  <span class="text-[11px] leading-tight text-gray-500">{summary(p.node)}</span>
+                </span>
+                <div class="flex h-1.5 w-full bg-gray-100">
+                  {#each segments(p.node) as seg}<div class={seg.cls} style="width:{seg.pct}%"></div>{/each}
+                </div>
+              </button>
+            {/each}
+            {#if edgeHover?.key.startsWith(`${g.prep_protocol}:`)}
+              <div
+                class="pointer-events-none absolute z-10 -translate-x-1/2 -translate-y-full rounded bg-gray-900 px-2 py-1 font-mono text-[11px] whitespace-nowrap text-white shadow"
+                style="left:{edgeHover.x}px;top:{edgeHover.y - 6}px"
+              >
+                {edgeHover.text}
+              </div>
+            {/if}
+          </div>
+        </div>
+
+        {#if selNode}
+          {@const sc = scatter(g, selNode, visible[g.prep_protocol] ?? [])}
+          {@const ftIdx = selNode.kind === 'product' ? selNode.processing_idx : null}
+          {@const pc = ftIdx != null ? pcoaFor[ftIdx] : undefined}
+          {@const shown = new Set((visible[g.prep_protocol] ?? []).map((r) => String(r.sample)))}
+          <div class="border-t border-gray-200">
+            {#if ftIdx != null}
+              {@const meta = metaFor[g.prep_protocol]}
+              {@const bio = pc?.state === 'ok' ? (k: string) => pc.table.biosampleOf[k] : same}
+              {@const coloring = pc?.state === 'ok' ? coloringFor(g, pc.pcoa.samples, bio) : null}
+              {@const shaping = pc?.state === 'ok' ? shapingFor(g, pc.pcoa.samples, bio) : null}
+              <div class="grid grid-cols-1 gap-x-2 pt-4 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
+                <div>
+                  {#if pc?.state === 'ok'}
+                    <PcoaPlot
+                      pcoa={pc.pcoa}
+                      busy={pc.busy}
+                      visible={shown}
+                      displayOf={(k) => {
+                        const b = pc.table.biosampleOf[k];
+                        return b === k ? k : `${b} · ${k}`;
+                      }}
+                      colorOf={coloring?.colorOf ?? null}
+                      symbolOf={shaping?.symbolOf ?? null}
+                      onDepth={(d) => rarefy(ftIdx, d, g.prep_protocol)}
+                    />
+                  {:else if pc?.state === 'error'}
+                    <p class="px-4 py-12 text-center text-sm text-amber-800 sm:px-6">{pc.message}</p>
+                  {:else}
+                    <Spinner label="Computing PCoA…" />
+                  {/if}
+                </div>
+                {#if pc?.state === 'ok'}
+                  <div class="lg:pt-6">
+                    <ColorPanel
+                      variables={meta?.state === 'ok' ? variablesOf(meta.byLabel) : []}
+                      bind:value={
+                        () => colorVar[g.prep_protocol] ?? '',
+                        (v) => (colorVar = { ...colorVar, [g.prep_protocol]: v })
+                      }
+                      legend={coloring?.legend ?? []}
+                      gradient={coloring?.gradient ?? null}
+                      bind:continuous={
+                        () => continuousFor[g.prep_protocol] ?? false,
+                        (v) => (continuousFor = { ...continuousFor, [g.prep_protocol]: v })
+                      }
+                      bind:shape={
+                        () => shapeVar[g.prep_protocol] ?? '',
+                        (v) => (shapeVar = { ...shapeVar, [g.prep_protocol]: v })
+                      }
+                      shapeLegend={shaping?.legend ?? []}
+                      shapeRepeats={shaping?.repeats ?? false}
+                      permanova={permFor[g.prep_protocol] ?? null}
+                      loading={meta?.state !== 'ok'}
+                    />
+                  </div>
+                {/if}
+              </div>
+            {:else if sc}
+              {@const meta = metaFor[g.prep_protocol]}
+              {@const labels = sc.points.map((p) => p.label)}
+              {@const coloring = coloringFor(g, labels)}
+              {@const shaping = shapingFor(g, labels)}
+              <div class="grid grid-cols-1 gap-x-2 pt-4 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
+                <ValueScatter
+                  {...sc}
+                  colorOf={coloring?.colorOf ?? null}
+                  symbolOf={shaping?.symbolOf ?? null}
+                  initialDepth={loadPlotPrefs(studyIdx, g.prep_protocol).asvDepth ?? null}
+                  onDepthChange={(d) => savePlotPrefs(studyIdx, g.prep_protocol, { asvDepth: d })}
+                />
+                <div class="lg:pt-6">
+                  <ColorPanel
+                    variables={meta?.state === 'ok' ? variablesOf(meta.byLabel) : []}
+                    bind:value={
+                      () => colorVar[g.prep_protocol] ?? '',
+                      (v) => (colorVar = { ...colorVar, [g.prep_protocol]: v })
+                    }
+                    legend={coloring?.legend ?? []}
+                    gradient={coloring?.gradient ?? null}
+                    bind:continuous={
+                      () => continuousFor[g.prep_protocol] ?? false,
+                      (v) => (continuousFor = { ...continuousFor, [g.prep_protocol]: v })
+                    }
+                    bind:shape={
+                      () => shapeVar[g.prep_protocol] ?? '',
+                      (v) => (shapeVar = { ...shapeVar, [g.prep_protocol]: v })
+                    }
+                    shapeLegend={shaping?.legend ?? []}
+                    shapeRepeats={shaping?.repeats ?? false}
+                    loading={meta?.state !== 'ok'}
+                  />
+                </div>
+              </div>
+            {/if}
+            {#if ftIdx != null && pc?.state === 'ok'}
+              <FeatureTableGrid
+                table={pc.table}
+                idHeader={labelHeader(g.samples.map((s) => s.label_source))}
+                bind:visibleLabels={
+                  () => (visible[g.prep_protocol] ?? []).map((r) => String(r.sample)),
+                  (v) => untrack(() => (visible = { ...visible, [g.prep_protocol]: v.map((l) => ({ sample: l })) }))
+                }
+              />
+            {:else}
+            <DataTable
+              columns={detailColumns(g, selNode)}
+              rows={detailRows(g, selNode)}
+              bind:visibleRows={
+                () => visible[g.prep_protocol] ?? [],
+                // Untracked: the table's effect calls this, and reading `visible`
+                // there would make the effect depend on what it writes.
+                (v) => untrack(() => (visible = { ...visible, [g.prep_protocol]: v }))
+              }
+            >
+              {#snippet actions(r)}
+                {@const st = String(r.__state) as LineageState}
+                <span class="inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium capitalize ring-1 ring-inset {STATE_CHIP[st] ?? STATE_CHIP.not_started}">{stateLabel(st)}</span>
+              {/snippet}
+            </DataTable>
+            {/if}
+          </div>
         {/if}
-      </div>
-    {:else}
-      <p class="mt-2 text-xs text-gray-400">Click a node to see its per-sample detail.</p>
-    {/if}
-  {/if}
-</Card>
+      </Card>
+    {/each}
+  </div>
+{/if}
