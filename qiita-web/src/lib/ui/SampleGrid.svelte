@@ -7,7 +7,7 @@
   import type { Biosample } from '$lib/api';
   import { humanize } from '$lib/utils';
   import { settings } from '$lib/settings.svelte';
-  import { cellText, geoPoint, sampleLabel, type Column, type GeoPoint } from '$lib/samples';
+  import { cellText, geoPoint, sampleLabel, sampleLabelHeader, type Column, type GeoPoint } from '$lib/samples';
   import Card from '$lib/ui/Card.svelte';
   import GeoMap from '$lib/ui/GeoMap.svelte';
   import Modal from '$lib/ui/Modal.svelte';
@@ -30,7 +30,14 @@
 
   // Each row keeps its sample so the filtered set can feed the map.
   type Row = { sample: Biosample; cells: Record<string, string> };
-  const allCols = $derived([{ key: 'accession', label: 'Accession' }, ...columns]);
+  const idHeader = $derived(sampleLabelHeader(samples));
+  // Global fields only, or also the study's own (local) fields.
+  let showLocal = $state(true);
+  const visibleColumns = $derived(showLocal ? columns : columns.filter((c) => c.scope === 'global'));
+  const allCols = $derived<Column[]>([
+    { key: 'accession', label: 'Accession', scope: 'global' },
+    ...visibleColumns
+  ]);
   const rows = $derived<Row[]>(
     samples.map((s) => {
       const cells: Record<string, string> = { accession: sampleLabel(s) };
@@ -97,8 +104,27 @@
 
 {#snippet toolbar()}
   <div class="flex items-center gap-3">
+    <label class="inline-flex cursor-pointer items-center gap-2 text-sm text-gray-700 select-none">
+      <button
+        type="button"
+        role="switch"
+        aria-checked={showLocal}
+        aria-label="Show local metadata"
+        onclick={() => (showLocal = !showLocal)}
+        class="relative inline-flex h-5 w-9 shrink-0 rounded-full transition-colors {showLocal
+          ? 'bg-teal-600'
+          : 'bg-gray-200'}"
+      >
+        <span
+          class="absolute top-0.5 left-0.5 size-4 rounded-full bg-white shadow ring-1 ring-gray-900/5 transition-transform {showLocal
+            ? 'translate-x-4'
+            : ''}"
+        ></span>
+      </button>
+      Show local metadata
+    </label>
     <input
-      placeholder="filter…"
+      placeholder="Filter..."
       bind:value={query}
       class="w-56 rounded-md border border-gray-300 px-2.5 py-1 text-sm"
     />
@@ -111,7 +137,8 @@
 {/snippet}
 
 {#snippet grid()}
-  <div class="overflow-x-auto">
+  <!-- In a Card the header's border-b already tops the table; bare, it needs its own. -->
+  <div class="overflow-x-auto {bare ? 'border-t border-gray-200' : ''}">
     <table class="min-w-full divide-y divide-gray-200 text-sm">
       <thead class="bg-gray-50">
         <tr>
@@ -119,14 +146,16 @@
             <th
               class="{i === 0
                 ? 'sticky left-0 z-10 bg-gray-50 '
-                : ''}px-3 py-2 text-left text-xs font-semibold tracking-wide whitespace-nowrap text-gray-500 uppercase"
+                : c.scope === 'local'
+                  ? 'bg-gray-100 '
+                  : ''}px-3 py-2 text-left text-xs font-semibold tracking-wide whitespace-nowrap text-gray-500 uppercase"
             >
               <!-- Preflight resets text-transform on <button>; restate the header style. -->
               <button
                 class="inline-flex items-center gap-1 font-semibold tracking-wide uppercase hover:text-gray-700"
                 onclick={() => toggleSort(c.key)}
               >
-                {i === 0 ? 'Accession' : settings.humanizeLabels ? humanize(c.label) : c.label}
+                {i === 0 ? idHeader : settings.humanizeLabels ? humanize(c.label) : c.label}
                 <span class="text-gray-400">{sortKey === c.key ? (sortDir === 'asc' ? '↑' : '↓') : ''}</span>
               </button>
             </th>
@@ -140,7 +169,9 @@
               <td
                 class="{i === 0
                   ? 'sticky left-0 z-10 bg-white font-mono text-xs text-gray-700 '
-                  : 'text-gray-600 '}px-3 py-2 whitespace-nowrap"
+                  : c.scope === 'local'
+                    ? 'bg-gray-50 text-gray-600 '
+                    : 'text-gray-600 '}px-3 py-2 whitespace-nowrap"
               >{row.cells[c.key] || (i === 0 ? '' : '—')}</td>
             {/each}
           </tr>
@@ -165,7 +196,7 @@
 {/snippet}
 
 {#if bare}
-  <div class="mb-3 flex justify-end">{@render toolbar()}</div>
+  <div class="flex justify-end px-4 py-3 sm:px-6">{@render toolbar()}</div>
   {@render grid()}
 {:else}
   <Card title="Sample metadata" bodyClass="">

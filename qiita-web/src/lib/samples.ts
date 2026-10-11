@@ -1,14 +1,31 @@
 // Reading biosample metadata for display: one cell's text, the column set, and
 // the geographic point a sample contributes to the map. Used by SampleGrid and
 // the study page.
-import type { Biosample } from './api';
+import type { Biosample, MetaField } from './api';
 
-export type Column = { key: string; label: string };
+/** `global`: a field every study shares; `local`: one of this study's own. */
+export type Column = { key: string; label: string; scope: 'global' | 'local' };
 export type GeoPoint = { lat: number; lon: number; type: string; label: string };
+
+// Built once per sample: a grid reads every cell of every sample to filter and sort.
+const fieldsCache = new WeakMap<Biosample, Record<string, MetaField>>();
+
+/** Every metadata field a sample carries, global and study-local, keyed for
+ * lookup. A study-local key that a global field also uses is prefixed so
+ * neither hides the other. */
+export function metadataFields(s: Biosample): Record<string, MetaField> {
+  let out = fieldsCache.get(s);
+  if (!out) {
+    out = { ...(s.global_metadata ?? {}) };
+    for (const [k, f] of Object.entries(s.local_metadata ?? {})) out[k in out ? `local:${k}` : k] = f;
+    fieldsCache.set(s, out);
+  }
+  return out;
+}
 
 /** A metadata cell as text; '' when the field is absent or null. */
 export function cellText(s: Biosample, key: string): string {
-  const f = s.global_metadata?.[key];
+  const f = metadataFields(s)[key];
   if (!f || f.value == null) return '';
   const v = f.value;
   if (typeof v === 'object') {
@@ -20,17 +37,55 @@ export function cellText(s: Biosample, key: string): string {
   return String(v);
 }
 
-/** Union of metadata fields across samples, in first-seen order. */
+/** Union of metadata fields across samples, global fields first, each in
+ * first-seen order. */
 export function metadataColumns(samples: Biosample[]): Column[] {
-  const seen = new Map<string, string>();
-  for (const s of samples)
-    for (const [k, f] of Object.entries(s.global_metadata ?? {}))
-      if (!seen.has(k)) seen.set(k, f.display_name || k);
-  return [...seen.entries()].map(([key, label]) => ({ key, label }));
+  const seen = new Map<string, Column>();
+  for (const s of samples) {
+    const globals = s.global_metadata ?? {};
+    for (const k of Object.keys(metadataFields(s)))
+      if (!seen.has(k))
+        // A global field's key is its snake_case internal_name; a local field's is
+        // the sheet's own header. Either reads as written; humanizing is the
+        // client's choice.
+        seen.set(k, { key: k, label: k.replace(/^local:/, ''), scope: k in globals ? 'global' : 'local' });
+  }
+  const cols = [...seen.values()];
+  return [...cols.filter((c) => c.scope === 'global'), ...cols.filter((c) => c.scope === 'local')];
 }
 
+// The sample's public name: a deposited accession, else Qiita's own QB. Never
+// the internal biosample_idx.
 export function sampleLabel(s: Biosample): string {
-  return s.biosample_accession ?? String(s.biosample_idx);
+  return s.biosample_accession ?? s.ena_sample_accession ?? s.export_entity_id;
+}
+
+/** Where a sample's public label comes from. */
+export type LabelSource = 'biosample_accession' | 'ena_sample_accession' | 'export_entity_id';
+
+const LABEL_SOURCE_NAME: Record<LabelSource, string> = {
+  biosample_accession: 'BioSample accession',
+  ena_sample_accession: 'ENA sample accession',
+  export_entity_id: 'Qiita ID (QB)'
+};
+
+/** The header for a column of sample labels: what they are when they all come
+ * from the same place. */
+export function labelHeader(sources: Iterable<LabelSource>): string {
+  const set = new Set(sources);
+  return set.size === 1 ? LABEL_SOURCE_NAME[[...set][0]] : 'Accession / Qiita ID';
+}
+
+export function sampleLabelHeader(samples: Biosample[]): string {
+  return labelHeader(
+    samples.map((s): LabelSource =>
+      s.biosample_accession
+        ? 'biosample_accession'
+        : s.ena_sample_accession
+          ? 'ena_sample_accession'
+          : 'export_entity_id'
+    )
+  );
 }
 
 function num(v: unknown): number | null {
@@ -59,7 +114,7 @@ const LON_RE = /\b(lon|lng|long|longitude)\b/;
 function geoLatLon(s: Biosample): { lat: number | null; lon: number | null } {
   let lat: number | null = null;
   let lon: number | null = null;
-  for (const [k, f] of Object.entries(s.global_metadata ?? {})) {
+  for (const [k, f] of Object.entries(metadataFields(s))) {
     const key = k.toLowerCase().replace(/[_-]+/g, ' ');
     if (lat == null && LAT_RE.test(key)) lat = num(f?.value);
     else if (lon == null && LON_RE.test(key)) lon = num(f?.value);

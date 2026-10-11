@@ -12,14 +12,17 @@
     columns,
     rows,
     pageSize = 25,
-    filterPlaceholder = 'filter…',
-    actions
+    filterPlaceholder = 'Filter...',
+    actions,
+    visibleRows = $bindable([])
   }: {
     columns: Col[];
     rows: Row[];
     pageSize?: number;
     filterPlaceholder?: string;
     actions?: Snippet<[Row]>;
+    /** Out: the rows passing the filter, in display order, for a companion view. */
+    visibleRows?: Row[];
   } = $props();
 
   let query = $state('');
@@ -56,6 +59,9 @@
     return out;
   });
 
+  $effect(() => {
+    visibleRows = filtered;
+  });
   const pageCount = $derived(Math.max(1, Math.ceil(filtered.length / pageSize)));
   const clampedPage = $derived(Math.min(page, pageCount - 1));
   const paged = $derived(filtered.slice(clampedPage * pageSize, clampedPage * pageSize + pageSize));
@@ -69,15 +75,15 @@
 </script>
 
 <div>
-  <div class="flex items-center justify-between gap-3 px-3 py-2">
+  <div class="flex items-center justify-between gap-3 px-4 py-3 sm:px-6">
+    <span class="text-xs text-gray-400">{filtered.length} row{filtered.length === 1 ? '' : 's'}</span>
     <input
       placeholder={filterPlaceholder}
       bind:value={query}
       class="w-56 rounded-md border border-gray-300 px-2.5 py-1 text-sm"
     />
-    <span class="text-xs text-gray-400">{filtered.length} row{filtered.length === 1 ? '' : 's'}</span>
   </div>
-  <div class="overflow-x-auto">
+  <div class="overflow-x-auto border-t border-gray-200">
     <table class="min-w-full divide-y divide-gray-200 text-sm">
       <thead class="bg-gray-50">
         <tr>

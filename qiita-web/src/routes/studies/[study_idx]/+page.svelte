@@ -1,8 +1,3 @@
-<script module lang="ts">
-  import type { Biosample } from '$lib/api';
-  const bsCache = new Map<number, Biosample>();
-</script>
-
 <script lang="ts">
   import { page } from '$app/state';
   import { auth } from '$lib/auth.svelte';
@@ -15,12 +10,13 @@
   import SampleGrid from '$lib/ui/SampleGrid.svelte';
   import StudyPools from '$lib/ui/StudyPools.svelte';
   import Tabs from '$lib/ui/Tabs.svelte';
+  import Spinner from '$lib/ui/Spinner.svelte';
   import { metadataColumns } from '$lib/samples';
+  import { studyMetadata } from '$lib/studyMetadata.svelte';
   import { settings } from '$lib/settings.svelte';
   import { humanizeLabel, fmtDate } from '$lib/utils';
   import { insdcAccessionUrl } from '$lib/ena';
 
-  const CONC = 12;
 
   // --- study record, split across tabs ---
   let tab = $state('overview');
@@ -41,15 +37,29 @@
   let loading = $state(false);
   let record = $state<ApiResult<Record<string, unknown>> | null>(null);
   let access = $state<ApiResult<StudyAccessRow[]> | null>(null);
-  let total = $state(0);
   let pools = $state<StudySequencedPool[]>([]);
-  let samples = $state<Biosample[]>([]);
-  let sampleErr = $state('');
+  // The study's biosamples live in the shared store, loaded once per study.
+  const samples = $derived(studyMetadata.studyIdx === studyIdx ? studyMetadata.samples : []);
+  const total = $derived(studyMetadata.studyIdx === studyIdx ? studyMetadata.total : 0);
+  const sampleErr = $derived(studyMetadata.studyIdx === studyIdx ? studyMetadata.error : '');
+  const samplesLoading = $derived(studyMetadata.studyIdx !== studyIdx || studyMetadata.loading);
   let addOpen = $state(false);
   let loadSeq = 0;
   let loadedFor = -1;
 
-  const columns = $derived(metadataColumns(samples));
+  // Built once the samples are in, not on every streamed batch.
+  const columns = $derived(samplesLoading ? [] : metadataColumns(samples));
+  // The grid mounts a frame after its tab is selected, so the tab moves first and
+  // a spinner covers the render.
+  let gridReady = $state(false);
+  $effect(() => {
+    if (tab !== 'samples' || samplesLoading) {
+      gridReady = false;
+      return;
+    }
+    const id = requestAnimationFrame(() => requestAnimationFrame(() => (gridReady = true)));
+    return () => cancelAnimationFrame(id);
+  });
   const rec = $derived(record?.ok ? record.data : null);
   const studyTitle = $derived(
     rec && typeof rec.title === 'string' && rec.title ? rec.title : `Study ${studyIdx}`
@@ -79,13 +89,13 @@
     }
   });
 
-  async function load(i: number) {
+  async function load(i: number, { force = false } = {}) {
     const seq = ++loadSeq;
     loading = true;
-    samples = [];
-    sampleErr = '';
     access = null;
     pools = [];
+    // Metadata starts loading now, alongside the record, for every tab and plot.
+    const listed = studyMetadata.load(i, { force });
     record = await api.studyRecord(i);
     // Access list (member+ only) loads alongside — never blocks sample loading.
     api.studyAccess(i).then((r) => {
@@ -95,29 +105,15 @@
     api.studyPools(i).then((r) => {
       if (seq === loadSeq) pools = r.ok ? r.data.sequenced_pool : [];
     });
-    const list = await api.biosampleIdxs(i);
+    const ok = await listed;
     if (seq !== loadSeq) return;
-    if (!list.ok) {
-      sampleErr = `samples: HTTP ${list.status} — ${list.detail}`;
-      total = 0;
-      loading = false;
-      if (settings.rememberRecents)
-        addRecent({ idx: i, accessible: false, biosampleCount: null, lastOpened: Date.now() });
-      return;
-    }
-    const idxs = list.data.idxs;
-    total = idxs.length;
     if (settings.rememberRecents)
-      addRecent({ idx: i, accessible: true, biosampleCount: total, lastOpened: Date.now() });
-    samples = idxs.map((x) => bsCache.get(x)).filter((b): b is Biosample => !!b);
-    const missing = idxs.filter((x) => !bsCache.has(x));
-    for (let k = 0; k < missing.length; k += CONC) {
-      const rs = await Promise.all(missing.slice(k, k + CONC).map((x) => api.biosample(x)));
-      if (seq !== loadSeq) return;
-      const got = rs.flatMap((r) => (r.ok ? [r.data] : []));
-      for (const b of got) bsCache.set(b.biosample_idx, b);
-      samples = [...samples, ...got];
-    }
+      addRecent({
+        idx: i,
+        accessible: ok,
+        biosampleCount: ok ? studyMetadata.total : null,
+        lastOpened: Date.now()
+      });
     loading = false;
   }
 </script>
@@ -184,7 +180,8 @@
         <div class="border-b border-gray-200 px-4 pt-1 sm:px-6">
           <Tabs tabs={TABS} bind:active={tab} />
         </div>
-        <div class="px-4 py-4 sm:px-6">
+        <!-- The samples grid runs flush to the card edges; other tabs are padded. -->
+        <div class={tab === 'samples' ? '' : 'px-4 py-4 sm:px-6'}>
           {#if tab === 'overview'}
             {#if hasOverview}
               <dl class="space-y-4">
@@ -202,11 +199,13 @@
             {/if}
           {:else if tab === 'samples'}
             {#if sampleErr}
-              <p class="py-6 text-center text-amber-800">{sampleErr}</p>
-            {:else if samples.length || loading}
-              <SampleGrid {samples} {columns} {total} {loading} bare />
+              <p class="px-4 py-6 text-center text-amber-800">{sampleErr}</p>
+            {:else if samplesLoading || (samples.length && !gridReady)}
+              <Spinner label={samplesLoading ? `Loading ${samples.length} of ${total} samples…` : ''} />
+            {:else if samples.length}
+              <SampleGrid {samples} {columns} {total} bare />
             {:else}
-              <p class="py-6 text-center text-gray-500">No samples linked to this study.</p>
+              <p class="px-4 py-6 text-center text-gray-500">No samples linked to this study.</p>
             {/if}
           {:else if tab === 'details'}
             <dl class="grid grid-cols-1 gap-x-6 gap-y-2 sm:grid-cols-2">
@@ -266,6 +265,6 @@
   <StudyPools {studyIdx} />
 {/if}
 
-<Modal bind:open={addOpen} title="Add samples to study {studyIdx}">
-  <SampleUploader studyIdx={Number(studyIdx)} onUploaded={() => load(studyIdx)} />
+<Modal bind:open={addOpen} size="full" title="Add samples to study {studyIdx}">
+  <SampleUploader studyIdx={Number(studyIdx)} onUploaded={() => load(studyIdx, { force: true })} />
 </Modal>
