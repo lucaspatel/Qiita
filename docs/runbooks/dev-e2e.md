@@ -1,16 +1,17 @@
 # Dev deploy: rapid-16S end to end, with the web UI
 
-Deploys branch `deploy/dev-e2e` of `lucaspatel/Qiita` to the dev stack and proves, on a
+Deploys branch `feat/web-ui` of `lucaspatel/Qiita` to the dev stack and proves, on a
 real deployment, the path the local stack has run: a MiSeq i100 run → golay-demux by
 matrix tube → amplicon 1.1.0 → the study lineage, the feature table and its plots in the
 web UI, and the delivered metadata loaded over REST.
 
-`deploy/dev-e2e` is `main` plus two fork branches, merged:
+`feat/web-ui` is the deploy branch: `main` plus all work in progress, from which
+features are later split into upstream PRs. Besides `main` it carries:
 
-- `feat/amplicon-tube-e2e`: tube-keyed roster resolution, workflow follow-ons, the
+- the rapid-16S work: tube-keyed roster resolution, workflow follow-ons, the
   bcl-convert 4.x dummy sheet, QM identifiers, the `amplicon_sample` gate, the study
   lineage endpoint, and the amplicon feature table (REST + `qiita feature-table amplicon`).
-- `feat/web-ui`: `qiita-web/`, plus named environments for the CLI and
+- the web UI: `qiita-web/`, plus named environments for the CLI and
   `GET /api/v1/deployment`.
 
 None of it is upstream. Section 5 covers going back to `main`.
@@ -19,7 +20,7 @@ None of it is upstream. Section 5 covers going back to `main`.
 
 The dev stack's own procedure applies; these are the inputs it needs.
 
-1. **Source.** Check out `deploy/dev-e2e` from `https://github.com/lucaspatel/Qiita`.
+1. **Source.** Check out `feat/web-ui` from `https://github.com/lucaspatel/Qiita`.
 2. **Build everything.** `make build`. The data plane changed (`flight_service.rs`: an
    amplicon read scoped to a bounded set of runs). The control plane's
    `run-preflight` pin moved to `lucaspatel/kl-run-preflight@e521060`, which accepts
@@ -48,8 +49,7 @@ The dev stack's own procedure applies; these are the inputs it needs.
 
 ```bash
 ssh -L 18080:<node>:18080 -L 15051:<node>:15051 barnacle   # CP, and DP for the CLI bundle
-git -C ~/Projects/Qiita worktree add ../Qiita-deploy deploy/dev-e2e   # if not already
-cd ~/Projects/Qiita-deploy/qiita-control-plane && uv sync
+cd ~/Projects/Qiita-web-ui/qiita-control-plane && uv sync   # the feat/web-ui worktree
 uv run qiita env add dev http://localhost:18080 --adopt-token <your dev token file>
 uv run qiita env use dev && uv run qiita whoami        # stderr names the deployment
 cd ../qiita-web && npm install && npm run dev -- --port 5180
@@ -70,7 +70,7 @@ do. It matches rows by tube, then by owner sample id, patches the matched biosam
 and bulk-creates the rest:
 
 ```bash
-cd ~/Projects/Qiita-deploy
+cd ~/Projects/Qiita-web-ui
 python3 scripts/dev/load-study-metadata.py --api http://localhost:18080/api/v1 \
   --token-file <dev token file> --study 25060 \
   --sheet ~/Desktop/ibd-analysis/15663_20260928-110342.txt \
@@ -96,6 +96,11 @@ The loader is safe to re-run: a second run matches everything the first created.
 qiita submit-golay-demux --instrument-run-id 20260925_SL00377_0008_ASC2267726-SC3 \
   --preflight-blob IBD_15663_plates_5-6.preflight.db --prep-protocol-idx <rapid-16S protocol>
 ```
+
+The run folder must sit **directly** under one of dev's `PATH_INGEST_ROOTS`, named
+exactly as the run id (`<root>/20260925_SL00377_0008_ASC2267726-SC3`): the control plane
+looks one level down, not deeper. It must be readable by the control plane's service
+account, and visible at the same path on the compute nodes, where bcl-convert reads it.
 
 The pre-flight identifies samples by tube. The CLI resolves them through
 `POST /biosample/resolve-roster` and prints every problem against the sheet. If an
