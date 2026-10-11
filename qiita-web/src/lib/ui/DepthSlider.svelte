@@ -35,7 +35,10 @@
   const kept = $derived(depth == null ? depths.length : depths.filter((d) => d >= depth).length);
 </script>
 
-<div class="flex items-center gap-3 text-xs text-gray-600">
+<!-- One row on a wide screen; on a narrow one the label and value share the first
+     line (the value right-aligned with the plot's edge) and the slider takes the
+     second. -->
+<div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-gray-600 sm:flex-nowrap">
   <span class="shrink-0 font-medium text-gray-500">Rarefaction depth</span>
   <input
     type="range"
@@ -46,10 +49,10 @@
     {disabled}
     oninput={() => onPreview?.(depth)}
     onchange={() => onCommit(depth)}
-    class="h-1.5 min-w-24 flex-1 cursor-pointer accent-teal-600 disabled:opacity-50"
+    class="order-last h-1.5 w-full min-w-24 cursor-pointer accent-teal-600 disabled:opacity-50 sm:order-none sm:w-auto sm:flex-1"
     aria-label="Rarefaction depth"
   />
-  <span class="w-56 shrink-0 text-right whitespace-nowrap tabular-nums">
+  <span class="ml-auto shrink-0 text-right whitespace-nowrap tabular-nums sm:ml-0 sm:w-56">
     {#if depth == null}
       off (relative abundance)
     {:else}

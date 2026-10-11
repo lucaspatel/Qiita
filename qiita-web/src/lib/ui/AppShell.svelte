@@ -15,6 +15,7 @@
   let loginError = $state('');
   let me = $state<Whoami | null>(null);
   let menuOpen = $state(false);
+  let drawerOpen = $state(false);
   const initials = $derived((me?.email ?? '?').slice(0, 1).toUpperCase());
 
   $effect(() => {
@@ -68,55 +69,96 @@
   }
 </script>
 
+{#snippet brand(dark: boolean)}
+  <span class="flex items-center gap-2.5">
+    <span
+      class="flex size-9 items-center justify-center rounded-lg shadow-sm {dark ? 'bg-white' : 'bg-teal-700'}"
+    >
+      <span class="font-serif text-2xl leading-none font-bold {dark ? 'text-teal-700' : 'text-white'}">Q</span>
+    </span>
+    <span class="text-lg font-semibold tracking-tight whitespace-nowrap {dark ? 'text-white' : 'text-teal-800'}"
+      >Qiita <span class="text-xs font-normal {dark ? 'text-teal-300' : 'text-teal-600'}">miint</span></span
+    >
+  </span>
+{/snippet}
+
+{#snippet navList(onNavigate?: () => void)}
+  <ul class="-mx-2 space-y-1">
+    {#each nav as item}
+      <li>
+        <a
+          href={item.href}
+          onclick={onNavigate}
+          class={cn(
+            'group flex items-center gap-x-3 rounded-md p-2 text-sm font-semibold',
+            isActive(item.href)
+              ? 'bg-teal-900 text-white'
+              : 'text-teal-100 hover:bg-teal-900 hover:text-white'
+          )}
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" class="size-5 shrink-0">
+            <path d={item.path} stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+          {item.label}
+        </a>
+      </li>
+    {/each}
+  </ul>
+{/snippet}
+
 <div class="min-h-screen bg-gray-50 text-gray-900">
   <!-- Desktop sidebar -->
   <div class="hidden lg:fixed lg:inset-y-0 lg:z-40 lg:flex lg:w-64 lg:flex-col">
     <div class="flex grow flex-col gap-y-6 overflow-y-auto bg-teal-800 px-6 pb-4">
-      <div class="flex h-16 shrink-0 items-center gap-2.5">
-        <span class="flex size-9 items-center justify-center rounded-lg bg-white shadow-sm">
-          <span class="font-serif text-2xl leading-none font-bold text-teal-700">Q</span>
-        </span>
-        <span class="text-lg font-semibold tracking-tight text-white"
-          >Qiita <span class="text-xs font-normal text-teal-300">miint</span></span
-        >
-      </div>
-      <nav class="flex flex-1 flex-col">
-        <ul class="-mx-2 space-y-1">
-          {#each nav as item}
-            <li>
-              <a
-                href={item.href}
-                class={cn(
-                  'group flex items-center gap-x-3 rounded-md p-2 text-sm font-semibold',
-                  isActive(item.href)
-                    ? 'bg-teal-900 text-white'
-                    : 'text-teal-100 hover:bg-teal-900 hover:text-white'
-                )}
-              >
-                <svg
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="1.5"
-                  class="size-5 shrink-0"
-                >
-                  <path d={item.path} stroke-linecap="round" stroke-linejoin="round" />
-                </svg>
-                {item.label}
-              </a>
-            </li>
-          {/each}
-        </ul>
-      </nav>
+      <div class="flex h-16 shrink-0 items-center">{@render brand(true)}</div>
+      <nav class="flex flex-1 flex-col">{@render navList()}</nav>
     </div>
   </div>
+
+  <!-- Mobile drawer: the same navigation, opened from the header's menu button. -->
+  {#if drawerOpen}
+    <div class="fixed inset-0 z-50 lg:hidden" role="dialog" aria-modal="true" aria-label="Navigation">
+      <button
+        type="button"
+        class="absolute inset-0 bg-gray-900/60"
+        aria-label="Close navigation"
+        onclick={() => (drawerOpen = false)}
+      ></button>
+      <div class="relative flex h-full w-72 max-w-[80%] flex-col gap-y-6 overflow-y-auto bg-teal-800 px-6 pb-4">
+        <div class="flex h-16 shrink-0 items-center justify-between">
+          {@render brand(true)}
+          <button
+            type="button"
+            class="-mr-2 rounded-md p-2 text-teal-100 hover:bg-teal-900 hover:text-white"
+            aria-label="Close navigation"
+            onclick={() => (drawerOpen = false)}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" class="size-6">
+              <path d="M6 18 18 6M6 6l12 12" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </button>
+        </div>
+        <nav class="flex flex-1 flex-col">{@render navList(() => (drawerOpen = false))}</nav>
+      </div>
+    </div>
+  {/if}
 
   <!-- Main column -->
   <div class="lg:pl-64">
     <header
       class="sticky top-0 z-30 flex h-16 items-center gap-x-4 border-b border-gray-200 bg-white px-4 shadow-sm sm:px-6 lg:px-8"
     >
-      <span class="text-lg font-semibold text-teal-800 lg:hidden">Qiita</span>
+      <button
+        type="button"
+        class="-ml-2 rounded-md p-2 text-gray-600 hover:bg-gray-100 lg:hidden"
+        aria-label="Open navigation"
+        onclick={() => (drawerOpen = true)}
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" class="size-6">
+          <path d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+      </button>
+      <a href="/studies" class="lg:hidden">{@render brand(false)}</a>
       <div class="flex flex-1 items-center justify-end gap-x-3 text-sm">
         <EnvSwitcher />
         <span class="h-6 w-px bg-gray-200" aria-hidden="true"></span>

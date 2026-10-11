@@ -10,39 +10,46 @@
 
   let { unsupported = $bindable(false) }: { unsupported?: boolean } = $props();
 
-  const PAGE = 50;
+  const PAGE = 10;
   let scope = $state<'mine' | 'all'>('mine');
   let query = $state('');
   let rows = $state<StudySummary[]>([]);
-  let cursor = $state<number | null>(null);
+  // Cursor pages: `starts[i]` is the after_study_idx that opens page i (undefined
+  // for the first); `next` opens the page after this one, null at the end.
+  let starts = $state<(number | undefined)[]>([undefined]);
+  let pageNo = $state(0);
+  let next = $state<number | null>(null);
   let loading = $state(false);
   let error = $state('');
   let seq = 0;
 
-  async function load(reset: boolean) {
-    const mine = seq + (reset ? 1 : 0);
-    if (reset) {
-      seq = mine;
-      rows = [];
-      cursor = null;
-    }
+  async function load(page: number) {
+    const mine = ++seq;
     loading = true;
     error = '';
     const r = await api.studies({
       q: query.trim() || undefined,
       min_tier: scope === 'mine' ? 'viewer' : undefined,
-      after_study_idx: reset ? undefined : (cursor ?? undefined),
+      after_study_idx: starts[page],
       limit: PAGE
     });
-    if (mine !== seq) return; // a newer search/scope superseded this one
+    if (mine !== seq) return; // a newer page/search/scope superseded this one
     loading = false;
     if (!r.ok) {
       if (r.status === 405 || r.status === 404) unsupported = true;
       else error = `HTTP ${r.status} — ${r.detail}`;
       return;
     }
-    rows = [...rows, ...r.data.studies];
-    cursor = r.data.next_after_study_idx;
+    rows = r.data.studies;
+    pageNo = page;
+    next = r.data.next_after_study_idx;
+    if (next != null) starts[page + 1] = next;
+  }
+
+  function reset() {
+    starts = [undefined];
+    next = null;
+    load(0);
   }
 
   // Reload on scope change, and on search after a short pause in typing.
@@ -51,7 +58,7 @@
     scope;
     query;
     clearTimeout(timer);
-    timer = setTimeout(() => load(true), 250);
+    timer = setTimeout(reset, 250);
     return () => clearTimeout(timer);
   });
 
@@ -72,18 +79,19 @@
 {#if !unsupported}
   <Card title="Your studies" bodyClass="">
     {#snippet actions()}
-      <div class="flex items-center gap-3">
+      <div class="flex min-w-0 flex-1 items-center justify-end gap-2 sm:flex-none">
         <input
           placeholder="search…"
           bind:value={query}
-          class="w-56 rounded-md border border-gray-300 px-2.5 py-1 text-sm"
+          class="w-full min-w-0 rounded-md border border-gray-300 px-2.5 py-1 text-sm sm:w-56"
         />
-        <span class="inline-flex rounded-md shadow-sm ring-1 ring-gray-300 ring-inset">
-          {#each [['mine', 'Mine'], ['all', 'Include public']] as [value, label]}
+        <span class="inline-flex shrink-0 rounded-md shadow-sm ring-1 ring-gray-300 ring-inset">
+          {#each [['mine', 'Mine'], ['all', 'Public too']] as [value, label]}
             <button
-              class="px-3 py-1 text-sm font-medium first:rounded-l-md last:rounded-r-md {scope === value
+              class="px-3 py-1 text-sm font-medium whitespace-nowrap first:rounded-l-md last:rounded-r-md {scope === value
                 ? 'bg-teal-700 text-white'
                 : 'bg-white text-gray-700 hover:bg-gray-50'}"
+              aria-pressed={scope === value}
               onclick={() => (scope = value as 'mine' | 'all')}>{label}</button
             >
           {/each}
@@ -97,8 +105,8 @@
       <table class="min-w-full divide-y divide-gray-200 text-sm">
         <thead class="bg-gray-50">
           <tr>
-            {#each ['Study', 'Accession', 'Your access', 'Updated'] as h}
-              <th class="px-4 py-2 text-left text-xs font-semibold tracking-wide text-gray-500 uppercase">{h}</th>
+            {#each [['Study', ''], ['Accession', 'hidden sm:table-cell'], ['Your access', ''], ['Updated', 'hidden sm:table-cell']] as [h, cls]}
+              <th class="px-4 py-2 text-left text-xs font-semibold tracking-wide whitespace-nowrap text-gray-500 uppercase {cls}">{h}</th>
             {/each}
           </tr>
         </thead>
@@ -110,33 +118,38 @@
                 <a href="/studies/{s.study_idx}" class="font-medium text-teal-700 hover:underline">{s.title}</a>
                 <span class="block text-xs text-gray-400">#{s.study_idx}{s.alias ? ` · ${s.alias}` : ''}</span>
               </td>
-              <td class="px-4 py-2 font-mono text-xs whitespace-nowrap text-gray-600">
+              <td class="hidden px-4 py-2 font-mono text-xs whitespace-nowrap text-gray-600 sm:table-cell">
                 {s.bioproject_accession ?? s.ena_study_accession ?? '—'}
               </td>
               <td class="px-4 py-2">
                 <span class="inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium capitalize ring-1 ring-inset {a.cls}">{a.label}</span>
               </td>
-              <td class="px-4 py-2 whitespace-nowrap text-gray-500">{new Date(s.updated_at).toLocaleDateString()}</td>
+              <td class="hidden px-4 py-2 whitespace-nowrap text-gray-500 sm:table-cell">{new Date(s.updated_at).toLocaleDateString()}</td>
             </tr>
           {/each}
         </tbody>
       </table>
       <div class="flex items-center justify-between border-t border-gray-100 px-4 py-2 text-xs text-gray-500">
-        <span>{rows.length} shown{cursor ? '' : ' · end of list'}</span>
-        {#if cursor}
+        <span>Page {pageNo + 1}{next == null ? ' · end of list' : ''}</span>
+        <span class="flex gap-2">
           <button
             class="rounded border border-gray-300 px-2 py-0.5 hover:bg-gray-50 disabled:opacity-40"
-            onclick={() => load(false)}
-            disabled={loading}>{loading ? 'Loading…' : 'Load more'}</button
+            onclick={() => load(pageNo - 1)}
+            disabled={loading || pageNo === 0}>Previous</button
           >
-        {/if}
+          <button
+            class="rounded border border-gray-300 px-2 py-0.5 hover:bg-gray-50 disabled:opacity-40"
+            onclick={() => load(pageNo + 1)}
+            disabled={loading || next == null}>{loading ? 'Loading…' : 'Next'}</button
+          >
+        </span>
       </div>
     {:else if loading}
       <p class="px-4 py-8 text-center text-gray-500">Loading…</p>
-    {:else if cursor}
+    {:else if next != null}
       <!-- A short page can be empty yet not the last (the server filtered a batch). -->
       <p class="px-4 py-8 text-center text-gray-500">
-        Nothing yet — <button class="text-teal-700 hover:underline" onclick={() => load(false)}>keep looking</button>
+        Nothing on this page — <button class="text-teal-700 hover:underline" onclick={() => load(pageNo + 1)}>next page</button>
       </p>
     {:else}
       <p class="px-4 py-8 text-center text-gray-500">

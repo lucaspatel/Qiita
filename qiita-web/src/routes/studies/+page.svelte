@@ -98,26 +98,22 @@
 {:else}
   <div class="mb-6">
     <Card title="Open a study">
-      <div class="flex flex-wrap items-end gap-2">
-        <label class="text-sm">
-          <span class="mb-1 block text-gray-500">by</span>
-          <Select bind:value={openMode} class="w-48">
-            <option value="idx">study idx</option>
-            <option value="bioproject_accession">bioproject accession</option>
-            <option value="ena_study_accession">ENA accession</option>
-          </Select>
-        </label>
-        <label class="text-sm">
-          <span class="mb-1 block text-gray-500">{openMode === 'idx' ? 'idx' : 'accession'}</span>
-          <input
-            bind:value={openValue}
-            placeholder={openMode === 'idx' ? 'e.g. 25006' : openMode === 'bioproject_accession' ? 'PRJNA…' : 'PRJEB…'}
-            onkeydown={(e: KeyboardEvent) => e.key === 'Enter' && openStudy()}
-            class="w-56 rounded-md border border-gray-300 px-3 py-1.5 text-sm"
-          />
-        </label>
+      <!-- One row at every width: what to open by, the value, and Open. -->
+      <div class="flex items-center gap-2">
+        <Select bind:value={openMode} class="w-32 shrink-0 sm:w-48">
+          <option value="idx">study idx</option>
+          <option value="bioproject_accession">bioproject</option>
+          <option value="ena_study_accession">ENA accession</option>
+        </Select>
+        <input
+          bind:value={openValue}
+          aria-label={openMode === 'idx' ? 'study idx' : 'accession'}
+          placeholder={openMode === 'idx' ? 'e.g. 25006' : openMode === 'bioproject_accession' ? 'PRJNA…' : 'PRJEB…'}
+          onkeydown={(e: KeyboardEvent) => e.key === 'Enter' && openStudy()}
+          class="min-w-0 flex-1 rounded-md border border-gray-300 px-3 py-1.5 text-sm sm:max-w-xs"
+        />
         <button
-          class="rounded-md bg-white px-4 py-1.5 text-sm font-semibold text-teal-700 ring-1 ring-teal-600/30 ring-inset hover:bg-teal-50 disabled:opacity-50"
+          class="shrink-0 rounded-md bg-white px-4 py-1.5 text-sm font-semibold text-teal-700 ring-1 ring-teal-600/30 ring-inset hover:bg-teal-50 disabled:opacity-50"
           onclick={openStudy}
           disabled={!openValue.trim() || openBusy}>{openBusy ? 'Opening…' : 'Open'}</button>
       </div>

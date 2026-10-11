@@ -16,8 +16,10 @@
 
 <div class="overflow-hidden rounded-lg bg-white shadow-sm ring-1 ring-gray-200">
   {#if title || actions}
-    <div class="flex items-center justify-between gap-3 border-b border-gray-200 px-4 py-3 sm:px-6">
-      <h3 class="text-sm font-semibold text-gray-900">{title}</h3>
+    <!-- On a narrow screen the actions wrap below the title rather than squeezing
+         it onto two lines. -->
+    <div class="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-b border-gray-200 px-4 py-3 sm:px-6">
+      <h3 class="max-w-full shrink-0 text-sm font-semibold text-gray-900">{title}</h3>
       {#if actions}{@render actions()}{/if}
     </div>
   {/if}

@@ -103,7 +103,8 @@
 </script>
 
 {#snippet toolbar()}
-  <div class="flex items-center gap-3">
+  <!-- Wraps onto further lines on a narrow screen rather than overflowing. -->
+  <div class="flex flex-wrap items-center gap-x-3 gap-y-2">
     <label class="inline-flex cursor-pointer items-center gap-2 text-sm text-gray-700 select-none">
       <button
         type="button"
@@ -123,16 +124,19 @@
       </button>
       Show local metadata
     </label>
-    <input
-      placeholder="Filter..."
-      bind:value={query}
-      class="w-56 rounded-md border border-gray-300 px-2.5 py-1 text-sm"
-    />
-    <button
-      class="rounded-md bg-white px-3 py-1 text-sm font-medium text-teal-700 ring-1 ring-teal-600/30 ring-inset hover:bg-teal-50 disabled:opacity-40"
-      onclick={() => (mapOpen = true)}
-      disabled={!points.length}>Map ({points.length})</button
-    >
+    <!-- The filter and the map share a row; on a narrow screen it is the second. -->
+    <div class="flex w-full items-center gap-2 sm:w-auto">
+      <input
+        placeholder="Filter..."
+        bind:value={query}
+        class="min-w-0 flex-1 rounded-md border border-gray-300 px-2.5 py-1 text-sm sm:w-56 sm:flex-none"
+      />
+      <button
+        class="shrink-0 rounded-md bg-white px-3 py-1 text-sm font-medium text-teal-700 ring-1 ring-teal-600/30 ring-inset hover:bg-teal-50 disabled:opacity-40"
+        onclick={() => (mapOpen = true)}
+        disabled={!points.length}>Map ({points.length})</button
+      >
+    </div>
   </div>
 {/snippet}
 
