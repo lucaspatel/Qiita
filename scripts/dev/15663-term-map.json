@@ -1,0 +1,8 @@
+{
+  "env_biome": {
+    "urban biome": "ENVO:01000249"
+  },
+  "qiita_sample_type": {
+    "control blank": "control_blank"
+  }
+}
