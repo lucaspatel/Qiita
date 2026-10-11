@@ -3,7 +3,7 @@
 from qiita_control_plane.lineage import build_study_lineage
 
 
-def _sample(idx, protocol, *, pool=7, run=3, accession=None, has_reads=True, item="1"):
+def _sample(idx, protocol, *, pool=7, run=3, accession=None, read_count=100, item="1"):
     return {
         "prep_sample_idx": idx,
         "prep_protocol": protocol,
@@ -11,7 +11,7 @@ def _sample(idx, protocol, *, pool=7, run=3, accession=None, has_reads=True, ite
         "sequencing_run_idx": run,
         "sequenced_pool_item_id": item,
         "accession": accession,
-        "has_reads": has_reads,
+        "read_count": read_count,
     }
 
 
@@ -34,8 +34,8 @@ def test_amplicon_samples_form_run_reads_asvs_feature_table():
     rows = _rows(
         samples=[
             _sample(1, "short_read_amplicon", accession="SAMEA1"),
-            _sample(2, "short_read_amplicon", has_reads=True),
-            _sample(3, "short_read_amplicon", has_reads=False),
+            _sample(2, "short_read_amplicon", read_count=250),
+            _sample(3, "short_read_amplicon", read_count=None),
         ],
         ingest=[{"sequenced_pool_idx": 7, "action_id": "golay-demux", "state": "completed"}],
         amplicons=[_amplicon(1, "completed", 40), _amplicon(2, "no_data")],
@@ -58,6 +58,8 @@ def test_amplicon_samples_form_run_reads_asvs_feature_table():
     assert by_idx[1].label == "SAMEA1"
     assert by_idx[2].label == "pool item 1"
     assert by_idx[1].cells["processing:11"].value == 40
+    assert by_idx[2].cells["reads"].value == 250
+    assert nodes["reads"].value_label == "Reads"
     assert "processing:11" not in by_idx[3].cells
 
 
@@ -92,7 +94,7 @@ def test_protocols_get_separate_dags():
 
 def test_reads_state_follows_the_pool_ingest_ticket_when_none_landed():
     rows = _rows(
-        samples=[_sample(1, "p", has_reads=False), _sample(2, "p", pool=8, has_reads=False)],
+        samples=[_sample(1, "p", read_count=None), _sample(2, "p", pool=8, read_count=None)],
         ingest=[{"sequenced_pool_idx": 7, "action_id": "bcl-convert", "state": "failed"}],
     )
     (group,) = build_study_lineage(9, rows).groups

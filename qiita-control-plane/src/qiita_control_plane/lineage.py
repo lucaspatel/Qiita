@@ -1,8 +1,8 @@
 """The study lineage: every sample's provenance, one DAG per prep protocol.
 
 `fetch_study_lineage` reads, for a study's samples, everything Postgres records
-about how each got where it is — its run and pool, whether its reads landed (and
-the pool's ingest ticket when they did not), and its state in every per-sample
+about how each got where it is — its run and pool, how many reads landed (and
+the pool's ingest ticket when none did), and its state in every per-sample
 completion gate (`mask_sample`, `assembly_sample`, `amplicon_sample`) — in five
 queries. `build_study_lineage` turns those rows into nodes, edges and per-sample
 cells, so a client only lays the graph out.
@@ -56,14 +56,14 @@ async def fetch_study_lineage(pool: asyncpg.Pool, study_idx: int) -> dict[str, l
         "SELECT ps.idx AS prep_sample_idx, pp.name AS prep_protocol,"
         "       ss.sequenced_pool_idx, sp.sequencing_run_idx, ss.sequenced_pool_item_id,"
         "       COALESCE(b.biosample_accession, b.ena_sample_accession) AS accession,"
-        "       EXISTS (SELECT 1 FROM qiita.sequence_range sr"
-        "                WHERE sr.prep_sample_idx = ps.idx) AS has_reads"
+        "       sr.sequence_idx_stop - sr.sequence_idx_start + 1 AS read_count"
         "  FROM qiita.prep_sample_to_study pst"
         "  JOIN qiita.prep_sample ps ON ps.idx = pst.prep_sample_idx"
         "  JOIN qiita.prep_protocol pp ON pp.idx = ps.prep_protocol_idx"
         "  JOIN qiita.biosample b ON b.idx = ps.biosample_idx"
         "  LEFT JOIN qiita.sequenced_sample ss ON ss.prep_sample_idx = ps.idx"
         "  LEFT JOIN qiita.sequenced_pool sp ON sp.idx = ss.sequenced_pool_idx"
+        "  LEFT JOIN qiita.sequence_range sr ON sr.prep_sample_idx = ps.idx"
         " WHERE pst.study_idx = $1 AND NOT pst.retired AND ps.retired IS NOT TRUE"
         "   AND ss.ena_status IS NULL"
         " ORDER BY ps.idx",
@@ -143,14 +143,16 @@ def build_study_lineage(study_idx: int, rows: dict[str, list[Any]]) -> StudyLine
             READS_NODE,
             kind="reads",
             label=f"{' / '.join(ingest_actions)} → reads" if ingest_actions else "Reads",
+            value_label="Reads",
         )
         edge(RUN_NODE, READS_NODE)
         for s in members:
             c = cells[s["prep_sample_idx"]]
             if s["sequencing_run_idx"] is not None:
                 c[RUN_NODE] = LineageCell(state="completed")
-            if s["has_reads"]:
-                c[READS_NODE] = LineageCell(state="completed")
+            if s["read_count"] is not None:
+                # The sample's sequence_range is one contiguous id per read landed.
+                c[READS_NODE] = LineageCell(state="completed", value=s["read_count"])
             elif (t := ingest_by_pool.get(s["sequenced_pool_idx"])) and t["state"] in _INGEST_STATE:
                 c[READS_NODE] = LineageCell(state=_INGEST_STATE[t["state"]])
 

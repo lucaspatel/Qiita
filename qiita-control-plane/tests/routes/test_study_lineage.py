@@ -98,6 +98,7 @@ async def test_lineage_groups_the_amplicon_dag(role_keyed_clients, amplicon_stud
     assert nodes["reads"]["counts"] == {"completed": 1, "not_started": 2}
     cells = {smp["prep_sample_idx"]: smp["cells"] for smp in group["samples"]}
     assert cells[s["ps"][0]][f"processing:{p}"] == {"state": "completed", "value": 12}
+    assert cells[s["ps"][0]]["reads"] == {"state": "completed", "value": 10}
 
 
 async def test_lineage_needs_study_access(role_keyed_clients, amplicon_study):
