@@ -10,8 +10,13 @@ from qiita_control_plane.amplicon_feature_table import (
     Cohort,
     ProcessedSample,
     arrow_stream_bytes,
-    build_coo,
+    build_counts,
+    build_features,
 )
+
+
+def build_coo(cohort, membership, chunks):
+    return build_counts(cohort, membership, chunks), build_features(chunks)
 
 
 def _cohort(*names):

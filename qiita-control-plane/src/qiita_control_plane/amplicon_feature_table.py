@@ -10,10 +10,11 @@ the same sequence found by two runs is one feature.
 Three steps, each testable alone:
   * `resolve_cohort` picks the processed samples (one run's view of one
     prep_sample) the request names and gives each a public column name;
-  * `fetch_amplicon_runs` reads their observations and the ASV bytes from the
-    data plane under one signed ticket shape;
-  * `build_coo` turns those into the counts `(sample, feature, count)` and the
-    features `(feature, sequence, length)`, public handles only.
+  * `cohort_tickets` signs the reads of their observations and ASV bytes, which
+    `fetch_amplicon_runs` performs for the REST answer and a client performs itself;
+  * `stage_features` / `stage_counts` turn those into the features `(feature,
+    sequence, length)` and the counts `(sample, feature, count)`, public handles
+    only, on whichever DuckDB connection holds them.
 
 Nothing is made dense: a rapid-16S pool is ~8% dense, and density falls as runs
 and samples are added. Internal idxs are join keys and never reach the output.
@@ -179,72 +180,120 @@ async def resolve_cohort(pool: asyncpg.Pool, request: AmpliconFeatureTableReques
     return Cohort(runs=runs, samples=samples)
 
 
+def cohort_scope(cohort: Cohort) -> dict[str, list[int]]:
+    """The one ticket filter every read of `cohort` signs: its runs over its
+    prep_samples (the data plane's `build_amplicon_run_query` shape)."""
+    return {"processing_idx": cohort.runs, "prep_sample_idx": cohort.prep_sample_idxs}
+
+
+def cohort_tickets(cohort: Cohort, signing_key: bytes) -> tuple[bytes, bytes]:
+    """Signed DoGet tickets for the cohort's observations and its ASV chunks."""
+    scope = cohort_scope(cohort)
+    return (
+        sign_ticket(table=AMPLICON_MEMBERSHIP_TABLE, filter=scope, secret=signing_key),
+        sign_ticket(table=AMPLICON_SEQUENCE_CHUNKS_TABLE, filter=scope, secret=signing_key),
+    )
+
+
 def fetch_amplicon_runs(
-    *,
-    data_plane_url: str,
-    signing_key: bytes,
-    processing_idxs: list[int],
-    prep_sample_idxs: list[int],
-) -> tuple[pa.Table, pa.Table]:
-    """Read the runs' observations over the cohort, and the ASV chunks they name.
-    Blocking (Flight is synchronous); callers run it off the event loop."""
-    scope = {"processing_idx": processing_idxs, "prep_sample_idx": prep_sample_idxs}
-    tables = []
+    *, data_plane_url: str, signing_key: bytes, cohort: Cohort, membership: bool = True
+) -> tuple[pa.Table | None, pa.Table]:
+    """Read the cohort's observations (unless `membership` is False) and the ASV
+    chunks they name. Blocking (Flight is synchronous); callers run it off the
+    event loop."""
+    membership_ticket, chunks_ticket = cohort_tickets(cohort, signing_key)
     with flight.FlightClient(data_plane_url) as client:
-        for table in (AMPLICON_MEMBERSHIP_TABLE, AMPLICON_SEQUENCE_CHUNKS_TABLE):
-            ticket = sign_ticket(table=table, filter=scope, secret=signing_key)
-            tables.append(client.do_get(flight.Ticket(ticket)).read_all())
-    return tables[0], tables[1]
+        observed = (
+            client.do_get(flight.Ticket(membership_ticket)).read_all() if membership else None
+        )
+        chunks = client.do_get(flight.Ticket(chunks_ticket)).read_all()
+    return observed, chunks
 
 
-def build_coo(cohort: Cohort, membership: pa.Table, chunks: pa.Table) -> tuple[pa.Table, pa.Table]:
-    """The counts `(sample, feature, count)` and the features `(feature, sequence,
-    length)`, where `sample` is a column name from `cohort` and `feature` is the
-    md5 of the ASV's sequence (the QIIME 2 / Greengenes2 feature id). Refuses
-    rather than guesses: an observation of a processed sample the cohort did not
-    name, or an ASV with no sequence, would need an internal idx as its name."""
-    names = pa.table(
+# The relations `stage_features` / `stage_counts` create on the caller's connection.
+FEATURE_RELATION = "amplicon_feature"
+COUNT_RELATION = "amplicon_count"
+
+
+def stage_features(con, *, chunks: str) -> None:
+    """Create `FEATURE_RELATION` (feature_idx, feature, sequence, length) from the
+    ASV chunk relation `chunks`: each ASV's bytes reassembled, and its feature id,
+    the md5 of its sequence (the QIIME 2 / Greengenes2 convention)."""
+    con.execute(
+        f"CREATE TEMP TABLE {FEATURE_RELATION} AS"
+        " SELECT feature_idx, md5(seq) AS feature, seq AS sequence,"
+        "        length(seq)::INTEGER AS length"
+        " FROM (SELECT feature_idx, string_agg(chunk_data, '' ORDER BY chunk_index) AS seq"
+        f"       FROM {chunks} GROUP BY feature_idx)"
+    )
+
+
+def stage_counts(con, *, names: str, membership: str) -> None:
+    """Create `COUNT_RELATION` (sample, feature, count): the observations in
+    `membership` relabelled to public names, one row per nonzero cell. `names` maps
+    (processing_idx, prep_sample_idx) to a column name; `stage_features` must have
+    run. Refuses rather than guesses: an observation of a processed sample `names`
+    lacks, or of an ASV with no sequence, would need an internal idx as its name.
+    Shared by the control plane's REST answer and the client-side build, so the two
+    cannot disagree about a table."""
+    unnamed = con.execute(
+        f"SELECT count(*) FROM {membership}"
+        f" ANTI JOIN {names} USING (processing_idx, prep_sample_idx)"
+    ).fetchone()[0]
+    if unnamed:
+        raise RuntimeError(f"{unnamed} observation(s) of a processed sample with no QM")
+    missing = con.execute(
+        f"SELECT count(DISTINCT feature_idx) FROM {membership}"
+        f" ANTI JOIN {FEATURE_RELATION} USING (feature_idx)"
+    ).fetchone()[0]
+    if missing:
+        raise RuntimeError(f"{missing} observed ASV(s) have no sequence in the lake")
+    con.execute(
+        f"CREATE TEMP TABLE {COUNT_RELATION} AS"
+        " SELECT n.sample, f.feature, sum(m.count)::BIGINT AS count"
+        f" FROM {membership} m"
+        f" JOIN {names} n USING (processing_idx, prep_sample_idx)"
+        f" JOIN {FEATURE_RELATION} f USING (feature_idx)"
+        " GROUP BY n.sample, f.feature"
+    )
+
+
+def names_table(cohort: Cohort) -> pa.Table:
+    """(processing_idx, prep_sample_idx, sample): each processed sample's column name."""
+    return pa.table(
         {
             "processing_idx": pa.array([s.processing_idx for s in cohort.samples], pa.int64()),
             "prep_sample_idx": pa.array([s.prep_sample_idx for s in cohort.samples], pa.int64()),
             "sample": pa.array([s.column.sample for s in cohort.samples], pa.string()),
         }
     )
+
+
+def build_counts(cohort: Cohort, membership: pa.Table, chunks: pa.Table) -> pa.Table:
+    """The counts `(sample, feature, count)` as Arrow, for the REST answer."""
     with duckdb.connect() as duck:
         duck.register("membership", membership)
         duck.register("chunks", chunks)
-        duck.register("names", names)
-        unnamed = duck.execute(
-            "SELECT count(*) FROM membership m"
-            " ANTI JOIN names n USING (processing_idx, prep_sample_idx)"
-        ).fetchone()[0]
-        if unnamed:
-            raise RuntimeError(f"{unnamed} observation(s) of a processed sample with no QM")
-        duck.execute(
-            "CREATE TEMP TABLE feature AS"
-            " SELECT feature_idx, md5(seq) AS feature, seq AS sequence,"
-            "        length(seq)::INTEGER AS length"
-            " FROM (SELECT feature_idx, string_agg(chunk_data, '' ORDER BY chunk_index) AS seq"
-            "       FROM chunks GROUP BY feature_idx)"
-        )
-        missing = duck.execute(
-            "SELECT count(DISTINCT feature_idx) FROM membership"
-            " ANTI JOIN feature USING (feature_idx)"
-        ).fetchone()[0]
-        if missing:
-            raise RuntimeError(f"{missing} observed ASV(s) have no sequence in the lake")
+        duck.register("names", names_table(cohort))
+        stage_features(duck, chunks="chunks")
+        stage_counts(duck, names="names", membership="membership")
         counts = duck.execute(
-            "SELECT n.sample, f.feature, sum(m.count)::BIGINT AS count"
-            " FROM membership m"
-            " JOIN names n USING (processing_idx, prep_sample_idx)"
-            " JOIN feature f USING (feature_idx)"
-            " GROUP BY n.sample, f.feature ORDER BY n.sample, f.feature"
+            f"SELECT sample, feature, count FROM {COUNT_RELATION} ORDER BY sample, feature"
         ).to_arrow_table()
+    return counts.cast(COUNTS_SCHEMA)
+
+
+def build_features(chunks: pa.Table) -> pa.Table:
+    """The features `(feature, sequence, length)` as Arrow, for the REST answer.
+    The chunks ticket is already scoped to the ASVs the cohort observed, so this
+    needs no observations."""
+    with duckdb.connect() as duck:
+        duck.register("chunks", chunks)
+        stage_features(duck, chunks="chunks")
         features = duck.execute(
-            "SELECT feature, sequence, length FROM feature"
-            " WHERE feature_idx IN (SELECT feature_idx FROM membership) ORDER BY feature"
+            f"SELECT feature, sequence, length FROM {FEATURE_RELATION} ORDER BY feature"
         ).to_arrow_table()
-    return counts.cast(COUNTS_SCHEMA), features.cast(FEATURES_SCHEMA)
+    return features.cast(FEATURES_SCHEMA)
 
 
 def arrow_stream_bytes(table: pa.Table) -> bytes:

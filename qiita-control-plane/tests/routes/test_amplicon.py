@@ -9,7 +9,10 @@ read. The data-plane read is stubbed; its scope is pinned by the data plane's
 own tests.
 """
 
+import base64
 import hashlib
+import json
+import struct
 import uuid
 
 import pyarrow as pa
@@ -20,6 +23,7 @@ from qiita_common.api_paths import (
     URL_AMPLICON_FEATURE_TABLE_COUNTS,
     URL_AMPLICON_FEATURE_TABLE_FEATURES,
     URL_AMPLICON_FEATURE_TABLE_SAMPLES,
+    URL_AMPLICON_FEATURE_TABLE_TICKET,
 )
 
 from qiita_control_plane.repositories.processing import mint_processing
@@ -58,10 +62,11 @@ async def amplicon_run(role_keyed_clients, pool_alignment_seed, monkeypatch):
     runs = [processing_idx]
     fetched: list[tuple[list[int], list[int]]] = []
 
-    def _fetch(*, data_plane_url, signing_key, processing_idxs, prep_sample_idxs):
+    def _fetch(*, data_plane_url, signing_key, cohort, membership=True):
+        processing_idxs, prep_sample_idxs = cohort.runs, cohort.prep_sample_idxs
         fetched.append((list(processing_idxs), list(prep_sample_idxs)))
         rows = [(r, p) for r in processing_idxs for p in prep_sample_idxs]
-        membership = pa.table(
+        observed = pa.table(
             {
                 "prep_sample_idx": pa.array([p for _, p in rows], pa.int64()),
                 "processing_idx": pa.array([r for r, _ in rows], pa.int64()),
@@ -76,7 +81,7 @@ async def amplicon_run(role_keyed_clients, pool_alignment_seed, monkeypatch):
                 "chunk_data": pa.array([ASV], pa.string()),
             }
         )
-        return membership, chunks
+        return (observed if membership else None), chunks
 
     monkeypatch.setattr("qiita_control_plane.routes.amplicon.fetch_amplicon_runs", _fetch)
     yield {"processing_idx": processing_idx, "runs": runs, "fetched": fetched, **seed}
@@ -324,3 +329,70 @@ async def test_requires_auth(role_keyed_clients, amplicon_run):
             json=_body([amplicon_run["processing_idx"]], study_idx=1),
         )
     assert resp.status_code == 401, resp.text
+
+
+def _ticket_payload(ticket_b64: str) -> dict:
+    """The JSON payload of a signed ticket (<1B version><4B len><payload>...)."""
+    raw = base64.b64decode(ticket_b64)
+    (length,) = struct.unpack(">I", raw[1:5])
+    return json.loads(raw[5 : 5 + length])
+
+
+async def test_ticket_signs_exactly_the_cohort(role_keyed_clients, amplicon_run):
+    """A client reading the data plane itself gets both reads scoped to the cohort's
+    runs and prep_samples, and the columns with the keys to relabel them; nothing
+    is read from the data plane to answer."""
+    run, db = amplicon_run, role_keyed_clients["pool"]
+    cohort = sorted([run["ps_a"], run["ps_c"]])
+    resp = await role_keyed_clients["user"].post(
+        URL_AMPLICON_FEATURE_TABLE_TICKET,
+        json=_body([run["processing_idx"]], study_idx=run["study_1"]),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    for key, table in (
+        ("membership_ticket", "amplicon_membership"),
+        ("chunks_ticket", "amplicon_sequence_chunks"),
+    ):
+        payload = _ticket_payload(body[key])
+        assert payload["table"] == table
+        assert payload["filter"] == {
+            "processing_idx": [run["processing_idx"]],
+            "prep_sample_idx": cohort,
+        }
+    assert [(c["prep_sample_idx"], c["export_id"]) for c in body["samples"]] == [
+        (p, await _qm(db, run["processing_idx"], p)) for p in cohort
+    ]
+    assert run["fetched"] == []
+
+
+async def test_ticket_refuses_a_partially_readable_cohort(role_keyed_clients, amplicon_run):
+    run = amplicon_run
+    resp = await role_keyed_clients["user"].post(
+        URL_AMPLICON_FEATURE_TABLE_TICKET,
+        json=_body([run["processing_idx"]], prep_sample_idx=[run["ps_a"], run["ps_b"]]),
+    )
+    assert resp.status_code == 403, resp.text
+
+
+async def test_features_read_no_observations(role_keyed_clients, amplicon_run, monkeypatch):
+    calls = []
+
+    def _fetch(*, data_plane_url, signing_key, cohort, membership=True):
+        calls.append(membership)
+        chunks = pa.table(
+            {
+                "feature_idx": pa.array([77], pa.int64()),
+                "chunk_index": pa.array([0], pa.int32()),
+                "chunk_data": pa.array([ASV], pa.string()),
+            }
+        )
+        return None, chunks
+
+    monkeypatch.setattr("qiita_control_plane.routes.amplicon.fetch_amplicon_runs", _fetch)
+    resp = await role_keyed_clients["wet"].post(
+        URL_AMPLICON_FEATURE_TABLE_FEATURES,
+        json=_body([amplicon_run["processing_idx"]], prep_sample_idx=[amplicon_run["ps_a"]]),
+    )
+    assert resp.status_code == 200, resp.text
+    assert calls == [False]

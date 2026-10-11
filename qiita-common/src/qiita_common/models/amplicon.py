@@ -52,3 +52,23 @@ class AmpliconFeatureTableSamples(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     samples: list[AmpliconFeatureTableSample]
+
+
+class AmpliconFeatureTableTicketSample(AmpliconFeatureTableSample):
+    """A column, with the keys its observations carry on the data plane, so the
+    client can relabel them. The prep_sample_idx is Qiita's internal identifier:
+    a join key for the caller's own records, never a name to publish."""
+
+    prep_sample_idx: int
+
+
+class AmpliconFeatureTableTicketResponse(BaseModel):
+    """Signed DoGet tickets for the cohort's observations and ASV chunks, and the
+    columns to relabel them to."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    samples: list[AmpliconFeatureTableTicketSample]
+    # base64 signed tickets, scoped to exactly the cohort's runs and prep_samples.
+    membership_ticket: str
+    chunks_ticket: str

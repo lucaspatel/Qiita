@@ -69,6 +69,7 @@ from ._helpers import (
 )
 from .alignment import _handle_alignment_cohort, _handle_alignment_list
 from .amplicon import _handle_submit_golay_demux
+from .amplicon_feature_table import _handle_amplicon_feature_table
 from .assembly import DEFAULT_EXPORT_KINDS, EXPORT_KINDS, _handle_assembly_export
 from .auth import _handle_login, _handle_profile_set, _handle_whoami
 from .biosample import _handle_biosample_create
@@ -1358,6 +1359,59 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     p_ft_build.set_defaults(handler=_handle_feature_table_build)
+
+    # `feature-table amplicon` — an ASV table over a cohort, built client-side from
+    # two signed Flight streams and written straight from its sparse rows.
+    p_ft_amplicon = p_feature_table_sub.add_parser(
+        "amplicon",
+        help=(
+            "Build an ASV feature table from one or more amplicon runs over a study's"
+            " samples or a named list, and write it with the map needed to read it"
+        ),
+    )
+    p_ft_amplicon.add_argument(
+        "--processing-idx",
+        type=int,
+        nargs="+",
+        required=True,
+        help=(
+            "The amplicon runs to draw from. Several merge into one table only when their"
+            " ASVs are comparable (same trim length and orientation); otherwise refused."
+        ),
+    )
+    amplicon_cohort = p_ft_amplicon.add_mutually_exclusive_group(required=True)
+    amplicon_cohort.add_argument(
+        "--study-idx", type=int, help="Every sample of this study the runs counted."
+    )
+    amplicon_cohort.add_argument(
+        "--prep-sample-idx",
+        type=int,
+        nargs="+",
+        help="Exactly these prep_samples; one the runs did not count is refused.",
+    )
+    p_ft_amplicon.add_argument(
+        "--format",
+        choices=TABLE_FORMATS,
+        default=DEFAULT_TABLE_FORMAT,
+        help=f"Table format (default {DEFAULT_TABLE_FORMAT}).",
+    )
+    p_ft_amplicon.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help=(
+            "Where to write the table. The rest of the bundle is named after it:"
+            " <stem>.exported-identifier.json, <stem>.manifest.json and"
+            " <stem>.sequences.parquet. None is overwritten if it exists, and a failure"
+            " part-way leaves none of them behind."
+        ),
+    )
+    p_ft_amplicon.add_argument(
+        "--data-plane-url",
+        required=True,
+        help="gRPC URL of the data plane the observations and ASV bytes stream from.",
+    )
+    p_ft_amplicon.set_defaults(handler=_handle_amplicon_feature_table)
 
     p_ticket = sub.add_parser("ticket", help="Work-ticket operations")
     p_ticket_sub = p_ticket.add_subparsers(dest="ticket_cmd", required=True)

@@ -625,19 +625,23 @@ URL_ASSEMBLY_PREP_SAMPLE = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_PREP_SAMPLE}"
 # =============================================================================
 # /amplicon/* — an amplicon feature table, as a query over a cohort
 # =============================================================================
-# One request body (runs + a study or a sample list) answered three ways: the
-# samples (JSON), the counts as sparse COO rows, and the features' sequences
-# (both Arrow IPC streams). Labelled only with public handles.
+# One request body (runs + a study or a sample list) answered as the samples
+# (JSON), the counts as sparse COO rows and the features' sequences (both Arrow
+# IPC streams), or as signed Flight tickets for a client that reads the data plane.
 
 PATH_AMPLICON_PREFIX = "/amplicon"
 PATH_AMPLICON_FEATURE_TABLE_SAMPLES = "/feature-table/samples"
 PATH_AMPLICON_FEATURE_TABLE_COUNTS = "/feature-table/counts"
 PATH_AMPLICON_FEATURE_TABLE_FEATURES = "/feature-table/features"
+# The same cohort as signed Flight tickets, for a client that reads the data plane
+# itself (`qiita amplicon feature-table`).
+PATH_AMPLICON_FEATURE_TABLE_TICKET = "/feature-table/ticket"
 
 URL_AMPLICON_PREFIX = f"{API_PREFIX}{PATH_AMPLICON_PREFIX}"
 URL_AMPLICON_FEATURE_TABLE_SAMPLES = f"{URL_AMPLICON_PREFIX}{PATH_AMPLICON_FEATURE_TABLE_SAMPLES}"
 URL_AMPLICON_FEATURE_TABLE_COUNTS = f"{URL_AMPLICON_PREFIX}{PATH_AMPLICON_FEATURE_TABLE_COUNTS}"
 URL_AMPLICON_FEATURE_TABLE_FEATURES = f"{URL_AMPLICON_PREFIX}{PATH_AMPLICON_FEATURE_TABLE_FEATURES}"
+URL_AMPLICON_FEATURE_TABLE_TICKET = f"{URL_AMPLICON_PREFIX}{PATH_AMPLICON_FEATURE_TABLE_TICKET}"
 
 
 # =============================================================================
