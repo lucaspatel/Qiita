@@ -34,13 +34,16 @@
   prints every problem against the sheet's `prepped_sample_idx`. The runner's
   roster check (`preflight.amplicon_samples`) accepts the same sheets. Needs
   run-preflight's `accept_tube_identity`, so the pin moves.
-- **An amplicon feature table is a cohort query over one or more runs.**
-  `POST /amplicon/feature-table/{samples,counts,features}` takes up to 32 amplicon
-  `processing_idx` (whose trim and primer orientation must agree) and a study or a set of
-  prepared samples. Columns are processed samples, named by ENA/BioSample accession when that
-  is unique in the table and by QM otherwise; counts are sparse COO in Arrow IPC with
-  md5 feature ids, and features carry each ASV's sequence. `POST .../ticket` returns signed
-  Flight tickets, and `qiita feature-table amplicon` builds a BIOM or Parquet bundle from them.
+- **A feature table is a cohort query over one or more processing runs.**
+  `POST /feature-table/{samples,values,features}` takes up to 32 `processing_idx` of one
+  method — amplicon runs (whose trim and primer orientation must agree) or taxonomic
+  profiles (against one database file and threshold) — and a study or a set of prepared
+  samples. Columns are processed samples, named by ENA/BioSample accession when that is
+  unique in the table and by QM otherwise; values are sparse COO in Arrow IPC (amplicon
+  counts with md5 feature ids, whose features carry each ASV's sequence; profile relative
+  abundances by genome name), and the samples answer names the method and `value_kind`.
+  `POST .../ticket` returns signed Flight tickets, and `qiita feature-table runs` builds a
+  BIOM or Parquet bundle from them.
 - **`GET /study/{idx}/lineage` describes a study's processing as a graph.** One DAG per
   prep protocol (run, reads, mask, processing, product), with per-sample states backed by a
   new `qiita.amplicon_sample` gate, sample labels by accession, else QB, and each sample's

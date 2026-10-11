@@ -47,28 +47,37 @@ def pcoa_coo(
     """The table's samples on their leading principal coordinates (Bray-Curtis).
 
     Observation i is (`sample_codes[i]`, `feature_codes[i]`, `values[i]`), codes
-    into `samples` and a feature space of `n_features`. Returns the samples placed,
-    one coordinate list per axis, each axis's proportion explained, every sample's
-    total count (`depths`, the whole table's), and the samples a depth dropped.
+    into `samples` and a feature space of `n_features`. The values are counts (an
+    amplicon run's) or relative abundances (a profile's fractions); only counts can
+    be rarefied. Returns the samples placed, one coordinate list per axis, each
+    axis's proportion explained, every sample's total count (`depths`, the whole
+    table's; empty for abundances, which have no depth), and the samples a depth
+    dropped.
     """
     names = [str(s) for s in samples]
-    counts = np.zeros((len(names), int(n_features)), dtype=np.int64)
+    matrix = np.zeros((len(names), int(n_features)), dtype=np.float64)
     np.add.at(
-        counts,
+        matrix,
         (
             np.asarray(sample_codes, dtype=np.int64),
             np.asarray(feature_codes, dtype=np.int64),
         ),
-        np.asarray(values, dtype=np.int64),
+        np.asarray(values, dtype=np.float64),
     )
-    totals = counts.sum(axis=1)
+    totals = matrix.sum(axis=1)
     if (totals <= 0).any():
         empty = [n for n, d in zip(names, totals) if d <= 0]
-        raise ValueError(f"{len(empty)} sample(s) have no counts, e.g. {empty[:3]}")
+        raise ValueError(f"{len(empty)} sample(s) have no values, e.g. {empty[:3]}")
+    is_counts = bool(np.all(matrix == np.round(matrix)))
+    if depth is not None and not is_counts:
+        raise ValueError("relative abundances cannot be rarefied; pass no depth")
+    counts = matrix.astype(np.int64) if is_counts else None
 
     dropped: list[str] = []
     if depth is None:
-        profiles = counts / totals[:, None]
+        # Renormalized, so a profile whose reported genomes do not sum to 1 (mass
+        # left unclassified) is compared on what it did classify.
+        profiles = matrix / totals[:, None]
     else:
         if depth <= 0:
             raise ValueError(f"rarefaction depth must be positive, not {depth}")
@@ -96,10 +105,10 @@ def pcoa_coo(
         "samples": names,
         "axes": [result.samples.iloc[:, i].tolist() for i in range(k)],
         "proportion_explained": result.proportion_explained.iloc[:k].tolist(),
-        "n_features": int(counts.shape[1]),
+        "n_features": int(matrix.shape[1]),
         "n_samples": len(names),
         "depth": depth,
-        "depths": [int(t) for t in totals],
+        "depths": [int(t) for t in totals] if is_counts else [],
         "dropped": dropped,
     }
 

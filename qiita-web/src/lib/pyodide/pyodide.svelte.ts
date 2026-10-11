@@ -35,7 +35,8 @@ export type Pcoa = {
   n_samples: number;
   /** The rarefaction depth, or null for relative abundance. */
   depth: number | null;
-  /** Every sample's total count in the table, rarefied or not. */
+  /** Every sample's total count in the table, rarefied or not; empty for a table
+   *  of relative abundances, which cannot be rarefied. */
   depths: number[];
   /** Samples below the rarefaction depth, left out. */
   dropped: string[];

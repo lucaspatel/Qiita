@@ -75,6 +75,7 @@ from qiita_common.models import (
     WorkTicketState,
 )
 from qiita_common.parquet import PARQUET_MEDIA_TYPE, PARQUET_RESPONSES
+from qiita_common.taxonomic_profile_constants import TAXONOMIC_PROFILE_TABLE
 
 from ..actions.library import (
     delete_reference_data,
@@ -995,10 +996,13 @@ _DOGET_ALLOWED_TABLES = frozenset(
         # (routes/assembly.py) and in-process by the feature-table resolver.
         BIN_QUALITY_TABLE,
         # One amplicon run's ASV counts and sequences over a cohort, signed
-        # in-process by the amplicon feature-table route (routes/amplicon.py).
+        # in-process by the feature-table route (routes/run_feature_table.py).
         AMPLICON_MEMBERSHIP_TABLE,
         AMPLICON_SEQUENCE_TABLE,
         AMPLICON_SEQUENCE_CHUNKS_TABLE,
+        # One taxonomic-profile run's rows over a cohort, signed in-process by the
+        # feature-table route.
+        TAXONOMIC_PROFILE_TABLE,
     }
 )
 
@@ -1034,6 +1038,7 @@ _REFERENCE_DOGET_TABLES = _DOGET_ALLOWED_TABLES - frozenset(
         AMPLICON_MEMBERSHIP_TABLE,
         AMPLICON_SEQUENCE_TABLE,
         AMPLICON_SEQUENCE_CHUNKS_TABLE,
+        TAXONOMIC_PROFILE_TABLE,
     }
 )
 

@@ -819,6 +819,28 @@ pub fn ensure_amplicon_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+/// Create the taxonomic-profile table. One row per (sample, run, genome) a
+/// profiler reported: the `taxonomic-profile` workflow's sylph abundances and ANI
+/// (fractions in [0, 1]) and effective coverage. `genome_name` is the profiling database's own genome identifier (not
+/// yet mapped to `qiita.genome`). Replace-keyed on `(prep_sample_idx,
+/// processing_idx)` in `flight_service::REPLACE_KEY_TABLES`, so a re-run replaces
+/// its own rows.
+pub fn ensure_taxonomic_profile_table(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS qiita_lake.taxonomic_profile (
+            prep_sample_idx BIGINT NOT NULL,
+            processing_idx BIGINT NOT NULL,
+            genome_name VARCHAR NOT NULL,
+            contig_name VARCHAR,
+            taxonomic_abundance DOUBLE NOT NULL,
+            sequence_abundance DOUBLE NOT NULL,
+            adjusted_ani DOUBLE NOT NULL,
+            eff_cov DOUBLE NOT NULL
+        );",
+    )?;
+    Ok(())
+}
+
 /// Create the one row that registrations into the replace-keyed tables
 /// serialize on, and seed it.
 ///
@@ -1527,6 +1549,22 @@ mod tests {
             vec![feat_kept],
             "alignment_visible persists + anti-joins after reattach"
         );
+    }
+
+    #[test]
+    fn ensure_taxonomic_profile_table_is_idempotent() {
+        let conn = setup_conn();
+        ensure_taxonomic_profile_table(&conn).expect("first ensure_taxonomic_profile_table");
+        ensure_taxonomic_profile_table(&conn).expect("second (idempotent)");
+        let n: i64 = conn
+            .prepare(
+                "SELECT count(*) FROM information_schema.tables \
+                 WHERE table_name = 'taxonomic_profile'",
+            )
+            .unwrap()
+            .query_row([], |row| row.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "taxonomic_profile table should exist exactly once");
     }
 
     #[test]

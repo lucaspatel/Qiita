@@ -440,28 +440,29 @@ _TRIPLES: list[tuple[str, str, str]] = [
     ("URL_READ_MASKED_DOGET", "PATH_READ_MASKED_PREFIX", "PATH_READ_MASKED_DOGET"),
     # /read (Flight DoGet ticket for a block's reads)
     ("URL_READ_DOGET", "PATH_READ_PREFIX", "PATH_READ_DOGET"),
+    # /feature-table (a run feature table over a cohort)
+    (
+        "URL_FEATURE_TABLE_SAMPLES",
+        "PATH_FEATURE_TABLE_PREFIX",
+        "PATH_FEATURE_TABLE_SAMPLES",
+    ),
+    (
+        "URL_FEATURE_TABLE_VALUES",
+        "PATH_FEATURE_TABLE_PREFIX",
+        "PATH_FEATURE_TABLE_VALUES",
+    ),
+    (
+        "URL_FEATURE_TABLE_FEATURES",
+        "PATH_FEATURE_TABLE_PREFIX",
+        "PATH_FEATURE_TABLE_FEATURES",
+    ),
+    (
+        "URL_FEATURE_TABLE_TICKET",
+        "PATH_FEATURE_TABLE_PREFIX",
+        "PATH_FEATURE_TABLE_TICKET",
+    ),
     # /assembly (Flight DoGet ticket for one assembly run's contigs, and that
     # run's contig -> genome map)
-    (
-        "URL_AMPLICON_FEATURE_TABLE_SAMPLES",
-        "PATH_AMPLICON_PREFIX",
-        "PATH_AMPLICON_FEATURE_TABLE_SAMPLES",
-    ),
-    (
-        "URL_AMPLICON_FEATURE_TABLE_COUNTS",
-        "PATH_AMPLICON_PREFIX",
-        "PATH_AMPLICON_FEATURE_TABLE_COUNTS",
-    ),
-    (
-        "URL_AMPLICON_FEATURE_TABLE_FEATURES",
-        "PATH_AMPLICON_PREFIX",
-        "PATH_AMPLICON_FEATURE_TABLE_FEATURES",
-    ),
-    (
-        "URL_AMPLICON_FEATURE_TABLE_TICKET",
-        "PATH_AMPLICON_PREFIX",
-        "PATH_AMPLICON_FEATURE_TABLE_TICKET",
-    ),
     ("URL_ASSEMBLY_DOGET", "PATH_ASSEMBLY_PREFIX", "PATH_ASSEMBLY_DOGET"),
     ("URL_ASSEMBLY_RUN_DOGET", "PATH_ASSEMBLY_PREFIX", "PATH_ASSEMBLY_RUN_DOGET"),
     ("URL_ASSEMBLY_GENOME_MAP", "PATH_ASSEMBLY_PREFIX", "PATH_ASSEMBLY_GENOME_MAP"),

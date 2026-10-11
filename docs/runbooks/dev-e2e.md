@@ -10,7 +10,7 @@ features are later split into upstream PRs. Besides `main` it carries:
 
 - the rapid-16S work: tube-keyed roster resolution, workflow follow-ons, the
   bcl-convert 4.x dummy sheet, QM identifiers, the `amplicon_sample` gate, the study
-  lineage endpoint, and the amplicon feature table (REST + `qiita feature-table amplicon`).
+  lineage endpoint, and run feature tables (REST + `qiita feature-table runs`).
 - the web UI: `qiita-web/`, plus named environments for the CLI and
   `GET /api/v1/deployment`.
 
@@ -127,7 +127,7 @@ The local run used `trim: 150` with no primer.
 | UI → study 25060 → **Samples** | First column is the accession, else QB; every delivered column shows; the local-metadata switch shades local columns |
 | UI → **Processing** | One DAG: Run → Reads → ASVs → Feature table, with per-sample states; the producing action appears on arrow hover |
 | Feature table node | 173 samples × 4028 ASVs; PCoA with a rarefaction slider; color/shape by any metadata column; PERMANOVA re-run on each change |
-| `qiita feature-table amplicon --processing-idx <run> --study-idx 25060 --format biom --output ibd.biom --data-plane-url grpc://localhost:15051` | BIOM 4028 × 173, total count 12,750,700, matching the REST table |
+| `qiita feature-table runs --processing-idx <run> --study-idx 25060 --format biom --output ibd.biom --data-plane-url grpc://localhost:15051` | BIOM 4028 × 173, total count 12,750,700, matching the REST table |
 | UI → **Add samples**, drop the sheet | Validation runs on drop (about 15 s the first time); the review grid and the fixes work. **Don't upload** (section 4). |
 
 The sample, ASV and count figures are the local run's. Dev should reproduce them

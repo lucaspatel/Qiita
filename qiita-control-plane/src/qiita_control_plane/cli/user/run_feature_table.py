@@ -1,17 +1,19 @@
-"""qiita user CLI — the client-side amplicon feature table.
+"""qiita user CLI — the client-side run feature table.
 
-`qiita feature-table amplicon` builds an ASV feature table on the caller's own
-machine, the way `feature-table build` builds a genome table: the control plane
-authorizes the cohort and signs two Flight tickets (the observations and the ASV
-bytes), the data plane streams them, and the relabel and the write happen in the
-caller's DuckDB under the caller's credentials. Nothing is computed server-side
-and nothing is stored there.
+`qiita feature-table runs` builds a feature table from processing runs on the
+caller's own machine, the way `feature-table build` builds a genome table: the
+control plane authorizes the cohort and signs Flight tickets (the values, and an
+amplicon table's ASV bytes), the data plane streams them, and the relabel and the
+write happen in the caller's DuckDB under the caller's credentials. Nothing is
+computed server-side and nothing is stored there.
 
-The table is written straight from its sparse COO rows — BIOM and Parquet both
-take `(feature_id, sample_id, value)` — so it is never made dense on the way to
-disk. The relabel itself (md5 feature ids, public column names) is the control
-plane's `stage_features` / `stage_counts`, shared with the REST answer, so the
-two cannot disagree about a table.
+A run is an amplicon run (ASV counts, features named by sequence md5) or a
+taxonomic profile (relative abundances, features named by the profiling
+database's genome identifiers). The table is written straight from its sparse COO
+rows — BIOM and Parquet both take `(feature_id, sample_id, value)` — so it is never
+made dense on the way to disk. The relabel itself is the control plane's
+`stage_values`, shared with the REST answer, so the two cannot disagree about a
+table.
 """
 
 from __future__ import annotations
@@ -24,14 +26,13 @@ from pathlib import Path
 from typing import Any
 
 from qiita_common import analytic as ft
-from qiita_common.api_paths import PATH_AMPLICON_FEATURE_TABLE_TICKET, PATH_AMPLICON_PREFIX
-from qiita_common.models.amplicon import AmpliconFeatureTableRequest
+from qiita_common.api_paths import PATH_FEATURE_TABLE_PREFIX, PATH_FEATURE_TABLE_TICKET
+from qiita_common.models.run_feature_table import FeatureTableRequest
 
-from ...amplicon_feature_table import COUNT_RELATION, stage_counts, stage_features
+from ...run_feature_table import SOURCES, VALUE_RELATION, stage_values
 from .. import _common
 from .feature_table import (
     IDENTIFIER_MAP_NOTE,
-    SEQUENCES_COMPANION,
     SequencesClearance,
     _bundle_targets,
     _registered,
@@ -41,15 +42,21 @@ from .feature_table import (
 )
 
 MANIFEST_NOTE = (
-    "This file records what produced the table beside it: the amplicon runs and the"
-    " samples it was built over. A feature table is a selection over the lake, so the"
-    " same runs over a different cohort yield a different table — which is why this"
-    " record is part of the bundle."
+    "This file records what produced the table beside it: the runs and the samples it"
+    " was built over. A feature table is a selection over the lake, so the same runs"
+    " over a different cohort yield a different table — which is why this record is"
+    " part of the bundle."
 )
 
+# What each method's feature ids are, for the manifest.
+_FEATURE_ID = {
+    "amplicon": "md5 of the ASV sequence",
+    "taxonomic-profile": "the profiling database's genome identifier",
+}
 
-def _request(args: argparse.Namespace) -> AmpliconFeatureTableRequest:
-    return AmpliconFeatureTableRequest(
+
+def _request(args: argparse.Namespace) -> FeatureTableRequest:
+    return FeatureTableRequest(
         processing_idx=args.processing_idx,
         study_idx=args.study_idx,
         prep_sample_idx=args.prep_sample_idx,
@@ -66,9 +73,10 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
         "POST",
         args.base_url,
         token,
-        f"{PATH_AMPLICON_PREFIX}{PATH_AMPLICON_FEATURE_TABLE_TICKET}",
+        f"{PATH_FEATURE_TABLE_PREFIX}{PATH_FEATURE_TABLE_TICKET}",
         json=request.model_dump(exclude_none=True),
     )
+    source = SOURCES[response["method"]]
     samples: list[dict[str, Any]] = response["samples"]
     names = pa.table(
         {
@@ -77,19 +85,27 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
             "sample": pa.array([s["sample"] for s in samples], pa.string()),
         }
     )
+    streams = [("values_ticket", "run_values")]
+    if response["sequences_ticket"] is not None:
+        streams.append(("sequences_ticket", "chunks"))
     with flight.FlightClient(args.data_plane_url) as client:
         # Each stream is read once, into a table: the relabel scans both twice.
-        for key, relation in (("membership_ticket", "membership"), ("chunks_ticket", "chunks")):
+        for key, relation in streams:
             ticket = base64.b64decode(response[key])
-            with staged_stream(con, client, ticket, relation=f"{relation}_stream") as source:
-                con.execute(f"CREATE TEMP TABLE {relation} AS SELECT * FROM {source}")
+            with staged_stream(con, client, ticket, relation=f"{relation}_stream") as stream:
+                con.execute(f"CREATE TEMP TABLE {relation} AS SELECT * FROM {stream}")
     with _registered(con, "names", names):
-        stage_features(con, chunks="chunks")
-        stage_counts(con, names="names", membership="membership")
+        stage_values(
+            con,
+            source=source,
+            names="names",
+            values="run_values",
+            chunks="chunks" if len(streams) == 2 else None,
+        )
     con.execute(
         f"CREATE TEMP TABLE {ft.LABELLED_RELATION} AS"
-        " SELECT feature AS feature_id, sample AS sample_id, count::DOUBLE AS value"
-        f" FROM {COUNT_RELATION} ORDER BY sample_id, feature_id"
+        " SELECT feature AS feature_id, sample AS sample_id, value"
+        f" FROM {VALUE_RELATION} ORDER BY sample_id, feature_id"
     )
     sizes = dict(
         zip(
@@ -105,9 +121,10 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
     def manifest(targets: list[Path]) -> dict[str, Any]:
         return {
             "note": MANIFEST_NOTE,
-            "kind": "amplicon",
+            "kind": source.method,
+            "value_kind": source.value_kind,
             "request": request.model_dump(exclude_none=True),
-            "feature_id": "md5 of the ASV sequence",
+            "feature_id": _FEATURE_ID[source.method],
             **sizes,
             "files": [p.name for p in targets],
             "versions": _tool_versions(con),
@@ -119,15 +136,17 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
         fmt=args.format,
         identifiers=samples,
         manifest=manifest,
-        clearances={"sequences": SequencesClearance(features=sizes["features"])},
+        clearances=(
+            {"sequences": SequencesClearance(features=sizes["features"])}
+            if source.sequences_table is not None
+            else {}
+        ),
     )
     return written, sizes
 
 
-def _handle_amplicon_feature_table(
-    args: argparse.Namespace, parser: argparse.ArgumentParser
-) -> int:
-    """Entry point for `qiita feature-table amplicon`. Fails loudly (exit 1) on the
+def _handle_run_feature_table(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """Entry point for `qiita feature-table runs`. Fails loudly (exit 1) on the
     first refusal; a failure part-way leaves no bundle file behind."""
     import duckdb  # noqa: PLC0415
     import pyarrow.flight as flight  # noqa: PLC0415
@@ -142,8 +161,10 @@ def _handle_amplicon_feature_table(
         return 1
     try:
         # The refusals that need only the flags, before a connection or a stream.
+        # The method, and so whether a sequences companion is written, is known
+        # only from the ticket; the write checks the whole bundle again.
         _request(args)
-        _bundle_targets(args.output, args.format, companions=(SEQUENCES_COMPANION,))
+        _bundle_targets(args.output, args.format)
         with contextlib.closing(connect_with_miint()) as con:
             written, sizes = _build(args, token, con)
     except ValidationError as exc:
@@ -169,13 +190,14 @@ def _handle_amplicon_feature_table(
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    table_path, map_path, manifest_path, sequences_path = written
+    table_path, map_path, manifest_path, *companions = written
     print(
         f"wrote {sizes['samples']} sample(s) x {sizes['features']} feature(s),"
         f" {sizes['observations']} observation(s), to {table_path} ({args.format})"
     )
     print(f"and the map needed to read it: {map_path}")
     print(f"and the record of what produced it: {manifest_path}")
-    print(f"and each feature's sequence: {sequences_path}")
+    for path in companions:
+        print(f"and each feature's sequence: {path}")
     print(IDENTIFIER_MAP_NOTE)
     return 0

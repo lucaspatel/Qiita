@@ -1,0 +1,222 @@
+"""The taxonomic-profile completion gate, `qiita.taxonomic_profile_sample`, and the
+runner pieces around it: the pool's metagenomic population, the sylph database
+resolver, the identity knobs, and the closing action."""
+
+import hashlib
+import json
+import uuid
+
+import duckdb
+import pytest
+
+from qiita_control_plane.actions.library import finalize_taxonomic_profile_sample
+from qiita_control_plane.repositories.processing import mint_processing
+from qiita_control_plane.repositories.taxonomic_profile import (
+    create_taxonomic_profile_samples_pending,
+    list_pool_metagenomic_prep_sample_idxs,
+)
+from qiita_control_plane.runner._processing import (
+    _build_processing_params,
+    _record_taxonomic_profile_gate_no_data,
+)
+from qiita_control_plane.runner._reference import _resolve_sylph_database
+from qiita_control_plane.testing.db_seeds import (
+    seed_biosample_with_sequenced_prep_sample,
+    seed_sequenced_sample_subtype,
+    seed_user_principal,
+)
+from qiita_control_plane.testing.db_teardown import delete_principal, teardown_entity_graph
+
+pytestmark = pytest.mark.db
+
+
+@pytest.fixture
+async def run(postgres_pool):
+    """A pool of two metagenomic prep_samples and one amplicon one (an ENA study's
+    runs share a pool), and a taxonomic-profile processing run."""
+    owner = await seed_user_principal(
+        postgres_pool, prefix="prof-gate", suffix=str(uuid.uuid4())[:8]
+    )
+    samples, run_idx, pool_idx = [], None, None
+    for i, protocol in enumerate(
+        ("short_read_metagenomics", "long_read_metagenomics", "short_read_amplicon")
+    ):
+        bs, ps = await seed_biosample_with_sequenced_prep_sample(
+            postgres_pool, owner_idx=owner, protocol_name=protocol
+        )
+        run_idx, pool_idx, _ = await seed_sequenced_sample_subtype(
+            postgres_pool,
+            prep_sample_idx=ps,
+            owner_idx=owner,
+            sequenced_pool_item_id=f"prof-gate-{i}",
+            sequencing_run_idx=run_idx,
+            sequenced_pool_idx=pool_idx,
+        )
+        samples.append((bs, ps))
+    async with postgres_pool.acquire() as conn:
+        processing = await mint_processing(
+            conn,
+            workflow="taxonomic-profile",
+            version="1.0.0",
+            params={"workflow": "taxonomic-profile", "probe": str(uuid.uuid4())},
+        )
+    p = processing["processing_idx"]
+    yield {
+        "processing_idx": p,
+        "pool_idx": pool_idx,
+        "owner": owner,
+        "metagenomic": [samples[0][1], samples[1][1]],
+        "amplicon": samples[2][1],
+    }
+    await postgres_pool.execute(
+        "DELETE FROM qiita.exported_identifier WHERE processing_idx = $1", p
+    )
+    await postgres_pool.execute(
+        "DELETE FROM qiita.taxonomic_profile_sample WHERE processing_idx = $1", p
+    )
+    await postgres_pool.execute("DELETE FROM qiita.processing WHERE processing_idx = $1", p)
+    await teardown_entity_graph(
+        postgres_pool,
+        study_idxs=[],
+        biosample_idxs=[b for b, _ in samples],
+        prep_sample_idxs=[ps for _, ps in samples],
+    )
+    await postgres_pool.execute("DELETE FROM qiita.sequenced_pool WHERE idx = $1", pool_idx)
+    await postgres_pool.execute("DELETE FROM qiita.sequencing_run WHERE idx = $1", run_idx)
+    await delete_principal(postgres_pool, [owner])
+
+
+async def _states(pool, processing_idx):
+    rows = await pool.fetch(
+        "SELECT prep_sample_idx, state, genome_count FROM qiita.taxonomic_profile_sample"
+        " WHERE processing_idx = $1 ORDER BY prep_sample_idx",
+        processing_idx,
+    )
+    return {r["prep_sample_idx"]: (r["state"], r["genome_count"]) for r in rows}
+
+
+async def _pending(pool, run):
+    async with pool.acquire() as conn, conn.transaction():
+        await create_taxonomic_profile_samples_pending(
+            conn, processing_idx=run["processing_idx"], prep_sample_idxs=run["metagenomic"]
+        )
+
+
+async def test_the_pool_population_is_its_metagenomic_samples(postgres_pool, run):
+    assert await list_pool_metagenomic_prep_sample_idxs(postgres_pool, run["pool_idx"]) == sorted(
+        run["metagenomic"]
+    )
+
+
+async def test_finalize_closes_the_gate_and_mints_identifiers(postgres_pool, run, tmp_path):
+    await _pending(postgres_pool, run)
+    a, b = run["metagenomic"]
+    counts = tmp_path / "profile_counts.parquet"
+    with duckdb.connect() as con:
+        con.execute(
+            f"COPY (SELECT {a}::BIGINT AS prep_sample_idx, 7::INTEGER AS genome_count)"
+            f" TO '{counts}' (FORMAT PARQUET)"
+        )
+    written = await finalize_taxonomic_profile_sample(
+        postgres_pool,
+        processing_idx=run["processing_idx"],
+        profile_counts_path=counts,
+        created_by_idx=run["owner"],
+    )
+    assert written == (1, 1)
+    assert await _states(postgres_pool, run["processing_idx"]) == {
+        a: ("completed", 7),
+        b: ("no_data", None),
+    }
+    minted = await postgres_pool.fetch(
+        "SELECT prep_sample_idx FROM qiita.exported_identifier"
+        " WHERE processing_idx = $1 AND NOT retired",
+        run["processing_idx"],
+    )
+    assert [r["prep_sample_idx"] for r in minted] == [a]
+
+
+async def test_a_no_data_run_closes_every_pending_row(postgres_pool, run):
+    await _pending(postgres_pool, run)
+    await _record_taxonomic_profile_gate_no_data(
+        postgres_pool, processing_idx=run["processing_idx"]
+    )
+    states = await _states(postgres_pool, run["processing_idx"])
+    assert set(states.values()) == {("no_data", None)}
+
+
+def test_the_identity_carries_the_database_file_and_threshold():
+    bound = {"sylph_reference_idx": 4, "sylph_database_sha256": "ab" * 32}
+    base = _build_processing_params("taxonomic-profile", "1.0.0", bound)
+    assert base == {
+        "workflow": "taxonomic-profile",
+        "version": "1.0.0",
+        "sylph_reference_idx": 4,
+        "sylph_database_sha256": "ab" * 32,
+    }
+    assert _build_processing_params("taxonomic-profile", "1.0.0", {**bound, "min_ani": 0.97}) == {
+        **base,
+        "min_ani": 0.97,
+    }
+    assert "trim" not in base and "sylph_reference_idx" not in _build_processing_params(
+        "amplicon", "1.1.0", {"trim": 150, "sortmerna_reference_idx": 1}
+    )
+
+
+@pytest.fixture
+async def sylph_reference(postgres_pool, tmp_path):
+    db = tmp_path / "wol3.syl2db"
+    db.write_bytes(b"sylph")
+    sha = hashlib.sha256(b"sylph").hexdigest()
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
+        " VALUES ($1, '1', 'profiling_database', 'active', 1) RETURNING reference_idx",
+        f"sylph-resolve-{uuid.uuid4().hex[:8]}",
+    )
+    await postgres_pool.execute(
+        "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params)"
+        " VALUES ($1, 'sylph', $2, $3::jsonb)",
+        idx,
+        str(db),
+        json.dumps({"format": "syl2db", "sha256": sha, "size_bytes": 5}),
+    )
+    yield {"reference_idx": idx, "path": db, "sha256": sha}
+    await postgres_pool.execute("DELETE FROM qiita.reference_index WHERE reference_idx = $1", idx)
+    await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
+
+
+async def test_the_resolver_binds_the_file_and_its_sha256(postgres_pool, sylph_reference):
+    bound = await _resolve_sylph_database(
+        postgres_pool, action_context={"sylph_reference_idx": sylph_reference["reference_idx"]}
+    )
+    assert bound == {
+        "sylph_database": sylph_reference["path"],
+        "sylph_database_sha256": sylph_reference["sha256"],
+    }
+
+
+async def test_the_resolver_refuses_a_moved_file(postgres_pool, sylph_reference):
+    sylph_reference["path"].unlink()
+    with pytest.raises(Exception, match="no longer a file"):
+        await _resolve_sylph_database(
+            postgres_pool, action_context={"sylph_reference_idx": sylph_reference["reference_idx"]}
+        )
+
+
+async def test_the_resolver_refuses_another_kind_of_reference(postgres_pool):
+    idx = await postgres_pool.fetchval(
+        "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
+        " VALUES ($1, '1', 'sequence_reference', 'active', 1) RETURNING reference_idx",
+        f"sylph-wrong-kind-{uuid.uuid4().hex[:8]}",
+    )
+    try:
+        with pytest.raises(Exception, match="not a 'profiling_database'"):
+            await _resolve_sylph_database(
+                postgres_pool, action_context={"sylph_reference_idx": idx}
+            )
+        with pytest.raises(Exception, match="does not exist"):
+            await _resolve_sylph_database(
+                postgres_pool, action_context={"sylph_reference_idx": 2**62}
+            )
+    finally:
+        await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)

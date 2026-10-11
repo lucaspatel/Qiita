@@ -123,21 +123,32 @@ async function postArrow(path: string, body: unknown, timeoutMs = 60_000): Promi
   return { ok: false, status: res.status, detail };
 }
 
-/** Which amplicon runs, over which samples (exactly one of study_idx / prep_sample_idx). */
-export type AmpliconFeatureTableRequest = {
+/** Which runs (amplicon runs or taxonomic profiles, all of one method), over which
+ *  samples (exactly one of study_idx / prep_sample_idx). */
+export type FeatureTableRequest = {
   processing_idx: number[];
   study_idx?: number;
   prep_sample_idx?: number[];
 };
 
-/** One column of an amplicon feature table: a processed sample. */
-export type AmpliconFeatureTableSample = {
+/** What a table's values are: reads counted per feature, or a fraction of the sample. */
+export type FeatureTableValueKind = 'count' | 'relative_abundance';
+
+/** One column of a run feature table: a processed sample. */
+export type FeatureTableSample = {
   /** The column name: the biosample's deposited accession, else the QM. */
   sample: string;
   export_id: string;
   /** The biosample's public name (accession, else QB): the metadata join key. */
   biosample: string;
   processing_idx: number;
+};
+
+export type FeatureTableSamples = {
+  /** The runs' method (`amplicon`, `taxonomic-profile`). */
+  method: string;
+  value_kind: FeatureTableValueKind;
+  samples: FeatureTableSample[];
 };
 
 export type Whoami = {
@@ -611,15 +622,13 @@ export const api = {
     get<IdxList>(`/study/${studyIdx}/biosample/list-idxs`),
   /** One biosample incl. its global_metadata values. Readable at viewer tier. */
   biosample: (idx: number) => get<Biosample>(`/biosample/${idx}`),
-  /** An amplicon feature table's columns. */
-  ampliconFeatureTableSamples: (body: AmpliconFeatureTableRequest) =>
-    send<{ samples: AmpliconFeatureTableSample[] }>('POST', '/amplicon/feature-table/samples', body),
-  /** Its counts, sparse COO (sample, feature, count), as an Arrow IPC stream. */
-  ampliconFeatureTableCounts: (body: AmpliconFeatureTableRequest) =>
-    postArrow('/amplicon/feature-table/counts', body),
-  /** Its features (feature, sequence, length), as an Arrow IPC stream. */
-  ampliconFeatureTableFeatures: (body: AmpliconFeatureTableRequest) =>
-    postArrow('/amplicon/feature-table/features', body),
+  /** A run feature table's columns, with its method and value kind. */
+  featureTableSamples: (body: FeatureTableRequest) =>
+    send<FeatureTableSamples>('POST', '/feature-table/samples', body),
+  /** Its values, sparse COO (sample, feature, value), as an Arrow IPC stream. */
+  featureTableValues: (body: FeatureTableRequest) => postArrow('/feature-table/values', body),
+  /** Its features (feature, sequence, length; sequence null for a profile), as Arrow IPC. */
+  featureTableFeatures: (body: FeatureTableRequest) => postArrow('/feature-table/features', body),
   /** A biosample as one study sees it: global fields plus the study's own (local_metadata). */
   studyBiosample: (studyIdx: number, idx: number) =>
     get<Biosample>(`/study/${studyIdx}/biosample/${idx}`),

@@ -58,11 +58,11 @@ from qiita_common.taxonomy import TAXONOMY_SOURCE_TABLE
 if TYPE_CHECKING:
     import pyarrow as pa
 
-from ...amplicon_feature_table import FEATURE_RELATION
 from ...feature_table import (
     denovo_alignment_processing_idx,
     denovo_assembly_deprecation_error,
 )
+from ...run_feature_table import FEATURE_RELATION
 from .. import _common
 from ._helpers import _UNSET
 from .alignment import (

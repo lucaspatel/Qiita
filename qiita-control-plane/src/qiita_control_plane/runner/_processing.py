@@ -33,8 +33,13 @@ from ..repositories.assembly import (
     upsert_assembly_sample_no_data,
 )
 from ..repositories.processing import ProcessingDeprecated, mint_processing
+from ..repositories.taxonomic_profile import (
+    close_taxonomic_profile_samples,
+    create_taxonomic_profile_samples_pending,
+)
 from ._base import _log
 from ._mask import MASK_IDX_BINDING
+from ._reference import SYLPH_DATABASE_SHA256_BINDING, SYLPH_REFERENCE_IDX_KEY
 from ._upload import _submission_bad_input
 
 # action_context key naming the step-1 assembler. Its default is single-sourced
@@ -42,6 +47,11 @@ from ._upload import _submission_bad_input
 # here — a re-declared literal would let the hash pick a different assembler than
 # the container runs.
 ASSEMBLER_BINDING = "assembler"
+
+# The taxonomic-profile step's input naming the samples it profiles: a JSON list
+# of prep_sample_idx the runner writes to the workspace, the pool's metagenomic
+# samples (the pool also streams any others it holds).
+PROFILE_SAMPLES_BINDING = "profile_samples"
 
 
 def _workflow_needs_processing(steps: list[Any]) -> bool:
@@ -108,6 +118,14 @@ def _build_processing_params(
     # no-op knob, and an omitted-vs-explicit primer must not split the identity).
     # 1.1.0 binds neither and hashes orient_primer off, the shape of an un-oriented
     # 1.0.0 run.
+    # taxonomic-profile knobs, gated on `sylph_reference_idx` (no other workflow
+    # binds it). The database file's sha256 enters with its reference_idx, so a
+    # file replaced in place under the same reference is a different run; min_ani
+    # only when the submitter set it, so omitted means sylph's default.
+    if bound.get(SYLPH_REFERENCE_IDX_KEY) is not None:
+        candidates[SYLPH_REFERENCE_IDX_KEY] = bound.get(SYLPH_REFERENCE_IDX_KEY)
+        candidates[SYLPH_DATABASE_SHA256_BINDING] = bound.get(SYLPH_DATABASE_SHA256_BINDING)
+        candidates["min_ani"] = bound.get("min_ani")
     if bound.get("trim") is not None:
         orient = bool(bound.get("orient_primer"))
         candidates["trim"] = bound.get("trim")
@@ -197,6 +215,36 @@ async def _create_amplicon_gate_pending(
         await create_amplicon_samples_pending(
             conn, processing_idx=processing_idx, prep_sample_idxs=population
         )
+
+
+def _workflow_writes_taxonomic_profile_gate(steps: list[Any]) -> bool:
+    """True iff some entry is the `finalize-taxonomic-profile-sample` action — the
+    signal for the runner's 'pending' write of the pool's metagenomic samples."""
+    gate = LibraryPrimitive.FINALIZE_TAXONOMIC_PROFILE_SAMPLE
+    return any(isinstance(entry, WorkflowAction) and entry.name == gate for entry in steps)
+
+
+async def _create_taxonomic_profile_gate_pending(
+    pool: asyncpg.Pool, *, processing_idx: int, prep_sample_idxs: list[int]
+) -> None:
+    """Materialize this run's taxonomic_profile_sample rows at 'pending' for the
+    samples it profiles, right after the processing_idx mint gives them their key."""
+    async with pool.acquire() as conn, conn.transaction():
+        await create_taxonomic_profile_samples_pending(
+            conn, processing_idx=processing_idx, prep_sample_idxs=prep_sample_idxs
+        )
+
+
+async def _record_taxonomic_profile_gate_no_data(
+    pool: asyncpg.Pool, *, processing_idx: int
+) -> None:
+    """Close this run's still-'pending' taxonomic_profile_sample rows at 'no_data'.
+
+    Run from the StepNoData handler: the profiling job raises it when the profiler
+    reported no genome in any sample, which abandons the closing action, so
+    without this the rows would sit 'pending' for a run that has ended."""
+    async with pool.acquire() as conn, conn.transaction():
+        await close_taxonomic_profile_samples(conn, processing_idx=processing_idx, genome_counts={})
 
 
 async def _create_assembly_gate_pending(

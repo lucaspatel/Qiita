@@ -541,6 +541,29 @@ async def _run_action_primitive(
         )
         return {}
 
+    if entry.name == LibraryPrimitive.FINALIZE_TAXONOMIC_PROFILE_SAMPLE:
+        # After register-files; processing_idx from `bound`, the run identity the
+        # runner minted (and materialized the pool's 'pending' rows under) before
+        # the loop. The identifiers are minted for the ticket's originator.
+        if set(entry.inputs) != {"profile_counts"}:
+            raise RuntimeError(
+                "finalize-taxonomic-profile-sample expects inputs [profile_counts];"
+                f" got {entry.inputs!r}"
+            )
+        originator_idx = await pool.fetchval(
+            "SELECT originator_principal_idx FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+            work_ticket_idx,
+        )
+        if originator_idx is None:
+            raise RuntimeError(f"work_ticket {work_ticket_idx} not found")
+        await LIBRARY[LibraryPrimitive.FINALIZE_TAXONOMIC_PROFILE_SAMPLE](
+            pool,
+            processing_idx=bound[PROCESSING_IDX_BINDING],
+            profile_counts_path=Path(bound["profile_counts"]),
+            created_by_idx=originator_idx,
+        )
+        return {}
+
     if entry.name == LibraryPrimitive.REGISTER_INDEX:
         # Native step outputs are paths (StepResultResponse.outputs is
         # dict[str, str]), so an index builder can't hand back the build params

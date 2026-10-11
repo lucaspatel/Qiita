@@ -3,13 +3,14 @@
 `fetch_study_lineage` reads, for a study's samples, everything Postgres records
 about how each got where it is — its run and pool, how many reads landed (and
 the pool's ingest ticket when none did), and its state in every per-sample
-completion gate (`mask_sample`, `assembly_sample`, `amplicon_sample`) — in five
-queries. `build_study_lineage` turns those rows into nodes, edges and per-sample
-cells, so a client only lays the graph out.
+completion gate (`mask_sample`, `assembly_sample`, `amplicon_sample`,
+`taxonomic_profile_sample`) — in six queries. `build_study_lineage` turns those
+rows into nodes, edges and per-sample cells, so a client only lays the graph out.
 
 Edges are the provenance the gates already carry: reads feed a read mask; an
 assembly run feeds from the mask its params name (else from reads); an amplicon
-run feeds from reads and produces a feature table. A group's nodes are only the
+run feeds from reads and produces a feature table, as does each taxonomic-profile
+run (one branch per method and database). A group's nodes are only the
 ones some sample of that group reached.
 """
 
@@ -24,6 +25,7 @@ from qiita_common.actions import (
     BCL_CONVERT_ACTION_ID,
     DOWNLOAD_ENA_STUDY_ACTION_ID,
     GOLAY_DEMUX_ACTION_ID,
+    TAXONOMIC_PROFILE_ACTION_ID,
 )
 from qiita_common.models.lineage import (
     LineageCell,
@@ -126,12 +128,24 @@ async def fetch_study_lineage(pool: asyncpg.Pool, study_idx: int) -> dict[str, l
         " WHERE a.prep_sample_idx = ANY($1::bigint[])",
         prep_sample_idxs,
     )
+    # A profile names the database it read, by the profiling_database reference
+    # its run identity carries.
+    profiles = await pool.fetch(
+        "SELECT t.processing_idx, t.prep_sample_idx, t.state, t.genome_count,"
+        "       p.workflow, p.version, r.name AS database_name, r.version AS database_version"
+        "  FROM qiita.taxonomic_profile_sample t JOIN qiita.processing p USING (processing_idx)"
+        "  LEFT JOIN qiita.reference r"
+        "    ON r.reference_idx = (p.params->>'sylph_reference_idx')::bigint"
+        " WHERE t.prep_sample_idx = ANY($1::bigint[])",
+        prep_sample_idxs,
+    )
     return {
         "samples": list(samples),
         "ingest": list(ingest),
         "masks": list(masks),
         "assemblies": list(assemblies),
         "amplicons": list(amplicons),
+        "profiles": list(profiles),
     }
 
 
@@ -157,6 +171,13 @@ def build_study_lineage(study_idx: int, rows: dict[str, list[Any]]) -> StudyLine
         def edge(source: str, target: str) -> None:
             if not any(e.source == source and e.target == target for e in edges):
                 edges.append(LineageEdge(source=source, target=target))
+
+        def _product(processing_idx: int, source: str) -> None:
+            # A run's feature table exists once one of its samples completed: before
+            # that there is nothing to read, so no node to click into.
+            table_id = f"feature_table:{processing_idx}"
+            node(table_id, kind="product", label="Feature table", processing_idx=processing_idx)
+            edge(source, table_id)
 
         node(RUN_NODE, kind="run", label="Run")
         ingest_actions = sorted(
@@ -228,18 +249,40 @@ def build_study_lineage(study_idx: int, rows: dict[str, list[Any]]) -> StudyLine
                 processing_idx=r["processing_idx"],
                 value_label="ASVs",
             )
-            node(
-                table_id,
-                kind="product",
-                label="Feature table",
-                processing_idx=r["processing_idx"],
-            )
             edge(READS_NODE, node_id)
-            edge(node_id, table_id)
             c = cells[r["prep_sample_idx"]]
             c[node_id] = LineageCell(state=r["state"], value=r["asv_count"])
             if r["state"] == "completed":
+                _product(r["processing_idx"], node_id)
                 c[table_id] = LineageCell(state="completed", value=r["asv_count"])
+
+        # One branch per profiling run: method, version and database are its
+        # identity, so the same sample profiled two ways is two branches.
+        for r in rows["profiles"]:
+            if r["prep_sample_idx"] not in idxs:
+                continue
+            node_id = f"processing:{r['processing_idx']}"
+            table_id = f"feature_table:{r['processing_idx']}"
+            database = (
+                f" · {r['database_name']} {r['database_version']}"
+                if r["database_name"] is not None
+                else ""
+            )
+            node(
+                node_id,
+                kind="processing",
+                label="Taxonomic profile",
+                detail=f"{r['workflow']} {r['version']}{database}",
+                action_id=TAXONOMIC_PROFILE_ACTION_ID,
+                processing_idx=r["processing_idx"],
+                value_label="Genomes",
+            )
+            edge(READS_NODE, node_id)
+            c = cells[r["prep_sample_idx"]]
+            c[node_id] = LineageCell(state=r["state"], value=r["genome_count"])
+            if r["state"] == "completed":
+                _product(r["processing_idx"], node_id)
+                c[table_id] = LineageCell(state="completed", value=r["genome_count"])
 
         # A stage counts every sample of the group (one it never reached is
         # 'not_started'); a product counts only the samples it contains.

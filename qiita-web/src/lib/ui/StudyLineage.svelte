@@ -204,6 +204,8 @@
       const y = Number(r[`v:${b.id}`]);
       return x > 0 && y > 0 ? [{ label: String(r.sample), x, y }] : [];
     });
+    // Nothing to plot until some sample has both values (a run still pending).
+    if (points.length === 0) return null;
     return {
       points,
       xLabel: a.value_label!,
@@ -235,7 +237,7 @@
       // Restore the last depth, if a sample still has exactly that depth, before
       // anything is shown, so the plot draws once at the depth it will stay at.
       const saved = loadPlotPrefs(studyIdx, protocol).pcoaDepth;
-      if (saved != null) {
+      if (saved != null && table.data.valueKind === 'count') {
         try {
           if (!pcoa.depths.includes(saved)) throw new Error('no sample has that depth any more');
           pcoa = await pyworker.pcoa(table.data, saved);

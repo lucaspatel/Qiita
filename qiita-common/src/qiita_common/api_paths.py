@@ -259,6 +259,12 @@ class LibraryPrimitive(StrEnum):
     # pool. The runner materializes the 'pending' rows for any workflow that
     # declares it. See qiita_control_plane.actions.library.finalize_amplicon_sample.
     FINALIZE_AMPLICON_SAMPLE = "finalize-amplicon-sample"
+    # Taxonomic profile: close the run's qiita.taxonomic_profile_sample gate —
+    # 'completed' with a genome count for each sample the profiler reported on,
+    # 'no_data' for the rest — and mint those samples' public QM identifiers, as
+    # the ticket's originator. Runs after register-files. See
+    # qiita_control_plane.actions.library.finalize_taxonomic_profile_sample.
+    FINALIZE_TAXONOMIC_PROFILE_SAMPLE = "finalize-taxonomic-profile-sample"
 
 
 # =============================================================================
@@ -636,25 +642,26 @@ URL_ASSEMBLY_PREP_SAMPLE = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_PREP_SAMPLE}"
 
 
 # =============================================================================
-# /amplicon/* — an amplicon feature table, as a query over a cohort
+# /feature-table/* — a run feature table, as a query over a cohort
 # =============================================================================
-# One request body (runs + a study or a sample list) answered as the samples
-# (JSON), the counts as sparse COO rows and the features' sequences (both Arrow
-# IPC streams), or as signed Flight tickets for a client that reads the data plane.
+# One request body (processing runs + a study or a sample list) answered as the
+# samples (JSON), the values as sparse COO rows and the features (both Arrow IPC
+# streams), or as signed Flight tickets for a client that reads the data plane. A
+# run is an amplicon run (ASV counts) or a taxonomic profile (relative abundances).
 
-PATH_AMPLICON_PREFIX = "/amplicon"
-PATH_AMPLICON_FEATURE_TABLE_SAMPLES = "/feature-table/samples"
-PATH_AMPLICON_FEATURE_TABLE_COUNTS = "/feature-table/counts"
-PATH_AMPLICON_FEATURE_TABLE_FEATURES = "/feature-table/features"
+PATH_FEATURE_TABLE_PREFIX = "/feature-table"
+PATH_FEATURE_TABLE_SAMPLES = "/samples"
+PATH_FEATURE_TABLE_VALUES = "/values"
+PATH_FEATURE_TABLE_FEATURES = "/features"
 # The same cohort as signed Flight tickets, for a client that reads the data plane
-# itself (`qiita amplicon feature-table`).
-PATH_AMPLICON_FEATURE_TABLE_TICKET = "/feature-table/ticket"
+# itself (`qiita feature-table runs`).
+PATH_FEATURE_TABLE_TICKET = "/ticket"
 
-URL_AMPLICON_PREFIX = f"{API_PREFIX}{PATH_AMPLICON_PREFIX}"
-URL_AMPLICON_FEATURE_TABLE_SAMPLES = f"{URL_AMPLICON_PREFIX}{PATH_AMPLICON_FEATURE_TABLE_SAMPLES}"
-URL_AMPLICON_FEATURE_TABLE_COUNTS = f"{URL_AMPLICON_PREFIX}{PATH_AMPLICON_FEATURE_TABLE_COUNTS}"
-URL_AMPLICON_FEATURE_TABLE_FEATURES = f"{URL_AMPLICON_PREFIX}{PATH_AMPLICON_FEATURE_TABLE_FEATURES}"
-URL_AMPLICON_FEATURE_TABLE_TICKET = f"{URL_AMPLICON_PREFIX}{PATH_AMPLICON_FEATURE_TABLE_TICKET}"
+URL_FEATURE_TABLE_PREFIX = f"{API_PREFIX}{PATH_FEATURE_TABLE_PREFIX}"
+URL_FEATURE_TABLE_SAMPLES = f"{URL_FEATURE_TABLE_PREFIX}{PATH_FEATURE_TABLE_SAMPLES}"
+URL_FEATURE_TABLE_VALUES = f"{URL_FEATURE_TABLE_PREFIX}{PATH_FEATURE_TABLE_VALUES}"
+URL_FEATURE_TABLE_FEATURES = f"{URL_FEATURE_TABLE_PREFIX}{PATH_FEATURE_TABLE_FEATURES}"
+URL_FEATURE_TABLE_TICKET = f"{URL_FEATURE_TABLE_PREFIX}{PATH_FEATURE_TABLE_TICKET}"
 
 
 # =============================================================================

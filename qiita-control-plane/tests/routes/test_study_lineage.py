@@ -149,6 +149,65 @@ async def test_lineage_reads_follow_an_ena_download_in_progress(
     assert reads["counts"] == {"completed": 1, "processing": 2}
 
 
+@pytest.fixture
+async def profile_run(role_keyed_clients, amplicon_study):
+    """A taxonomic-profile run over the study's first two samples, against a
+    registered profiling database."""
+    db = role_keyed_clients["pool"]
+    ref = await db.fetchval(
+        "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
+        " VALUES ($1, 'rc4-ani95', 'profiling_database', 'active', 1) RETURNING reference_idx",
+        f"wol3-{secrets.token_hex(4)}",
+    )
+    async with db.acquire() as conn:
+        run = await mint_processing(
+            conn,
+            workflow="taxonomic-profile",
+            version="1.0.0",
+            params={
+                "workflow": "taxonomic-profile",
+                "version": "1.0.0",
+                "sylph_reference_idx": ref,
+                "probe": str(uuid.uuid4()),
+            },
+        )
+    p = run["processing_idx"]
+    ps_a, ps_b, _ = amplicon_study["ps"]
+    await db.execute(
+        "INSERT INTO qiita.taxonomic_profile_sample"
+        " (processing_idx, prep_sample_idx, state, genome_count)"
+        " VALUES ($1, $2, 'completed', 40), ($1, $3, 'no_data', NULL)",
+        p,
+        ps_a,
+        ps_b,
+    )
+    yield {"processing_idx": p, "reference_idx": ref}
+    await db.execute("DELETE FROM qiita.taxonomic_profile_sample WHERE processing_idx = $1", p)
+    await db.execute("DELETE FROM qiita.processing WHERE processing_idx = $1", p)
+    await db.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", ref)
+
+
+async def test_lineage_branches_a_taxonomic_profile_to_its_feature_table(
+    role_keyed_clients, amplicon_study, profile_run
+):
+    resp = await role_keyed_clients["wet"].get(
+        URL_STUDY_LINEAGE.format(study_idx=amplicon_study["study_idx"])
+    )
+    assert resp.status_code == 200, resp.text
+    (group,) = resp.json()["groups"]
+    nodes = {n["id"]: n for n in group["nodes"]}
+    p = profile_run["processing_idx"]
+    profile = nodes[f"processing:{p}"]
+    assert profile["label"] == "Taxonomic profile"
+    assert profile["detail"].startswith("taxonomic-profile 1.0.0 · wol3-")
+    assert profile["detail"].endswith(" rc4-ani95")
+    assert profile["counts"] == {"completed": 1, "no_data": 1, "not_started": 1}
+    assert nodes[f"feature_table:{p}"]["counts"] == {"completed": 1}
+    edges = {(e["source"], e["target"]) for e in group["edges"]}
+    assert ("reads", f"processing:{p}") in edges
+    assert (f"processing:{p}", f"feature_table:{p}") in edges
+
+
 async def test_lineage_needs_study_access(role_keyed_clients, amplicon_study):
     resp = await role_keyed_clients["user"].get(
         URL_STUDY_LINEAGE.format(study_idx=amplicon_study["study_idx"])

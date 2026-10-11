@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from qiita_common.models import (
     INDEX_TYPE_BOWTIE2,
     INDEX_TYPE_MINIMAP2,
     INDEX_TYPE_RYPE_ROUTER,
+    INDEX_TYPE_SYLPH,
     ReferenceStatus,
 )
 
@@ -672,6 +674,55 @@ async def _resolve_qc_adapters(
 # SortMeRNA reference resolution (amplicon denoise)
 # =============================================================================
 #
+# taxonomic-profile's step reads a sylph database a `profiling_database` reference
+# names. The file stays where the operator staged it; the runner binds its path,
+# and its sha256 for the run identity.
+
+SYLPH_DATABASE_BINDING = "sylph_database"
+SYLPH_DATABASE_SHA256_BINDING = "sylph_database_sha256"
+# action_context key: the profiling_database reference to profile against.
+SYLPH_REFERENCE_IDX_KEY = "sylph_reference_idx"
+
+
+async def _resolve_sylph_database(
+    pool: asyncpg.Pool | asyncpg.Connection, *, action_context: dict[str, Any]
+) -> dict[str, Any]:
+    """Bind the sylph database file of the action context's `sylph_reference_idx`,
+    and its sha256. The reference must be an ACTIVE `profiling_database` with a
+    `sylph` index row; anything else is a SUBMISSION BAD_INPUT, as is a file that
+    is no longer where it was registered."""
+    reference_idx = _coerce_reference_idx(
+        action_context.get(SYLPH_REFERENCE_IDX_KEY), SYLPH_REFERENCE_IDX_KEY
+    )
+    kind = await pool.fetchval(
+        "SELECT kind FROM qiita.reference WHERE reference_idx = $1", reference_idx
+    )
+    if kind is None:
+        raise _submission_bad_input(f"{SYLPH_REFERENCE_IDX_KEY} {reference_idx} does not exist")
+    if kind != "profiling_database":
+        raise _submission_bad_input(
+            f"{SYLPH_REFERENCE_IDX_KEY} {reference_idx} is a {kind!r}, not a 'profiling_database'"
+        )
+    fs_path = await _resolve_required_host_index(
+        pool, reference_idx, INDEX_TYPE_SYLPH, SYLPH_REFERENCE_IDX_KEY
+    )
+    params = await pool.fetchval(
+        "SELECT params FROM qiita.reference_index"
+        " WHERE reference_idx = $1 AND index_type = $2 AND fs_path = $3"
+        " ORDER BY created_at DESC, reference_index_idx DESC LIMIT 1",
+        reference_idx,
+        INDEX_TYPE_SYLPH,
+        str(fs_path),
+    )
+    if isinstance(params, str):
+        params = json.loads(params)
+    if not Path(fs_path).is_file():
+        raise _submission_bad_input(
+            f"{SYLPH_REFERENCE_IDX_KEY} {reference_idx}: {fs_path} is no longer a file"
+        )
+    return {SYLPH_DATABASE_BINDING: Path(fs_path), SYLPH_DATABASE_SHA256_BINDING: params["sha256"]}
+
+
 # amplicon's denoise step 16S-filters with SortMeRNA, which needs a FASTA. the
 # workflow names a loaded `sequence_reference` by reference_idx; the runner
 # materializes its sequences to a FASTA and binds `sortmerna_ref`.

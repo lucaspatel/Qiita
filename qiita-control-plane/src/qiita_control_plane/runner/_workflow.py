@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
@@ -31,6 +32,7 @@ from qiita_common.models import (
 from .. import step_progress
 from ..fanout_dispatch import DEFAULT_FANOUT_MAX_INFLIGHT
 from ..repositories.mask_definition import fetch_mask_definition_by_idx
+from ..repositories.taxonomic_profile import list_pool_metagenomic_prep_sample_idxs
 from ..workspace import step_attempt_dir, ticket_workspace
 from ._alignment import (
     ALIGN_MASK_IDX_BINDING,
@@ -93,13 +95,17 @@ from ._mask import (
 )
 from ._processing import (
     ASSEMBLER_BINDING,
+    PROFILE_SAMPLES_BINDING,
     _create_amplicon_gate_pending,
     _create_assembly_gate_pending,
+    _create_taxonomic_profile_gate_pending,
     _mint_processing_idx,
     _record_assembly_gate_no_data,
+    _record_taxonomic_profile_gate_no_data,
     _workflow_needs_processing,
     _workflow_writes_amplicon_gate,
     _workflow_writes_assembly_gate,
+    _workflow_writes_taxonomic_profile_gate,
 )
 from ._read_ingest import (
     BARCODE_MAP_BINDING,
@@ -126,10 +132,12 @@ from ._reconstruct import (
 from ._reference import (
     QC_ADAPTER_BINDING,
     SORTMERNA_REF_BINDING,
+    SYLPH_DATABASE_BINDING,
     _resolve_host_filter_indexes,
     _resolve_qc_adapters,
     _resolve_sharded_align_index_bindings,
     _resolve_sortmerna_ref,
+    _resolve_sylph_database,
     _resolve_syndna_index,
     _workflow_needs_adapters,
     _workflow_needs_sharded_align_indexes,
@@ -393,6 +401,31 @@ async def run_workflow(
                     workspace=workspace,
                 )
             )
+
+        # taxonomic-profile: bind the sylph database file (and its sha256, for the
+        # identity mint below), and the pool's metagenomic samples the run covers.
+        # A pool with none is refused here, before a processing_idx is minted.
+        if _workflow_declares_input(action.steps, SYLPH_DATABASE_BINDING):
+            bound.update(await _resolve_sylph_database(pool, action_context=bound))
+        profile_samples: list[int] | None = None
+        if _workflow_writes_taxonomic_profile_gate(action.steps):
+            if scope_target["kind"] != ScopeTargetKind.SEQUENCED_POOL.value:
+                raise _submission_bad_input(
+                    "a workflow that gates taxonomic profiling (declares "
+                    f"{LibraryPrimitive.FINALIZE_TAXONOMIC_PROFILE_SAMPLE}) must be "
+                    f"sequenced_pool-scoped; got {scope_target['kind']!r}"
+                )
+            profile_samples = await list_pool_metagenomic_prep_sample_idxs(
+                pool, scope_target["sequenced_pool_idx"]
+            )
+            if not profile_samples:
+                raise _submission_bad_input(
+                    f"sequenced_pool {scope_target['sequenced_pool_idx']} has no live"
+                    " metagenomic sample to profile"
+                )
+            samples_path = workspace / f"{PROFILE_SAMPLES_BINDING}.json"
+            samples_path.write_text(json.dumps(profile_samples))
+            bound[PROFILE_SAMPLES_BINDING] = str(samples_path)
 
         # ENA run-roster binding (download-ena-study workflow's
         # `ingest_ena_reads` step): see _stage_ena_run_roster_binding for the
@@ -666,6 +699,20 @@ async def run_workflow(
                 pool,
                 processing_idx=minted_processing_idx,
                 sequenced_pool_idx=scope_target["sequenced_pool_idx"],
+            )
+
+        # Taxonomic-profile completion gate: the samples bound above, 'pending'
+        # under the identity just minted.
+        if profile_samples is not None:
+            if minted_processing_idx is None:
+                raise _submission_bad_input(
+                    "a workflow that gates taxonomic profiling (declares "
+                    f"{LibraryPrimitive.FINALIZE_TAXONOMIC_PROFILE_SAMPLE}) must thread "
+                    f"{PROCESSING_IDX_BINDING} through a step's params so the run "
+                    "identity the gate rows are keyed on is minted"
+                )
+            await _create_taxonomic_profile_gate_pending(
+                pool, processing_idx=minted_processing_idx, prep_sample_idxs=profile_samples
             )
 
         # De novo alignment identity + completion gate: a workflow declaring the
@@ -949,6 +996,12 @@ async def run_workflow(
                 processing_idx=minted_processing_idx,
                 prep_sample_idx=scope_target["prep_sample_idx"],
             )
+        if (
+            action is not None
+            and _workflow_writes_taxonomic_profile_gate(action.steps)
+            and minted_processing_idx is not None
+        ):
+            await _record_taxonomic_profile_gate_no_data(pool, processing_idx=minted_processing_idx)
         await _transition_to_no_data(pool, work_ticket_idx)
         return
     except BackendFailure as exc:

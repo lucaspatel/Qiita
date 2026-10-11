@@ -6401,12 +6401,31 @@ fn amplicon_surfaces_are_doget_allowed() {
         "amplicon_membership",
         "amplicon_sequence",
         "amplicon_sequence_chunks",
+        "taxonomic_profile",
     ] {
         assert!(
             ALLOWED_TABLES.contains(&readable),
             "{readable:?} must be DoGet-readable"
         );
     }
+}
+
+#[test]
+fn build_query_taxonomic_profile_scopes_the_run_on_its_own_columns() {
+    let (sql, full) = build_query(
+        "taxonomic_profile",
+        &bin_quality_scope(&[42, 43], 7),
+        &[],
+        &[],
+    )
+    .unwrap();
+    assert_eq!(full, "qiita_lake.taxonomic_profile");
+    assert_eq!(
+        sql,
+        "SELECT * FROM qiita_lake.taxonomic_profile \
+         WHERE processing_idx IN (7) AND prep_sample_idx IN (42, 43)",
+        "got: {sql}"
+    );
 }
 
 #[test]
@@ -6512,6 +6531,7 @@ fn build_query_amplicon_requires_exactly_the_run_key() {
         "amplicon_membership",
         "amplicon_sequence",
         "amplicon_sequence_chunks",
+        "taxonomic_profile",
     ] {
         for (label, filter) in cases {
             assert!(

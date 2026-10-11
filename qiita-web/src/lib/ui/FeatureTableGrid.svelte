@@ -60,9 +60,20 @@
   const first = $derived(Math.max(0, Math.floor(scrollLeft / COL_W) - 2));
   const last = $derived(Math.min(nCols, Math.ceil((scrollLeft + viewW - ID_W) / COL_W) + 2));
   const cols = $derived(Array.from({ length: Math.max(0, last - first) }, (_, k) => view.order[first + k]));
-  // A column is headed by its ASV: the first bases, the whole sequence (and its
-  // md5 feature id) on hover, and a click copies the sequence.
+  // A column is headed by its ASV — the first bases, the whole sequence (and its
+  // md5 feature id) on hover, and a click copies the sequence — or, for a profile,
+  // by the genome's name, which a click copies.
+  const isAbundance = $derived(table.valueKind === 'relative_abundance');
   const sequence = (f: number) => table.sequenceOf.get(table.features[f]) ?? table.features[f];
+  const headerTitle = (f: number) =>
+    table.sequenceOf.has(table.features[f])
+      ? `${sequence(f)}\nmd5 ${table.features[f]}\nClick to copy the sequence`
+      : `${table.features[f]}\nClick to copy the genome name`;
+  // An abundance is a fraction of the sample, shown as a percentage.
+  const cell = (v: number) =>
+    isAbundance
+      ? `${(100 * v).toLocaleString(undefined, { maximumFractionDigits: v < 0.001 ? 4 : 2 })}%`
+      : v.toLocaleString();
   const short = (seq: string) => (seq.length > 10 ? `${seq.slice(0, 10)}…` : seq);
   let copied = $state<number | null>(null);
   let copiedTimer: ReturnType<typeof setTimeout> | undefined;
@@ -82,7 +93,9 @@
   <div class="flex items-center justify-between gap-3 px-4 py-3 sm:px-6">
     <span class="text-xs text-gray-400">
       {filtered.length} sample{filtered.length === 1 ? '' : 's'} × {nCols.toLocaleString()} features ·
-      {table.s.length.toLocaleString()} observations · counts as delivered (not rarefied)
+      {table.s.length.toLocaleString()} observations · {isAbundance
+        ? 'relative abundance, as the profiler reported it'
+        : 'counts as delivered (not rarefied)'}
     </span>
     <input
       placeholder="Filter..."
@@ -110,7 +123,7 @@
                 class="w-full cursor-copy px-2 py-2 text-left font-mono text-[11px] font-normal whitespace-nowrap {copied === f
                   ? 'text-teal-700'
                   : 'text-gray-500 hover:text-gray-800'}"
-                title="{sequence(f)}&#10;md5 {table.features[f]}&#10;Click to copy the sequence"
+                title={headerTitle(f)}
                 onclick={() => copy(f)}>{copied === f ? 'Copied' : short(sequence(f))}</button
               >
             </th>
@@ -128,7 +141,7 @@
             {#each cols as f (f)}
               {@const v = view.bySample[r.s].get(f)}
               <td class="px-2 py-1.5 text-right tabular-nums {v ? 'text-gray-700' : 'text-gray-300'}">
-                {v ? v.toLocaleString() : '-'}
+                {v ? cell(v) : '-'}
               </td>
             {/each}
             {#if last < nCols}<td></td>{/if}

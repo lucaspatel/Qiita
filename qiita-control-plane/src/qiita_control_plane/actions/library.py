@@ -96,6 +96,7 @@ from ..repositories.syndna_read_count import (
     fetch_syndna_inserts,
     replace_syndna_read_counts,
 )
+from ..repositories.taxonomic_profile import close_taxonomic_profile_samples
 from ..shard_planner import _SHARD_COUNT, LineageItem, tile_by_lineage
 from .reference import IllegalStatusTransition, transition_reference_status
 
@@ -3293,6 +3294,42 @@ async def finalize_amplicon_sample(
         return await close_amplicon_samples(conn, processing_idx=processing_idx, asv_counts=counts)
 
 
+async def finalize_taxonomic_profile_sample(
+    pool: asyncpg.Pool,
+    *,
+    processing_idx: int,
+    profile_counts_path: Path,
+    created_by_idx: int,
+) -> tuple[int, int]:
+    """Close a taxonomic-profile run's gate from the job's `profile_counts`
+    (prep_sample_idx, genome_count — one row per sample it reported genomes for),
+    and mint those samples' QM identifiers, in one transaction. Returns
+    (completed, no_data).
+
+    One action rather than amplicon's two: both write from the same sample set and
+    must agree. Runs after register-files, so neither names a sample whose profile
+    did not land."""
+    with duckdb.connect() as duck:
+        counts = dict(
+            duck.execute(
+                "SELECT prep_sample_idx, genome_count::INTEGER FROM read_parquet(?)"
+                " ORDER BY prep_sample_idx",
+                [str(profile_counts_path)],
+            ).fetchall()
+        )
+    async with pool.acquire() as conn, conn.transaction():
+        if counts:
+            await mint_processing_exported_identifiers(
+                conn,
+                processing_idx=processing_idx,
+                prep_sample_idxs=list(counts),
+                created_by_idx=created_by_idx,
+            )
+        return await close_taxonomic_profile_samples(
+            conn, processing_idx=processing_idx, genome_counts=counts
+        )
+
+
 LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.MINT_FEATURES: mint_features,
     LibraryPrimitive.MINT_ANNOTATION_FEATURES: mint_annotation_features,
@@ -3316,4 +3353,5 @@ LIBRARY: dict[str, Callable[..., Awaitable[Any]]] = {
     LibraryPrimitive.SYNC_REFERENCE_EXCLUSION: sync_reference_exclusion,
     LibraryPrimitive.MINT_AMPLICON_IDENTIFIERS: mint_amplicon_identifiers,
     LibraryPrimitive.FINALIZE_AMPLICON_SAMPLE: finalize_amplicon_sample,
+    LibraryPrimitive.FINALIZE_TAXONOMIC_PROFILE_SAMPLE: finalize_taxonomic_profile_sample,
 }

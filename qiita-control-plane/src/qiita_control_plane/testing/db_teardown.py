@@ -69,6 +69,7 @@ SWEEP_TIERS = (
         ("study_access", (("study_idx", STUDY),)),
         ("study_tag_to_study", (("study_idx", STUDY),)),
         ("syndna_read_count", (("prep_sample_idx", PREP_SAMPLE),)),
+        ("taxonomic_profile_sample", (("prep_sample_idx", PREP_SAMPLE),)),
     ),
     (
         ("biosample_study_field", (("study_idx", STUDY),)),

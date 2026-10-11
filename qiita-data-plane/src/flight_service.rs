@@ -366,6 +366,12 @@ const ALLOWED_TABLES: &[&str] = &[
     "amplicon_membership",
     "amplicon_sequence",
     "amplicon_sequence_chunks",
+    // Taxonomic-profile runs over a cohort, for the profile feature table: per
+    // (sample, genome) relative abundances, ANI and coverage a profiler reported.
+    // No sequence and no read. Scoped exactly as `amplicon_membership` is, which it
+    // mirrors: a bounded set of runs over a non-empty prep_sample set
+    // (`build_amplicon_run_query`).
+    "taxonomic_profile",
 ];
 
 /// Allowed column names for filter clauses. All identifier columns that can
@@ -2158,6 +2164,10 @@ const REPLACE_KEY_TABLES: &[ReplaceKey] = &[
     // feature_idx, replaced (not appended) so a re-load of the same ASV converges.
     ReplaceKey::own("amplicon_sequence", &["feature_idx"]),
     ReplaceKey::own("amplicon_sequence_chunks", &["feature_idx"]),
+    // taxonomic-profile's rows: amplicon_membership's key and argument. The job
+    // derives the run's rows from its own workspace, and a re-run resolves to the
+    // same processing_idx, so a --force resubmit replaces rather than duplicates.
+    ReplaceKey::own("taxonomic_profile", &["prep_sample_idx", "processing_idx"]),
 ];
 
 /// One `REPLACE_KEY_TABLES` entry.
@@ -3675,11 +3685,15 @@ fn is_bin_quality_surface(table: &str) -> bool {
 /// a handful of times, not hundreds; the bound keeps a ticket's SQL bounded.
 const MAX_AMPLICON_RUNS: usize = 32;
 
-/// The DoGet surfaces whose scope is a set of amplicon RUNS over a cohort.
+/// The DoGet surfaces whose scope is a set of processing RUNS over a cohort: an
+/// amplicon run's ASVs, and a taxonomic-profile run's rows.
 fn is_amplicon_run_surface(table: &str) -> bool {
     matches!(
         table,
-        "amplicon_membership" | "amplicon_sequence" | "amplicon_sequence_chunks"
+        "amplicon_membership"
+            | "amplicon_sequence"
+            | "amplicon_sequence_chunks"
+            | "taxonomic_profile"
     )
 }
 
@@ -4021,7 +4035,9 @@ fn build_amplicon_run_query(
         join(&runs),
         join(&prep_sample_idx)
     );
-    let sql = if table == "amplicon_membership" {
+    // The two tables carrying both scope columns are read directly; the ASV
+    // sequence tables resolve the scope through membership.
+    let sql = if table == "amplicon_membership" || table == "taxonomic_profile" {
         format!("SELECT * FROM {full_table} WHERE {run_scope}")
     } else {
         format!(

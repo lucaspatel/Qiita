@@ -208,6 +208,9 @@ ALIGN_DENOVO_ACTION_ID = "align-denovo"
 # The amplicon denoise action's bare id (workflows/amplicon/<version>.yaml), and so
 # the `qiita.processing.workflow` of every amplicon run.
 AMPLICON_ACTION_ID = "amplicon"
+# The taxonomic profiler's bare id (workflows/taxonomic-profile/<version>.yaml):
+# sylph over a pool's raw shotgun reads against a registered profiling database.
+TAXONOMIC_PROFILE_ACTION_ID = "taxonomic-profile"
 
 
 class Audience(BaseModel):

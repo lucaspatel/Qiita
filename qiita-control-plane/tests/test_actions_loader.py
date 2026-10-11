@@ -1668,3 +1668,32 @@ def test_load_actions_loads_amplicon_1_1_0_with_the_identifier_and_gate_tail():
         "finalize-amplicon-sample",
     ]
     assert new.steps[-2].inputs == new.steps[-1].inputs == ["asv_counts"]
+
+
+def test_load_actions_loads_taxonomic_profile_1_0_0():
+    """taxonomic-profile profiles a pool's metagenomic samples with sylph in one
+    native step, registers its staged table, then closes its gate from the step's
+    profile_counts. The database and the sample list are runner-resolved inputs;
+    processing_idx rides params so the runner mints the run identity."""
+    from pathlib import Path
+
+    from qiita_common.actions import action_threads_processing_idx
+
+    from qiita_control_plane.actions import load_actions
+
+    actions = load_actions(Path(__file__).resolve().parents[2] / "workflows")
+    (action,) = [a for a in actions if a.action_id == "taxonomic-profile"]
+    assert action.version == "1.0.0"
+    assert action.target_kind == "sequenced_pool"
+    assert [s.name for s in action.steps] == [
+        "profile",
+        "register-files",
+        "finalize-taxonomic-profile-sample",
+    ]
+    profile = action.steps[0]
+    assert profile.inputs == ["sylph_database", "profile_samples"]
+    assert profile.outputs == ["staging_dir", "profile_counts"]
+    assert action.steps[-1].inputs == ["profile_counts"]
+    assert action_threads_processing_idx(action.steps)
+    assert action.context_schema["required"] == ["sylph_reference_idx"]
+    assert action.context_schema["additionalProperties"] is False

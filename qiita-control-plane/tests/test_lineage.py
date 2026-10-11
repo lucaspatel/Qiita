@@ -20,7 +20,15 @@ def _sample(idx, protocol, *, pool=7, run=3, label=None, read_count=100, item="1
 
 
 def _rows(**kw):
-    return {"samples": [], "ingest": [], "masks": [], "assemblies": [], "amplicons": [], **kw}
+    return {
+        "samples": [],
+        "ingest": [],
+        "masks": [],
+        "assemblies": [],
+        "amplicons": [],
+        "profiles": [],
+        **kw,
+    }
 
 
 def _amplicon(idx, state, asv_count=None, processing_idx=11):
@@ -121,6 +129,60 @@ def test_an_ena_download_ticket_names_the_reads_and_gives_their_state():
     reads = next(n for n in group.nodes if n.id == "reads")
     assert reads.detail == "download-ena-study"
     assert reads.counts == {"processing": 2}
+
+
+def _profile(idx, state, genome_count=None, processing_idx=21, database=("wol3", "rc4-ani95")):
+    return {
+        "processing_idx": processing_idx,
+        "prep_sample_idx": idx,
+        "state": state,
+        "genome_count": genome_count,
+        "workflow": "taxonomic-profile",
+        "version": "1.0.0",
+        "database_name": database[0],
+        "database_version": database[1],
+    }
+
+
+def test_each_profiling_run_is_its_own_branch_to_a_feature_table():
+    rows = _rows(
+        samples=[_sample(1, "short_read_metagenomics"), _sample(2, "short_read_metagenomics")],
+        profiles=[
+            _profile(1, "completed", 40),
+            _profile(2, "no_data"),
+            _profile(1, "completed", 12, processing_idx=22, database=("wol3", "rc4-ani99")),
+        ],
+    )
+    (group,) = build_study_lineage(9, rows).groups
+    nodes = {n.id: n for n in group.nodes}
+    assert nodes["processing:21"].label == "Taxonomic profile"
+    assert nodes["processing:21"].detail == "taxonomic-profile 1.0.0 · wol3 rc4-ani95"
+    assert nodes["processing:22"].detail == "taxonomic-profile 1.0.0 · wol3 rc4-ani99"
+    assert nodes["processing:21"].counts == {"completed": 1, "no_data": 1}
+    assert nodes["processing:22"].counts == {"completed": 1, "not_started": 1}
+    assert nodes["feature_table:21"].counts == {"completed": 1}
+    edges = {(e.source, e.target) for e in group.edges}
+    assert {
+        ("reads", "processing:21"),
+        ("processing:21", "feature_table:21"),
+        ("reads", "processing:22"),
+        ("processing:22", "feature_table:22"),
+    } <= edges
+    cells = {smp.prep_sample_idx: smp.cells for smp in group.samples}
+    assert cells[1]["processing:22"].value == 12
+
+
+def test_a_run_with_nothing_completed_has_no_feature_table_yet():
+    rows = _rows(
+        samples=[_sample(1, "short_read_amplicon"), _sample(2, "short_read_amplicon")],
+        amplicons=[_amplicon(1, "pending"), _amplicon(2, "pending")],
+        profiles=[_profile(1, "pending")],
+    )
+    (group,) = build_study_lineage(9, rows).groups
+    ids = {n.id for n in group.nodes}
+    assert {"processing:11", "processing:21"} <= ids
+    assert not any(i.startswith("feature_table:") for i in ids)
+    assert not any(e.target.startswith("feature_table:") for e in group.edges)
 
 
 def test_a_sample_with_no_accession_and_no_qb_is_refused():

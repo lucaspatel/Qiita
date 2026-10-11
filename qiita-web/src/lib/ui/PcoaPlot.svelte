@@ -66,7 +66,10 @@
 
 <div class="px-4 pb-4 sm:px-6">
   <p class="mb-2 text-xs font-medium text-gray-500">PCoA · Bray–Curtis</p>
-  <DepthSlider depths={pcoa.depths} value={pcoa.depth} allowOff disabled={busy} onCommit={onDepth} />
+  <!-- Relative abundances (a profile) have no depth to rarefy to. -->
+  {#if pcoa.depths.length > 0}
+    <DepthSlider depths={pcoa.depths} value={pcoa.depth} allowOff disabled={busy} onCommit={onDepth} />
+  {/if}
   <div class="relative mt-2" bind:clientWidth={width}>
     {#if side > 0}
       <div class="relative mx-auto {busy ? 'opacity-40' : ''}" style="width:{side}px">

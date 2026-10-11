@@ -1,0 +1,84 @@
+action_id: taxonomic-profile
+version: 1.0.0
+target_kind: sequenced_pool
+# no target_processing_kinds; the run identity is the profiler knobs, which the
+# runner hashes into a processing_idx before the step loop.
+
+description: >
+  Taxonomic profiling of a sequenced pool's metagenomic samples with sylph, run
+  in-process through duckdb-miint's `sylph_profile`. The `profile` step STREAMS the
+  pool's raw reads from the DuckLake `read` table at runtime (the pool-scoped
+  read_block DoGet amplicon's denoise uses) and profiles the pool's short- and
+  long-read metagenomic samples, which the runner binds as `profile_samples`; an
+  ENA study's amplicon runs share its pool and are left out. The database is a
+  registered `profiling_database` reference (`sylph_reference_idx`), read where an
+  operator staged it; the runner binds its path, and its sha256 into the run
+  identity, so profiling with a different database, file or threshold is a
+  different processing_idx.
+
+  The step writes one DuckLake `taxonomic_profile` row per (sample, genome) sylph
+  reported, with its taxonomic and sequence abundance, ANI and effective coverage;
+  register-files loads it (replace-keyed on prep_sample + processing). The closing
+  action records each sample's genome count in qiita.taxonomic_profile_sample and
+  mints its public QM identifier, the label a feature table carries for it.
+
+  TODO: host-filter the reads (rype) before profiling metagenomic preps; this
+  version profiles raw reads.
+
+scopes: []
+
+audience:
+  # processing over a pool's reads; users and up, no service account.
+  service: false
+  human_roles: [user, wet_lab_admin, system_admin]
+
+context_schema:
+  type: object
+  required: [sylph_reference_idx]
+  # a context naming an undeclared key is refused, not silently ignored.
+  additionalProperties: false
+  properties:
+    # a registered profiling_database reference; part of the run identity, with
+    # its file's sha256.
+    sylph_reference_idx:
+      type: integer
+      minimum: 1
+    # sylph's minimum adjusted ANI, a fraction in [0, 1], to report a genome;
+    # omitted is sylph's default. result-affecting.
+    min_ani:
+      type: number
+      minimum: 0
+      maximum: 1
+
+steps:
+  # profile the pool's metagenomic samples. no reads input — the pool's reads
+  # stream at runtime; the database and the sample list are runner-resolved.
+  # processing_idx rides params and signals the runner to mint it.
+  - step: profile
+    step_type: singleton
+    module: qiita_compute_orchestrator.jobs.taxonomic_profile
+    inputs: [sylph_database, profile_samples]
+    params: {processing_idx: processing_idx, min_ani: min_ani}
+    outputs: [staging_dir, profile_counts]
+    baseline_resources:
+      cpu: 8
+      mem_gb: 32
+      walltime: PT4H
+
+  # load taxonomic_profile (replace-keyed on prep_sample+processing) into the lake.
+  - action: register-files
+    inputs: [staging_dir]
+    outputs: []
+
+  # close the run's per-sample gate (qiita.taxonomic_profile_sample) and mint each
+  # profiled sample's public QM identifier. after register-files: neither names a
+  # sample whose profile did not land.
+  - action: finalize-taxonomic-profile-sample
+    inputs: [profile_counts]
+    outputs: []
+
+action_ceiling:
+  # above the baseline on both axes so a retry can escalate.
+  cpu: 16
+  mem_gb: 128
+  walltime: PT12H
