@@ -3,7 +3,7 @@
 > **Status: OUTLINE.** Headings and the intended shape are here; the step-by-step
 > detail is filled in once the workflow has run end-to-end on a real deploy. The
 > workflow *contracts* live in the YAML `description:` blocks
-> (`workflows/golay-demux/1.0.0.yaml`, `workflows/amplicon/1.0.0.yaml`) — this
+> (`workflows/golay-demux/1.0.0.yaml`, `workflows/amplicon/1.1.0.yaml`) — this
 > runbook is the operator/analyst playbook, not the contract.
 
 **For:** whoever processes an EMP-style 16S run — Golay-barcoded, with no
@@ -45,8 +45,9 @@ see [`getting-started.md`](getting-started.md).
 
 ## Submit amplicon (denoise)
 
-- _(TODO)_ context: `sortmerna_reference_idx`, `trim`, optional `primer` /
-  `orient_primer`. The pool's reads STREAM from the data plane at runtime (the runner
+- _(TODO)_ context (`amplicon` 1.1.0): `sortmerna_reference_idx` and `trim`, nothing
+  else (reads are not oriented on the primer; see the `amplicon_deblur` job). The
+  pool's reads STREAM from the data plane at runtime (the runner
   stages nothing; the stream spills transiently to the job workspace). Writes
   `amplicon_membership` + the ASV sequence tables (reference-agnostic ASV counts).
 

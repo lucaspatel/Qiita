@@ -7,7 +7,8 @@ closed-reference) is derived later.
 
 Refinements over the reference implementation (duckdb-miint's amplicon
 `deblur.sql`), whose per-sample ASV output this job is built to reproduce:
-  * primer orient is optional (`orient_primer`, default off);
+  * reads are not oriented on the primer: in the EMP-style preps this serves the
+    primer is not sequenced, so every read already starts at the amplicon;
   * UCHIME chimera detection runs before the MSA;
   * feature identity is the shared canonical hash.
 
@@ -22,7 +23,7 @@ import os
 import shutil
 from pathlib import Path
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from qiita_common.backend_failure import StepNoData
 from qiita_common.chunking import canonical_sequence_hash_expr, sequence_split_expr
 from qiita_common.parquet import validate_parquet_path
@@ -37,9 +38,6 @@ from ..miint import (
     resolve_duckdb_memory_gb,
 )
 from ..read_source import bind_step_reads
-
-# IUPAC codes a primer may contain; validated before use.
-_IUPAC_DNA = frozenset("ACGTURYSWKMBDHVN")
 
 YAML_STEP_NAME = "denoise"
 
@@ -56,20 +54,32 @@ class Inputs(BaseModel):
     reads: unset in practice; the pool's reads stream from the data plane.
         bind_step_reads binds the shared read projection.
     sortmerna_ref: SortMeRNA 16S FASTA, materialized by the runner from a reference.
-    primer: forward primer (EMP V4 515F); used only when orient_primer.
-    orient_primer: run the primer orient step. Default off.
     trim: truncation length (150 for the GG2 V4 catalog).
+    orient_primer, primer: bound only by workflow 1.0.0, which offered primer
+        orienting and which the action sync disables once 1.1.0 loads, so no
+        ticket should reach this step with them. They are kept so 1.0.0's params
+        still bind to this module; `primer` is unused, and orienting is refused
+        should a ticket ever ask for it.
     """
 
     reads: Path | None = None
     sortmerna_ref: Path
-    # used only when orient_primer; optional so a submit can omit it.
-    primer: str = "GTGYCAGCMGCCGCGGTAA"
     trim: int
     orient_primer: bool = False
+    primer: str | None = None
     sequenced_pool_idx: int
     sequencing_run_idx: int
     work_ticket_idx: int
+
+    @field_validator("orient_primer")
+    @classmethod
+    def _orienting_removed(cls, value: bool) -> bool:
+        if value:
+            raise ValueError(
+                "primer orienting was removed from the amplicon denoise step;"
+                " submit amplicon 1.1.0, which does not offer it"
+            )
+        return value
 
 
 # The relations these blocks feed to miint table functions (derep, alignable,
@@ -129,50 +139,12 @@ SELECT sample_id, read_id, sequence AS sequence1, abundance
 FROM deblur('aligned', sequence_col := 'aligned_sequence', sample_id := 'sample_id');
 """
 
-# orient each read to the primer (only when orient_primer). match on upper(read)
-# so mixed-case input still hits the uppercase primer regex.
-_ORIENT_SQL = """
-CREATE OR REPLACE TABLE _inputs_oriented AS
-SELECT sample_id, sequence_index,
-    CASE
-      WHEN regexp_matches(upper(sequence1), getvariable('rapid_regex_fwd'))
-           AND regexp_matches(upper(sequence1), getvariable('rapid_regex_fwd_rc')) THEN NULL
-      WHEN regexp_matches(upper(sequence1), getvariable('rapid_regex_fwd'))
-        THEN regexp_extract(upper(sequence1), getvariable('rapid_regex_fwd_extract'), 2)
-      WHEN regexp_matches(upper(sequence1), getvariable('rapid_regex_fwd_rc'))
-        THEN regexp_extract(sequence_dna_reverse_complement(upper(sequence1)),
-                            getvariable('rapid_regex_fwd_extract'), 2)
-      ELSE upper(sequence1)
-    END AS sequence1
-FROM _inputs;
-"""
 
-
-def _set_session_vars(conn, *, primer: str, trim: int, sortmerna_ref: Path, orient: bool) -> None:
+def _set_session_vars(conn, *, trim: int, sortmerna_ref: Path) -> None:
     conn.execute(f"SET VARIABLE rapid_trim = {int(trim)};")
     # reject unsafe path characters (applies to the FASTA too).
     safe_ref = validate_parquet_path(sortmerna_ref)
     conn.execute(f"SET VARIABLE miint_sortmerna_ref = '{safe_ref}';")
-    if orient:
-        # validate, don't mangle; a bad primer must fail loud.
-        upper = primer.upper()
-        if not upper or set(upper) - _IUPAC_DNA:
-            raise ValueError(f"primer is not valid IUPAC: {primer!r}")
-        conn.execute(f"SET VARIABLE rapid_fwd_primer = '{upper}';")
-        conn.execute(
-            "SET VARIABLE rapid_regex_fwd = "
-            "sequence_dna_as_regexp(getvariable('rapid_fwd_primer'));"
-        )
-        conn.execute(
-            "SET VARIABLE rapid_regex_fwd_rc = sequence_dna_as_regexp("
-            "sequence_dna_reverse_complement(getvariable('rapid_fwd_primer')));"
-        )
-        # capture the rest of the read after the primer. `.+` (not `[ATGC]+`) so an
-        # ambiguity code or lowercase base does not truncate the captured sequence.
-        conn.execute(
-            "SET VARIABLE rapid_regex_fwd_extract = "
-            "'(' || getvariable('rapid_regex_fwd') || ')(.+)';"
-        )
 
 
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
@@ -197,13 +169,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         open_miint_conn() as conn,
     ):
         apply_duckdb_settings(conn, duckdb_tmp, memory_gb=memory_gb, threads=_DUCKDB_THREADS)
-        _set_session_vars(
-            conn,
-            primer=inputs.primer,
-            trim=inputs.trim,
-            sortmerna_ref=inputs.sortmerna_ref,
-            orient=inputs.orient_primer,
-        )
+        _set_session_vars(conn, trim=inputs.trim, sortmerna_ref=inputs.sortmerna_ref)
         # stream the pool's reads from the data plane (the runner stages nothing;
         # the stream spills transiently to the job workspace).
         async with bind_step_reads(
@@ -218,13 +184,6 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "SELECT prep_sample_idx AS sample_id, sequence_idx AS sequence_index, sequence1 "
                 f"FROM {reads_rel}"
             )
-            if inputs.orient_primer:
-                conn.execute(_ORIENT_SQL)
-                conn.execute(
-                    "CREATE OR REPLACE VIEW _inputs AS SELECT sample_id, sequence_index, sequence1 "
-                    "FROM _inputs_oriented WHERE sequence1 IS NOT NULL"
-                )
-
             conn.execute(_FILTER_SQL)
             if conn.execute("SELECT count(*) FROM alignable").fetchone()[0] == 0:
                 raise StepNoData(

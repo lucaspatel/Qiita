@@ -691,8 +691,6 @@ export type AmpliconRunRequest = {
   prep_protocol_idx: number;
   sortmerna_reference_idx: number;
   trim: number;
-  primer?: string;
-  orient_primer?: boolean;
 };
 
 /** Body for POST /work-ticket — mirrors WorkTicketCreateRequest. */

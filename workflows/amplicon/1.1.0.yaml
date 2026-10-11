@@ -2,7 +2,8 @@ action_id: amplicon
 version: 1.1.0
 target_kind: sequenced_pool
 # no target_processing_kinds; the run identity is the amplicon knobs, which the
-# runner hashes into a processing_idx before the step loop.
+# runner hashes into a processing_idx before the step loop. Reads are not
+# oriented on the primer (see the amplicon_deblur job).
 
 description: >
   Rapid 16S amplicon denoising for a sequenced pool's already-ingested reads
@@ -39,6 +40,8 @@ audience:
 context_schema:
   type: object
   required: [sortmerna_reference_idx, trim]
+  # a context naming an undeclared key is refused, not silently ignored.
+  additionalProperties: false
   properties:
     # loaded SortMeRNA 16S reference; materialized by the runner. part of the
     # run identity (a different reference is a different result).
@@ -49,15 +52,6 @@ context_schema:
     trim:
       type: integer
       minimum: 6
-    # forward primer; used only when orient_primer (off by default).
-    primer:
-      type: string
-      minLength: 1
-      default: GTGYCAGCMGCCGCGGTAA
-    # run the primer orient step (default off).
-    orient_primer:
-      type: boolean
-      default: false
 
 steps:
   # denoise into ASVs. no reads input — the pool's reads stream at runtime.
@@ -66,7 +60,7 @@ steps:
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.amplicon_deblur
     inputs: [sortmerna_ref]
-    params: {primer: primer, trim: trim, orient_primer: orient_primer}
+    params: {trim: trim}
     outputs: [asv_counts, manifest, asv_chunks]
     baseline_resources:
       cpu: 8

@@ -136,6 +136,16 @@ def test_amplicon_orient_on_hashes_the_primer():
     assert on["orient_primer"] is True and on["primer"] == "GTGYCAGCMGCCGCGGTAA"
 
 
+def test_amplicon_1_1_0_hashes_orienting_off():
+    """1.1.0 binds only trim and the reference; it hashes orient_primer off, the
+    same params an un-oriented 1.0.0 run hashed apart from the version."""
+    bound = {"trim": 150, "sortmerna_reference_idx": 3}
+    new = _build_processing_params("amplicon", "1.1.0", bound)
+    old = _build_processing_params("amplicon", "1.0.0", bound)
+    assert new == {**old, "version": "1.1.0"}
+    assert new["orient_primer"] is False and "primer" not in new
+
+
 def test_amplicon_trim_and_reference_are_part_of_the_identity():
     """Different truncation length OR different SortMeRNA reference -> distinct
     params (distinct processing_idx): both change the denoised result."""

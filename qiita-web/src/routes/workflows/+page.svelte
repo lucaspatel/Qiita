@@ -43,8 +43,6 @@
   let prepProtocol = $state(0);
   let ref = $state(0);
   let trim = $state(150);
-  let primer = $state('GTGYCAGCMGCCGCGGTAA');
-  let orient = $state(false);
   let advanced = $state(false);
   let submitting = $state(false);
   let errMsg = $state('');
@@ -58,8 +56,6 @@
     selectedFile = null;
     fileName = '';
     trim = 150;
-    primer = 'GTGYCAGCMGCCGCGGTAA';
-    orient = false;
     advanced = false;
     errMsg = '';
     okTickets = null;
@@ -100,9 +96,7 @@
         run_preflight_blob: blob,
         prep_protocol_idx: prepProtocol,
         sortmerna_reference_idx: ref,
-        trim,
-        primer,
-        orient_primer: orient
+        trim
       });
       if (r.ok) okTickets = r.data.tickets;
       else errMsg = `HTTP ${r.status} — ${r.detail}`;
@@ -195,14 +189,6 @@
           <label>
             <span class="mb-1 block text-gray-500">Trim length</span>
             <input type="number" min="6" bind:value={trim} class="w-full rounded-md border border-gray-300 px-3 py-1.5" />
-          </label>
-          <label>
-            <span class="mb-1 block text-gray-500">Primer</span>
-            <input bind:value={primer} class="w-full rounded-md border border-gray-300 px-3 py-1.5" />
-          </label>
-          <label class="col-span-2 flex items-center gap-2 text-gray-700">
-            <input type="checkbox" bind:checked={orient} class="size-4 rounded border-gray-300 text-teal-600 focus:ring-teal-500" />
-            Orient primer
           </label>
         </div>
       {/if}

@@ -36,7 +36,8 @@ The dev stack's own procedure applies; these are the inputs it needs.
      sample. Fork only.
    - `20261010000000_amplicon_sample`: the per-sample gate the lineage reads. Fork only.
 5. **Restart** the control plane, orchestrator and data plane. The actions sync
-   registers `amplicon` **1.1.0** (1.0.0 stays) and its new library actions
+   registers `amplicon` **1.1.0**, auto-deprecating 1.0.0 (a 1.0.0 ticket still
+   unfinished at deploy can't run; resubmit it as 1.1.0), and its new library actions
    (`mint-amplicon-identifiers`, `finalize-amplicon-sample`).
 6. **Images.** None are new. golay-demux still needs `bcl-convert-4.5.4.sif` staged;
    every amplicon 1.1.0 step is native.
