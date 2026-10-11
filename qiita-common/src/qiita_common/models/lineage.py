@@ -59,6 +59,8 @@ class LineageSample(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     prep_sample_idx: int
+    # For the client to fetch the sample's metadata; not for display.
+    biosample_idx: int
     # The biosample's accession where it has one, else its QB.
     label: str
     # Which of those `label` is.

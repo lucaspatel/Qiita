@@ -64,7 +64,7 @@ async def fetch_study_lineage(pool: asyncpg.Pool, study_idx: int) -> dict[str, l
     population the study's sequenced-sample listing returns (live links, live
     prep_samples, no ENA-flagged sequenced sample)."""
     samples = await pool.fetch(
-        "SELECT ps.idx AS prep_sample_idx, pp.name AS prep_protocol,"
+        "SELECT ps.idx AS prep_sample_idx, ps.biosample_idx, pp.name AS prep_protocol,"
         "       ss.sequenced_pool_idx, sp.sequencing_run_idx, ss.sequenced_pool_item_id,"
         "       COALESCE(b.biosample_accession, b.ena_sample_accession, ee.export_entity_id)"
         "         AS label,"
@@ -250,6 +250,7 @@ def build_study_lineage(study_idx: int, rows: dict[str, list[Any]]) -> StudyLine
                 samples=[
                     LineageSample(
                         prep_sample_idx=s["prep_sample_idx"],
+                        biosample_idx=s["biosample_idx"],
                         label=_sample_label(s),
                         label_source=s["label_source"],
                         sequencing_run_idx=s["sequencing_run_idx"],

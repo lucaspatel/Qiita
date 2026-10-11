@@ -8,6 +8,7 @@ from qiita_control_plane.lineage import build_study_lineage
 def _sample(idx, protocol, *, pool=7, run=3, label=None, read_count=100, item="1"):
     return {
         "prep_sample_idx": idx,
+        "biosample_idx": 100 + idx,
         "prep_protocol": protocol,
         "sequenced_pool_idx": pool,
         "sequencing_run_idx": run,
