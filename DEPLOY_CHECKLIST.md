@@ -15,7 +15,18 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 1. Env vars — set BEFORE the deploy (most are `from_env()` fail-fast; a missing one keeps the unit down)
 
-_None yet._
+- `[operator]` **`PATH_INGEST_ROOTS` must cover the sequencer run-folder root(s).** No new
+  variable — but `submit-golay-demux --instrument-run-id <id>` resolves the run folder by
+  scanning `PATH_INGEST_ROOTS` for a directory whose basename matches the run id, so a run
+  living under a path the roots don't cover cannot be submitted. Ensure the existing value
+  includes wherever instruments copy runs. (#244)
+- `[admin]` **Optional, recommended: name the deployment.** `QIITA_DEPLOYMENT_NAME` (CP) is
+  served at `GET /api/v1/deployment` and shown by `qiita whoami` and the web UI's badge, so
+  users can tell prod from a dev stack. Unset reports `null`; a malformed value (not a
+  lowercase `[a-z0-9-]` slug, ≤32 chars) **fails CP boot**. (#feat/web-ui)
+  ```
+  sudo bash -c 'grep -q "^QIITA_DEPLOYMENT_NAME=" /etc/qiita/control-plane.env || echo "QIITA_DEPLOYMENT_NAME=prod" >> /etc/qiita/control-plane.env'   # (#feat/web-ui)
+  ```
 
 ### 2. One-time host setup
 
@@ -67,6 +78,8 @@ _None yet._
       || { echo "$s is not on DuckDB 1.5.5"; exit 1; }
   done && echo DUCKDB_155_OK'
   ```
+- **Deployment name served:** `curl -s https://qiita-miint.ucsd.edu/api/v1/deployment` →
+  `{"name":"prod"}` (`{"name":null}` if bucket 1's optional var was skipped). (#feat/web-ui)
 
 ### 6. After the deploy verifies green
 

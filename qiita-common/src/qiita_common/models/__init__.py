@@ -144,6 +144,7 @@ from qiita_common.models.biosample import (
     derive_metadata_field_scope,
     normalize_matrix_tube_id,
 )
+from qiita_common.models.deployment import DeploymentResponse
 from qiita_common.models.ena import (
     EnaRunRecord,
     EnaSampleAttributes,
@@ -490,6 +491,8 @@ __all__ = [
     "check_derived_inputs",
     "check_exactly_one_runtime",
     "check_withdrawal_reason",
+    # Deployment.
+    "DeploymentResponse",
     # Health.
     "HealthResponse",
     "HealthStatus",

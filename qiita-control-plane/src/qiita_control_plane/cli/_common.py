@@ -3,8 +3,10 @@
 Surface:
 - argparse helpers (`add_base_url_arg`, `add_token_file_arg`) and the
   defaults / env-var names that back them. `validate_base_url(args,
-  parser)` is the post-parse companion that refuses plain http:// to
-  a non-localhost host unless --insecure was passed.
+  parser)` is the post-parse companion: it resolves the target
+  (`--env` / `--base-url` / env vars / config, see `_environment`) into
+  `args.base_url`, then refuses plain http:// to a non-localhost host
+  unless --insecure was passed.
 - PAT file I/O (`read_token`, `write_token`), and `commit_partials`, the
   all-or-nothing multi-file commit both CLIs' exports write through.
 - The authenticated HTTP call helper (`call`) plus `whoami` as a thin
@@ -55,12 +57,14 @@ from collections.abc import Callable
 from pathlib import Path
 
 import httpx
-from qiita_common.api_paths import LOOPBACK_HOST
+from qiita_common.api_paths import LOOPBACK_HOST, URL_DEPLOYMENT_PREFIX
 from qiita_common.auth_constants import (
     API_PREFIX,
     BEARER_PREFIX,
     STALE_TOKEN_SCOPE_HEADER,
 )
+
+from . import _environment
 
 # Environment-variable names and CLI defaults are CLI conventions (not part of
 # the wire protocol — those live in qiita_common.auth_constants). Keep them
@@ -144,15 +148,24 @@ h1   { margin-bottom: 0.4em; }
 
 
 def add_base_url_arg(parser: argparse.ArgumentParser) -> None:
-    """Add the standard --base-url and --insecure flags. Default base URL is
-    $QIITA_CONTROL_PLANE_URL or DEFAULT_CONTROL_PLANE_URL. Validate after
-    parse_args via `validate_base_url(args, parser)`."""
+    """Add the standard --env / --base-url and --insecure flags. Both target
+    flags default to None so `validate_base_url(args, parser)` (call it after
+    parse_args) can tell an explicit flag from a fallback."""
+    parser.add_argument(
+        "--env",
+        dest="env_name",
+        default=None,
+        help=(
+            f"Named environment from {_environment.CONFIG_FILE_DEFAULT} (default from"
+            f" ${_environment.QIITA_ENV_ENV} or the config's `current`); see `qiita env`"
+        ),
+    )
     parser.add_argument(
         "--base-url",
-        default=os.environ.get(QIITA_CONTROL_PLANE_URL_ENV, DEFAULT_CONTROL_PLANE_URL),
+        default=None,
         help=(
-            f"Control-plane base URL (default from ${QIITA_CONTROL_PLANE_URL_ENV} or"
-            f" {DEFAULT_CONTROL_PLANE_URL})"
+            f"Control-plane base URL (default from ${QIITA_CONTROL_PLANE_URL_ENV}, the"
+            f" current environment, or {DEFAULT_CONTROL_PLANE_URL})"
         ),
     )
     parser.add_argument(
@@ -167,13 +180,17 @@ def add_base_url_arg(parser: argparse.ArgumentParser) -> None:
 
 
 def add_token_file_arg(parser: argparse.ArgumentParser) -> None:
-    """Add the standard --token-file flag. Default is TOKEN_FILE_DEFAULT
-    (~/.qiita/token)."""
+    """Add the standard --token-file flag. Left None here; `validate_base_url`
+    fills it with the resolved environment's token file, or TOKEN_FILE_DEFAULT
+    when no config exists."""
     parser.add_argument(
         "--token-file",
         type=Path,
-        default=TOKEN_FILE_DEFAULT,
-        help=f"Where to write the PAT (default {TOKEN_FILE_DEFAULT})",
+        default=None,
+        help=(
+            "Where to write the PAT (default: the environment's token file, or"
+            f" {TOKEN_FILE_DEFAULT} without a config)"
+        ),
     )
 
 
@@ -184,9 +201,50 @@ def add_token_file_arg(parser: argparse.ArgumentParser) -> None:
 _LOOPBACK_HOSTNAMES = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
+# The target `validate_base_url` resolved for this process, read by
+# `read_token`. Module state because `read_token()` is called argument-free
+# from every subcommand; one CLI invocation resolves exactly one target. None
+# means nothing resolved one (a test driving a handler directly), and
+# `read_token` keeps its pre-environment behaviour.
+_TARGET: _environment.Target | None = None
+
+
+def reset_target_for_tests() -> None:
+    global _TARGET
+    _TARGET = None
+
+
 def validate_base_url(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
-    """Refuse plain http:// to non-localhost hosts unless --insecure was
-    passed. Call after parse_args(); errors via parser.error (exit 2)."""
+    """Resolve the target into `args.base_url` (and `args.token_file`, for
+    login), then refuse plain http:// to non-localhost hosts unless
+    --insecure was passed. Call after parse_args(); errors via parser.error
+    (exit 2). Subcommands that set `needs_target=False` (`qiita env ...`)
+    skip resolution — they exist to repair a config resolution would reject."""
+    global _TARGET
+    if not getattr(args, "needs_target", True):
+        return
+    try:
+        target = _environment.resolve_target(
+            flag_env=getattr(args, "env_name", None),
+            flag_base_url=args.base_url,
+            default_url=DEFAULT_CONTROL_PLANE_URL,
+            url_env_var=QIITA_CONTROL_PLANE_URL_ENV,
+        )
+    except _environment.EnvConfigError as exc:
+        parser.error(str(exc))
+    _TARGET = target
+    args.base_url = target.base_url
+    if hasattr(args, "token_file") and args.token_file is None:
+        if target.env is not None:
+            args.token_file = target.env.token_file
+        elif not target.config_present:
+            args.token_file = TOKEN_FILE_DEFAULT
+        else:
+            parser.error(
+                f"{target.base_url} is not a configured environment, so there is no"
+                " token file to log in to; add it with `qiita env add NAME URL` or"
+                " pass --token-file"
+            )
     parsed = urllib.parse.urlparse(args.base_url)
     if parsed.scheme != "http":
         return
@@ -216,11 +274,35 @@ def validate_base_url(args: argparse.Namespace, parser: argparse.ArgumentParser)
 
 
 def read_token(token_file: Path | None = None) -> str:
-    """Read PAT from $QIITA_TOKEN env or from a token file (default ~/.qiita/token).
-    Raises with a clear actionable message if neither is set."""
+    """Read the PAT for the resolved target, under the pairing rules in
+    `_environment`'s docstring: $QIITA_TOKEN only beside a URL-named target,
+    otherwise the environment's own token file; ~/.qiita/token only when no
+    config exists. Raises with an actionable message when there is none."""
     env = os.environ.get(QIITA_TOKEN_ENV)
+    target = _TARGET
+    if target is not None and target.env is not None:
+        if env and target.by_url:
+            return env.strip()
+        if env:
+            raise RuntimeError(
+                f"${QIITA_TOKEN_ENV} is set, but the target was chosen as environment"
+                f" {target.env.name!r}, which uses its own token; unset"
+                f" ${QIITA_TOKEN_ENV}, or name the target by URL to pair them"
+            )
+        if target.env.token_file.is_file():
+            return target.env.token_file.read_text().strip()
+        raise RuntimeError(
+            f"no PAT for environment {target.env.name!r} at {target.env.token_file}"
+            f" — run `qiita --env {target.env.name} login`"
+        )
     if env:
         return env.strip()
+    if target is not None and target.config_present:
+        raise RuntimeError(
+            f"{target.base_url} is not a configured environment, and stored tokens are"
+            f" only sent to their own environment; add it with `qiita env add NAME URL`"
+            f" or set ${QIITA_TOKEN_ENV}"
+        )
     path = token_file or TOKEN_FILE_DEFAULT
     if path.is_file():
         return path.read_text().strip()
@@ -500,6 +582,22 @@ def patch_with_if_match(base_url: str, token: str, path: str, body: dict) -> dic
 
 def whoami(base_url: str, token: str) -> dict:
     return call("GET", base_url, token, "/auth/whoami")
+
+
+def describe_target(base_url: str) -> str:
+    """One line naming where this invocation points: the environment it was
+    resolved from (if any), the URL, and the deployment's self-reported name
+    from the unauthenticated GET /deployment. The server's answer is the one
+    to trust; an older server without the route reports "unknown"."""
+    target = _TARGET
+    label = f"environment {target.env.name!r}" if target and target.env else "no named environment"
+    try:
+        response = httpx.get(f"{base_url}{URL_DEPLOYMENT_PREFIX}", timeout=CLI_HTTP_TIMEOUT_SECONDS)
+        response.raise_for_status()
+        reported = response.json().get("name") or "unnamed"
+    except httpx.HTTPError:
+        reported = "unknown"
+    return f"target: {label}, {base_url} (deployment reports: {reported})"
 
 
 def resolve_owner_idx(
