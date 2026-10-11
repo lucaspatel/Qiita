@@ -100,6 +100,7 @@ from ..repositories.biosample_metadata import (
     BiosampleOwnerIdFieldCollisionError,
     BiosampleOwnerIdMissingValueError,
 )
+from ..repositories.exported_entity import fetch_exported_entities, require_export_entity_id
 from ..roster_resolution import classify_roster, fetch_roster_facts
 from ._helpers import (
     ETAG_HEADER,
@@ -248,8 +249,12 @@ async def _import_one_biosample(
             defer_metadata_write=defer_metadata_write,
         ),
     )
+    exported_rows = await fetch_exported_entities(
+        conn, study_idx=[], biosample_idx=[result.biosample_idx]
+    )
     response = BiosampleImportResponse(
         biosample_idx=result.biosample_idx,
+        export_entity_id=exported_rows[0]["export_entity_id"],
         owner_id_biosample_study_field_idx=result.owner_id_biosample_study_field_idx,
         owner_id_biosample_study_field_created=result.owner_id_biosample_study_field_created,
     )
@@ -1042,11 +1047,13 @@ def _biosample_core_row_dict(row: asyncpg.Record) -> dict[str, object]:
     """Map a qiita.biosample row's columns to BiosampleResponse field names.
 
     Centralises the column -> field mapping (the idx -> biosample_idx rename
-    aside, every key matches its column). Excludes the metadata dicts and
-    caller_system_role. Runs no DB queries.
+    aside, every key matches its column; export_entity_id is read from
+    qiita.exported_entity). Excludes the metadata dicts and caller_system_role.
+    Runs no DB queries.
     """
     return {
         "biosample_idx": row["idx"],
+        "export_entity_id": require_export_entity_id(row, kind="biosample"),
         "owner_idx": row["owner_idx"],
         "metadata_checklist": MetadataChecklistRef.from_row(
             row["metadata_checklist_idx"], row["metadata_checklist_name"]
