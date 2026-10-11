@@ -100,6 +100,46 @@ async function get<T>(path: string): Promise<ApiResult<T>> {
   return { ok: false, status: res.status, detail };
 }
 
+/** A POST whose response body is binary (an Arrow IPC stream), not JSON. */
+async function postArrow(path: string, body: unknown, timeoutMs = 60_000): Promise<ApiResult<ArrayBuffer>> {
+  let res: Response;
+  try {
+    res = await fetch(BASE + path, {
+      method: 'POST',
+      headers: {
+        ...(auth.isSet ? { Authorization: `Bearer ${auth.token}` } : {}),
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+  } catch (e) {
+    return networkErr(e);
+  }
+  if (res.ok) return { ok: true, status: res.status, data: await res.arrayBuffer() };
+  const b: unknown = await res.json().catch(() => ({}));
+  const detail =
+    b && typeof b === 'object' && 'detail' in b ? String((b as { detail: unknown }).detail) : res.statusText;
+  return { ok: false, status: res.status, detail };
+}
+
+/** Which amplicon runs, over which samples (exactly one of study_idx / prep_sample_idx). */
+export type AmpliconFeatureTableRequest = {
+  processing_idx: number[];
+  study_idx?: number;
+  prep_sample_idx?: number[];
+};
+
+/** One column of an amplicon feature table: a processed sample. */
+export type AmpliconFeatureTableSample = {
+  /** The column name: the biosample's deposited accession, else the QM. */
+  sample: string;
+  export_id: string;
+  /** The biosample's public name (accession, else QB): the metadata join key. */
+  biosample: string;
+  processing_idx: number;
+};
+
 export type Whoami = {
   kind: string;
   principal_idx: number;
@@ -162,8 +202,12 @@ export type Biosample = {
   biosample_idx: number;
   biosample_accession: string | null;
   ena_sample_accession: string | null;
+  /** Qiita's public biosample handle (QB<n>), minted when the biosample is created. */
+  export_entity_id: string;
   metadata_checklist: { idx: number; name: string } | null;
   global_metadata: Record<string, MetaField>;
+  /** The study's own fields (every column a global field does not take). */
+  local_metadata: Record<string, MetaField>;
   retired: boolean;
 };
 
@@ -344,8 +388,21 @@ export type BiosampleRow = {
   metadata_checklist_name?: string | null;
 };
 
+/** A study's biosample field (GET /study/{idx}/biosample-field). */
+export type BiosampleStudyField = {
+  biosample_study_field_idx: number;
+  biosample_global_field_idx: number | null;
+  display_name: string;
+  data_type: string;
+  unique_in_study: boolean;
+  required: boolean;
+  description: string | null;
+};
+
 export type BiosampleImported = {
   biosample_idx: number;
+  /** The QB<n> minted for the new biosample. */
+  export_entity_id: string;
   owner_id_biosample_study_field_idx: number;
   owner_id_biosample_study_field_created: boolean;
 };
@@ -408,43 +465,52 @@ export type AssemblyMembership = {
   truncated: boolean;
 };
 
-// Study-level lineage aggregate — the pipeline stages rolled up across every
-// pool/sample. `GET /study/{idx}/lineage` is a Phase-3 endpoint that doesn't exist
-// server-side yet (shimmed today); a real impl rolls up processing + mask + membership.
-export type LineageColumn = { key: string; label: string };
-export type LineageSampleRow = {
-  accession: string;
-  prep_sample_idx: number;
-  pool: number;
-  state: string; // completed | processing | failed | no_data | …
-  values: Record<string, number | string | null>;
-};
+// Study lineage (`GET /study/{idx}/lineage`): every sample's provenance, one DAG
+// per prep protocol, laid out client-side. A stage node counts every sample of
+// its group ('not_started' where it has no record); a product node counts only
+// the samples it contains.
+export type LineageState =
+  | 'completed'
+  | 'no_data'
+  | 'pending'
+  | 'processing'
+  | 'failed'
+  | 'invalidated'
+  | 'not_started';
 export type LineageNode = {
   id: string;
+  kind: 'run' | 'reads' | 'mask' | 'processing' | 'product';
+  /** What the node is ("Reads", "ASVs"); `detail` is what produced it. */
   label: string;
-  kind: 'stage' | 'bin' | 'feature_table';
-  /** The submittable action this node represents, if any — present only on workflow
-   *  nodes (reads/mask/assembly), absent on facet (bins/mag/lcg/unbinned) and
-   *  feature-table nodes, which are outputs, not actions. Gates the Queue button. */
-  action_id?: string;
-  completion: { done: number; total: number };
-  columns: LineageColumn[];
-  samples: LineageSampleRow[];
+  detail: string | null;
+  action_id: string | null;
+  processing_idx: number | null;
+  mask_idx: number | null;
+  counts: Partial<Record<LineageState, number>>;
+  /** What a sample's `value` at this node measures (e.g. "ASVs"). */
+  value_label: string | null;
 };
-export type FeatureTableStat = {
-  id: string;
-  rows: number;
-  cols: number;
-  sparsity_pct: number;
-  merged_sample_count: number;
+export type LineageEdge = { source: string; target: string };
+export type LineageCell = { state: LineageState; value: number | null };
+export type LineageSample = {
+  prep_sample_idx: number;
+  /** For fetching the sample's metadata; never displayed. */
+  biosample_idx: number;
+  /** The biosample's accession where it has one, else its QB. */
+  label: string;
+  label_source: 'biosample_accession' | 'ena_sample_accession' | 'export_entity_id';
+  sequencing_run_idx: number | null;
+  sequenced_pool_idx: number | null;
+  /** node id -> state there; a node absent here is 'not_started'. */
+  cells: Record<string, LineageCell>;
 };
-export type LineageEdge = [string, string, { dashed?: boolean }];
-export type StudyLineage = {
-  study_idx: number;
+export type LineageGroup = {
+  prep_protocol: string;
   nodes: LineageNode[];
   edges: LineageEdge[];
-  feature_table_stats: { tables: FeatureTableStat[] };
+  samples: LineageSample[];
 };
+export type StudyLineage = { study_idx: number; groups: LineageGroup[] };
 
 // --- ENA/INSDC study import (admin-only; a batch driver that spawns download tickets) ---
 
@@ -501,6 +567,8 @@ export const api = {
   studyRecord: (studyIdx: number) => get<Record<string, unknown>>(`/study/${studyIdx}`),
   /** Create a study. Needs study:write + a complete profile. */
   createStudy: (body: StudyCreate) => send<Record<string, unknown>>('POST', '/study', body),
+  /** The study's biosample fields, global-linked and local. */
+  biosampleFields: (studyIdx: number) => get<BiosampleStudyField[]>(`/study/${studyIdx}/biosample-field`),
   /** Bulk-import a plate's biosamples in one all-or-nothing call. Needs ADMIN on the study. */
   bulkImportBiosamples: (studyIdx: number, rows: BiosampleRow[]) =>
     send<BulkImportResult>('POST', `/study/${studyIdx}/biosample/bulk`, { rows }),
@@ -529,7 +597,7 @@ export const api = {
    *  404/405 on a server predating the endpoint — treat as "unsupported". */
   studyPools: (studyIdx: number) =>
     get<StudySequencedPoolList>(`/study/${studyIdx}/sequenced-pool`),
-  /** Study-level pipeline lineage aggregate (stages rolled up across pools/samples).
+  /** Every sample's provenance in the study, one DAG per prep protocol.
    *  404/405 on a server predating the endpoint — treat as "unsupported". */
   studyLineage: (studyIdx: number) => get<StudyLineage>(`/study/${studyIdx}/lineage`),
   /** (mock) Kick off a sample's next processing step; the lineage reflects it on refetch. */
@@ -543,6 +611,18 @@ export const api = {
     get<IdxList>(`/study/${studyIdx}/biosample/list-idxs`),
   /** One biosample incl. its global_metadata values. Readable at viewer tier. */
   biosample: (idx: number) => get<Biosample>(`/biosample/${idx}`),
+  /** An amplicon feature table's columns. */
+  ampliconFeatureTableSamples: (body: AmpliconFeatureTableRequest) =>
+    send<{ samples: AmpliconFeatureTableSample[] }>('POST', '/amplicon/feature-table/samples', body),
+  /** Its counts, sparse COO (sample, feature, count), as an Arrow IPC stream. */
+  ampliconFeatureTableCounts: (body: AmpliconFeatureTableRequest) =>
+    postArrow('/amplicon/feature-table/counts', body),
+  /** Its features (feature, sequence, length), as an Arrow IPC stream. */
+  ampliconFeatureTableFeatures: (body: AmpliconFeatureTableRequest) =>
+    postArrow('/amplicon/feature-table/features', body),
+  /** A biosample as one study sees it: global fields plus the study's own (local_metadata). */
+  studyBiosample: (studyIdx: number, idx: number) =>
+    get<Biosample>(`/study/${studyIdx}/biosample/${idx}`),
   /** Your work tickets (own by default; wet_lab_admin+ sees all with all=true). */
   tickets: (
     q: {
