@@ -13,6 +13,7 @@ def _sample(idx, protocol, *, pool=7, run=3, label=None, read_count=100, item="1
         "sequencing_run_idx": run,
         "sequenced_pool_item_id": item,
         "label": label or f"QB{idx}",
+        "label_source": "biosample_accession" if label else "export_entity_id",
         "read_count": read_count,
     }
 
@@ -61,6 +62,8 @@ def test_amplicon_samples_form_run_reads_asvs_feature_table():
     by_idx = {s.prep_sample_idx: s for s in group.samples}
     assert by_idx[1].label == "SAMEA1"
     assert by_idx[2].label == "QB2"
+    assert by_idx[1].label_source == "biosample_accession"
+    assert by_idx[2].label_source == "export_entity_id"
     assert by_idx[1].cells["processing:11"].value == 40
     assert by_idx[2].cells["reads"].value == 250
     assert nodes["reads"].value_label == "Reads"

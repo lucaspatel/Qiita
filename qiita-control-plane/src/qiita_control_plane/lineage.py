@@ -68,6 +68,9 @@ async def fetch_study_lineage(pool: asyncpg.Pool, study_idx: int) -> dict[str, l
         "       ss.sequenced_pool_idx, sp.sequencing_run_idx, ss.sequenced_pool_item_id,"
         "       COALESCE(b.biosample_accession, b.ena_sample_accession, ee.export_entity_id)"
         "         AS label,"
+        "       CASE WHEN b.biosample_accession IS NOT NULL THEN 'biosample_accession'"
+        "            WHEN b.ena_sample_accession IS NOT NULL THEN 'ena_sample_accession'"
+        "            ELSE 'export_entity_id' END AS label_source,"
         "       sr.sequence_idx_stop - sr.sequence_idx_start + 1 AS read_count"
         "  FROM qiita.prep_sample_to_study pst"
         "  JOIN qiita.prep_sample ps ON ps.idx = pst.prep_sample_idx"
@@ -248,6 +251,7 @@ def build_study_lineage(study_idx: int, rows: dict[str, list[Any]]) -> StudyLine
                     LineageSample(
                         prep_sample_idx=s["prep_sample_idx"],
                         label=_sample_label(s),
+                        label_source=s["label_source"],
                         sequencing_run_idx=s["sequencing_run_idx"],
                         sequenced_pool_idx=s["sequenced_pool_idx"],
                         cells=cells[s["prep_sample_idx"]],

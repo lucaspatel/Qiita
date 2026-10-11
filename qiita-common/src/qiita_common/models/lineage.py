@@ -61,6 +61,8 @@ class LineageSample(BaseModel):
     prep_sample_idx: int
     # The biosample's accession where it has one, else its QB.
     label: str
+    # Which of those `label` is.
+    label_source: Literal["biosample_accession", "ena_sample_accession", "export_entity_id"]
     sequencing_run_idx: int | None
     sequenced_pool_idx: int | None
     # node id -> the sample's state there; a node absent here is 'not_started'.
