@@ -91,8 +91,8 @@ def test_counts_are_sparse_and_named_by_column_and_md5():
         {"sample": "QM2", "feature": md5("TTTT"), "value": 3.0},
     ]
     assert sorted(features.to_pylist(), key=lambda r: r["sequence"]) == [
-        {"feature": md5("ACGTACGT"), "sequence": "ACGTACGT", "length": 8},
-        {"feature": md5("TTTT"), "sequence": "TTTT", "length": 4},
+        {"feature": md5("ACGTACGT"), "sequence": "ACGTACGT", "length": 8, "taxonomy": None},
+        {"feature": md5("TTTT"), "sequence": "TTTT", "length": 4, "taxonomy": None},
     ]
 
 
@@ -108,7 +108,18 @@ def test_a_profile_is_named_by_genome_and_carries_no_sequence():
         {"sample": "QM2", "feature": "G002", "value": 1.0},
     ]
     assert features.to_pylist() == [
-        {"feature": g, "sequence": None, "length": None} for g in ("G000", "G001", "G002")
+        {"feature": g, "sequence": None, "length": None, "taxonomy": None}
+        for g in ("G000", "G001", "G002")
+    ]
+    labelled = build_features(
+        _cohort("QM1", "QM2", method="taxonomic-profile"),
+        _profile([(1, "G000", 0.8), (2, "G002", 1.0)]),
+        None,
+        {"G000": "d__Bacteria;s__Burkholderia contaminans"},
+    )
+    assert [r["taxonomy"] for r in labelled.to_pylist()] == [
+        "d__Bacteria;s__Burkholderia contaminans",
+        None,
     ]
 
 
@@ -119,7 +130,7 @@ def test_no_internal_identifier_reaches_the_output():
     ):
         table, features = build_coo(cohort, values, chunks)
         assert table.column_names == ["sample", "feature", "value"]
-        assert features.column_names == ["feature", "sequence", "length"]
+        assert features.column_names == ["feature", "sequence", "length", "taxonomy"]
         # Names travel once, as dictionaries; rows carry codes.
         assert all(
             pa.types.is_dictionary(table.schema.field(c).type) for c in ("sample", "feature")

@@ -3,7 +3,7 @@ field-data enums, and the closed sequencing-platform and access-tier enums
 shared with the biosample, study, and sequencing surfaces."""
 
 from enum import StrEnum
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
@@ -311,9 +311,17 @@ INDEX_TYPE_RYPE_ROUTER = "rype_router"
 # run. Admitted by 20261011000000_profiling_database_reference.sql.
 INDEX_TYPE_SYLPH = "sylph"
 
-# The sylph database formats, by file suffix. miint reads either and tells them
-# apart by content; the suffix is what the registration records.
-SYLPH_DATABASE_SUFFIXES = {".syl2db": "syl2db", ".syldb": "syldb"}
+# A sylph release's taxonomy file: one `<genome file>\t<lineage>` line per genome
+# (GTDB-style `d__...;s__...`). Its rows load into qiita.profiling_taxonomy, which
+# labels a profiled genome. Admitted by 20261011000002_profiling_taxonomy.sql.
+INDEX_TYPE_SYLPH_TAXONOMY = "sylph_taxonomy"
+
+# The files a profiling database may register, by index type: suffix -> the format
+# recorded. miint reads either sylph format and tells them apart by content.
+REFERENCE_FILE_SUFFIXES = {
+    INDEX_TYPE_SYLPH: {".syl2db": "syl2db", ".syldb": "syldb"},
+    INDEX_TYPE_SYLPH_TAXONOMY: {".tsv": "tsv"},
+}
 
 
 class ReferenceIndex(BaseModel):
@@ -340,8 +348,14 @@ class ReferenceIndex(BaseModel):
 
 
 class ReferenceFileRegisterRequest(BaseModel):
-    """Register a prebuilt profiling database where it already sits on disk: one
-    `profiling_database` reference, active at once, and its `sylph` index row.
+    """Register a file of a prebuilt profiling database where it already sits on
+    disk, as one index row of a `profiling_database` reference.
+
+    One reference is one database release (name + version, e.g. `wol3` /
+    `rc4-ani95`); each file the release ships is one index row of a typed kind
+    (`REFERENCE_FILE_SUFFIXES`), the newest row of a kind winning. Name a new
+    release by `name` + `version` (it is created, active at once — there is
+    nothing to ingest), or attach a file to an existing one by `reference_idx`.
 
     The caller (the CLI, on a host that sees the file) hashes it; the control
     plane checks the path is an absolute, readable file of `size_bytes` before
@@ -349,27 +363,37 @@ class ReferenceFileRegisterRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
-    version: str = Field(min_length=1, max_length=MAX_VERSION_LENGTH)
-    index_type: Literal["sylph"] = INDEX_TYPE_SYLPH
+    reference_idx: Annotated[int, Field(gt=0)] | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=MAX_NAME_LENGTH)
+    version: str | None = Field(default=None, min_length=1, max_length=MAX_VERSION_LENGTH)
+    index_type: Literal["sylph", "sylph_taxonomy"] = INDEX_TYPE_SYLPH
     fs_path: str = Field(min_length=2, max_length=4096)
     sha256: str = Field(pattern=SHA256_HEX_PATTERN)
     size_bytes: int = Field(gt=0)
 
     @model_validator(mode="after")
-    def _absolute_with_a_known_suffix(self) -> ReferenceFileRegisterRequest:
+    def _one_target_an_absolute_path_and_a_known_suffix(self) -> Self:
+        if (self.reference_idx is None) == (self.name is None or self.version is None):
+            raise ValueError(
+                "name the release by name + version (new) or by reference_idx (existing),"
+                " not both and not neither"
+            )
+        if self.reference_idx is not None and (self.name or self.version):
+            raise ValueError("reference_idx names an existing release; drop name and version")
         if not self.fs_path.startswith("/"):
             raise ValueError(f"fs_path must be absolute, got {self.fs_path!r}")
-        if not any(self.fs_path.endswith(sfx) for sfx in SYLPH_DATABASE_SUFFIXES):
+        suffixes = REFERENCE_FILE_SUFFIXES[self.index_type]
+        if not any(self.fs_path.endswith(sfx) for sfx in suffixes):
             raise ValueError(
-                f"fs_path must end in one of {sorted(SYLPH_DATABASE_SUFFIXES)},"
+                f"a {self.index_type} file must end in one of {sorted(suffixes)},"
                 f" got {self.fs_path!r}"
             )
         return self
 
     @property
     def format(self) -> str:
-        return next(f for sfx, f in SYLPH_DATABASE_SUFFIXES.items() if self.fs_path.endswith(sfx))
+        suffixes = REFERENCE_FILE_SUFFIXES[self.index_type]
+        return next(f for sfx, f in suffixes.items() if self.fs_path.endswith(sfx))
 
 
 class ReferenceFileRegisterResponse(BaseModel):

@@ -820,8 +820,8 @@ pub fn ensure_amplicon_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
 }
 
 /// Create the taxonomic-profile table. One row per (sample, run, genome) a
-/// profiler reported: the `taxonomic-profile` workflow's sylph abundances and ANI
-/// (fractions in [0, 1]) and effective coverage. `genome_name` is the profiling database's own genome identifier (not
+/// profiler reported: the `taxonomic-profile` workflow's sylph abundances (percent),
+/// ANI (a fraction) and effective coverage. `genome_name` is the profiling database's own genome identifier (not
 /// yet mapped to `qiita.genome`). Replace-keyed on `(prep_sample_idx,
 /// processing_idx)` in `flight_service::REPLACE_KEY_TABLES`, so a re-run replaces
 /// its own rows.

@@ -47,6 +47,12 @@
   });
   const gmapCount = $derived(gmap?.ok ? (gmap.data.count ?? gmap.data.entries?.length ?? 0) : 0);
   const fmt = (x: number) => x.toLocaleString();
+  const bytes = (x: number) => {
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let i = 0;
+    while (x >= 1024 && i < units.length - 1) (x /= 1024), i++;
+    return `${x.toFixed(i ? 1 : 0)} ${units[i]}`;
+  };
 </script>
 
 <div class="mb-3">
@@ -79,6 +85,47 @@
       </dl>
     </Card>
 
+    {#if rec.data.kind === 'profiling_database'}
+    <!-- A profiling database's files, registered where they sit: newest first,
+         and the newest of each type is the one a profile reads. -->
+    <Card title="Files" bodyClass="">
+      {#if indices && !indices.ok}
+        <p class="px-4 py-6 text-center text-red-700">HTTP {indices.status} — {indices.detail}</p>
+      {:else if indices?.ok}
+        <table class="min-w-full divide-y divide-gray-200 text-sm">
+          <thead class="bg-gray-50">
+            <tr>
+              {#each ['Type', 'Path', 'Size', 'sha256', 'Genomes', 'Registered'] as h}
+                <th class="px-4 py-2 text-left text-xs font-semibold tracking-wide text-gray-500 uppercase">{h}</th>
+              {/each}
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-gray-100">
+            {#each indices.data as f, i (f.reference_index_idx)}
+              {@const current = indices.data.findIndex((x) => x.index_type === f.index_type) === i}
+              <tr class={current ? '' : 'text-gray-400'}>
+                <td class="px-4 py-2 font-medium whitespace-nowrap {current ? 'text-gray-900' : ''}">
+                  {f.index_type}{#if f.params?.format} · {f.params.format}{/if}{#if !current}
+                    <span class="ml-1 text-xs">(superseded)</span>{/if}
+                </td>
+                <td class="px-4 py-2 font-mono text-xs break-all">{f.fs_path}</td>
+                <td class="px-4 py-2 whitespace-nowrap">{f.params?.size_bytes ? bytes(n(f.params.size_bytes)) : '—'}</td>
+                <td class="px-4 py-2 font-mono text-xs" title={String(f.params?.sha256 ?? '')}
+                  >{String(f.params?.sha256 ?? '—').slice(0, 12)}</td
+                >
+                <td class="px-4 py-2">{f.params?.genome_count ? fmt(n(f.params.genome_count)) : '—'}</td>
+                <td class="px-4 py-2 whitespace-nowrap">{new Date(f.created_at).toLocaleString()}</td>
+              </tr>
+            {:else}
+              <tr><td colspan="6" class="px-4 py-6 text-center text-gray-500">No files registered.</td></tr>
+            {/each}
+          </tbody>
+        </table>
+      {:else}
+        <p class="px-4 py-6 text-center text-gray-400">Loading…</p>
+      {/if}
+    </Card>
+    {:else}
     <Card title="Built indices" bodyClass="">
       {#if indices && !indices.ok}
         <p class="px-4 py-6 text-center text-red-700">HTTP {indices.status} — {indices.detail}</p>
@@ -137,5 +184,6 @@
         {/if}
       </Card>
     </div>
+    {/if}
   </div>
 {/if}

@@ -4,7 +4,7 @@
   // stays sparse (COO); only the cells in view are looked up. Features run most
   // abundant first, and only the columns in view render: the rest are spacer
   // cells sized to keep the scroll width true.
-  import type { FeatureTable } from '$lib/featureTable';
+  import { genomeLabel, type FeatureTable } from '$lib/featureTable';
 
   let {
     table,
@@ -17,7 +17,8 @@
     visibleLabels?: string[];
   } = $props();
 
-  const COL_W = 96;
+  // A profile's columns carry species names, an amplicon table's the first bases.
+  const COL_W = $derived(table.valueKind === 'relative_abundance' ? 168 : 96);
   const ID_W = 200;
   const PAGE = 25;
 
@@ -64,22 +65,28 @@
   // md5 feature id) on hover, and a click copies the sequence — or, for a profile,
   // by the genome's name, which a click copies.
   const isAbundance = $derived(table.valueKind === 'relative_abundance');
-  const sequence = (f: number) => table.sequenceOf.get(table.features[f]) ?? table.features[f];
+  // What a header shows and a click copies: an ASV's sequence, or a genome's
+  // species (its lineage's lowest named rank) with the genome name copied.
+  const sequence = (f: number) =>
+    table.sequenceOf.get(table.features[f]) ??
+    (isAbundance ? genomeLabel(table, table.features[f]) : table.features[f]);
+  const copyText = (f: number) => table.sequenceOf.get(table.features[f]) ?? table.features[f];
   const headerTitle = (f: number) =>
     table.sequenceOf.has(table.features[f])
       ? `${sequence(f)}\nmd5 ${table.features[f]}\nClick to copy the sequence`
-      : `${table.features[f]}\nClick to copy the genome name`;
-  // An abundance is a fraction of the sample, shown as a percentage.
+      : `${table.features[f]}\n${table.taxonomyOf.get(table.features[f]) ?? 'no taxonomy'}\nClick to copy the genome name`;
+  // An abundance is a percent of the sample.
   const cell = (v: number) =>
     isAbundance
-      ? `${(100 * v).toLocaleString(undefined, { maximumFractionDigits: v < 0.001 ? 4 : 2 })}%`
+      ? `${v.toLocaleString(undefined, { maximumFractionDigits: v < 0.1 ? 4 : 2 })}%`
       : v.toLocaleString();
-  const short = (seq: string) => (seq.length > 10 ? `${seq.slice(0, 10)}…` : seq);
+  const short = (seq: string) =>
+    isAbundance ? (seq.length > 22 ? `${seq.slice(0, 22)}…` : seq) : seq.length > 10 ? `${seq.slice(0, 10)}…` : seq;
   let copied = $state<number | null>(null);
   let copiedTimer: ReturnType<typeof setTimeout> | undefined;
   async function copy(f: number) {
     try {
-      await navigator.clipboard.writeText(sequence(f));
+      await navigator.clipboard.writeText(copyText(f));
     } catch {
       return; // No clipboard (insecure context, or denied): nothing to confirm.
     }

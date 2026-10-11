@@ -8,7 +8,7 @@
 - **`taxonomic-profile` 1.0.0 profiles a pool's metagenomic samples with sylph.** One
   native step streams the pool's raw reads and runs miint's `sylph_profile` against a
   registered database (`sylph_reference_idx`, optional `min_ani` as a fraction), writing
-  DuckLake `taxonomic_profile` (relative abundances and ANI as fractions, effective
+  DuckLake `taxonomic_profile` (relative abundances in percent, ANI as a fraction, effective
   coverage, per sample and genome). Only the pool's short- and long-read metagenomic
   samples are profiled; a pool with none is refused. The run identity hashes the database
   reference, its file's sha256 and the threshold, so each method and database is its own

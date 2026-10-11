@@ -15,7 +15,8 @@ Outputs:
   staging_dir     <staging>/taxonomic_profile.parquet, the DuckLake table rows
                   (prep_sample_idx, processing_idx, genome_name, contig_name,
                   taxonomic_abundance, sequence_abundance, adjusted_ani, eff_cov),
-                  abundances and ANI as fractions in [0, 1], for register-files.
+                  abundances in percent and ANI as a fraction, as sylph reports
+                  them, for register-files.
   profile_counts  (prep_sample_idx, genome_count), one row per sample with a
                   genome, outside the staging directory, for the closing action
                   (register-files moves the staged file into the lake).
@@ -85,8 +86,8 @@ def _check_units(conn, sample_col: str) -> None:
 
     The staged miint returns both abundances in [0, 100] (each sample's
     taxonomic_abundance summing to 100) and adjusted_ani in [0, 1], where its docs
-    say the reverse. The job converts abundances to fractions, so a build that
-    changes either unit must stop here rather than land rows a hundredfold off."""
+    say the reverse. The lake stores them as reported, so a build that changes
+    either unit must stop here rather than land rows a hundredfold off the rest."""
     worst = conn.execute(
         "SELECT max(abs(total - 100)), max(ani) FROM ("
         f"  SELECT sum(taxonomic_abundance) AS total, max(adjusted_ani) AS ani"
@@ -157,16 +158,14 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 step_name=YAML_STEP_NAME, reason="sylph found no database genome in any sample"
             )
         _check_units(conn, sample_col)
-        # Abundances to fractions, the unit ANI already has. `genome_index` is
-        # left out: it is the genome's rank within the sample's rows, not its
-        # offset in the database, so it identifies nothing.
+        # `genome_index` is left out: it is the genome's rank within the sample's
+        # rows, not its offset in the database, so it identifies nothing.
         conn.execute(
             "COPY ("
             f"  SELECT {sample_col}::BIGINT AS prep_sample_idx,"
             f"         CAST({inputs.processing_idx} AS BIGINT) AS processing_idx,"
             "         genome_name, contig_name,"
-            "         taxonomic_abundance / 100.0 AS taxonomic_abundance,"
-            "         sequence_abundance / 100.0 AS sequence_abundance,"
+            "         taxonomic_abundance, sequence_abundance,"
             "         adjusted_ani, eff_cov"
             "  FROM profile ORDER BY prep_sample_idx, genome_name"
             f") TO '{profile_out}' ({PARQUET_OPTS})"

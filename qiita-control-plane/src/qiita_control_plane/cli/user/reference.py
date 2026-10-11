@@ -45,15 +45,25 @@ def _sha256_of(path: Path) -> str:
 def _handle_reference_register_file(
     args: argparse.Namespace, parser: argparse.ArgumentParser
 ) -> int:
-    """Register a prebuilt profiling database (a sylph `.syl2db`/`.syldb`) where
-    it sits on disk. Hashes the file here, so run it on a host that sees the
-    same path the control plane and the compute nodes do."""
+    """Register one file of a prebuilt profiling database where it sits on disk: a
+    sylph `.syl2db`/`.syldb` (`--index-type sylph`) or its taxonomy TSV
+    (`--index-type sylph_taxonomy`), on a new release (`--name`/`--version`) or an
+    existing one (`--reference-idx`). Hashes the file here, so run it on a host
+    that sees the same path the control plane and the compute nodes do."""
     path = Path(args.path).resolve()
     if not path.is_file():
         parser.error(f"--path {args.path}: not a file")
+    if (args.reference_idx is None) == (args.name is None or args.version is None):
+        parser.error(
+            "name a new release with --name and --version, or an existing one with --reference-idx"
+        )
+    target = (
+        {"reference_idx": args.reference_idx}
+        if args.reference_idx is not None
+        else {"name": args.name, "version": args.version}
+    )
     body = {
-        "name": args.name,
-        "version": args.version,
+        **target,
         "index_type": args.index_type,
         "fs_path": str(path),
         "sha256": _sha256_of(path),

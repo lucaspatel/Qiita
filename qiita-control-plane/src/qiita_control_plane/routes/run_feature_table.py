@@ -7,8 +7,9 @@
     its QM, its biosample's public name (to join to metadata), and its run; with
     the runs' method and what their values are (`count` or `relative_abundance`);
   * values — sparse COO `(sample, feature, value)` as an Arrow IPC stream;
-  * features — `(feature, sequence, length)` for every feature the values name, as
-    an Arrow IPC stream (sequence and length null for a profile);
+  * features — `(feature, sequence, length, taxonomy)` for every feature the values
+    name, as an Arrow IPC stream (sequence and length null for a profile, whose
+    taxonomy is each genome's lineage from its database's taxonomy file);
   * ticket — the same reads as signed Flight tickets, with the columns, for a
     client that builds the table itself (the CLI).
 
@@ -48,6 +49,7 @@ from qiita_common.models.run_feature_table import (
 from ..auth.guards import COHORT_MIN_TIER, require_complete_profile, require_scope
 from ..auth.principal import HumanUser, Principal
 from ..deps import get_data_plane_url, get_db_pool, get_flight_signing_key
+from ..repositories.profiling_taxonomy import fetch_lineages
 from ..run_feature_table import (
     ARROW_STREAM_MEDIA_TYPE,
     Cohort,
@@ -57,6 +59,7 @@ from ..run_feature_table import (
     build_values,
     cohort_tickets,
     fetch_runs,
+    profiled_genomes,
     resolve_cohort,
 )
 from ._helpers import authorize_prep_sample_cohort
@@ -143,7 +146,14 @@ async def feature_table_features(
     cohort = await _authorized_cohort(pool, caller, request)
     needs_values = cohort.source.sequences_table is None
     values, chunks = await _read(cohort, data_plane_url, signing_key, values=needs_values)
-    table = build_features(cohort, values, chunks)
+    lineages = (
+        await fetch_lineages(
+            pool, reference_idx=cohort.reference_idx, genomes=profiled_genomes(values)
+        )
+        if values is not None and cohort.reference_idx is not None
+        else None
+    )
+    table = build_features(cohort, values, chunks, lineages)
     return Response(arrow_stream_bytes(table), media_type=ARROW_STREAM_MEDIA_TYPE)
 
 

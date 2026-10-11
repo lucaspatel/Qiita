@@ -159,7 +159,12 @@ async def test_features_carry_each_md5s_sequence(role_keyed_clients, amplicon_ru
     )
     assert resp.status_code == 200, resp.text
     assert _arrow(resp).to_pylist() == [
-        {"feature": hashlib.md5(ASV.encode()).hexdigest(), "sequence": ASV, "length": len(ASV)}
+        {
+            "feature": hashlib.md5(ASV.encode()).hexdigest(),
+            "sequence": ASV,
+            "length": len(ASV),
+            "taxonomy": None,
+        }
     ]
 
 
@@ -480,8 +485,8 @@ async def test_a_profile_is_relative_abundance_by_genome(role_keyed_clients, pro
     features = await role_keyed_clients["wet"].post(URL_FEATURE_TABLE_FEATURES, json=body)
     assert features.status_code == 200, features.text
     assert _arrow(features).to_pylist() == [
-        {"feature": "G000", "sequence": None, "length": None},
-        {"feature": "G001", "sequence": None, "length": None},
+        {"feature": "G000", "sequence": None, "length": None, "taxonomy": None},
+        {"feature": "G001", "sequence": None, "length": None, "taxonomy": None},
     ]
     # A profile's features come from its values: both reads fetched them.
     assert run["fetched"] == [True, True]
@@ -521,3 +526,56 @@ async def test_refuses_profiles_against_different_databases(role_keyed_clients, 
     )
     assert resp.status_code == 409, resp.text
     assert "sylph_database_sha256" in resp.json()["detail"]
+
+
+async def test_a_profiles_features_carry_its_databases_lineage(
+    role_keyed_clients, amplicon_run, monkeypatch
+):
+    """The genome names sylph reports are sketch paths; the taxonomy file is keyed
+    by file name; the features join the two on the basename."""
+    run, db = amplicon_run, role_keyed_clients["pool"]
+    ref = await db.fetchval(
+        "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
+        " VALUES ($1, '1', 'profiling_database', 'active', 1) RETURNING reference_idx",
+        f"wol3-lineage-{uuid.uuid4().hex[:8]}",
+    )
+    await db.execute(
+        "INSERT INTO qiita.profiling_taxonomy (reference_idx, genome, lineage)"
+        " VALUES ($1, 'G000802255.fna.gz', 'd__Bacteria;s__Burkholderia contaminans')",
+        ref,
+    )
+    p = await _mint_profile(db, run["owner_idx"], [run["ps_a"]], sylph_reference_idx=ref)
+    run["runs"].append(p)
+
+    def _fetch(*, data_plane_url, signing_key, cohort, values=True):
+        names = ["/db/genomes/G000802255.fna.gz", "/db/genomes/G999.fna.gz"]
+        table = pa.table(
+            {
+                "prep_sample_idx": pa.array([run["ps_a"]] * 2, pa.int64()),
+                "processing_idx": pa.array([p] * 2, pa.int64()),
+                "genome_name": pa.array(names, pa.string()),
+                "contig_name": pa.array(["c1", "c2"], pa.string()),
+                "taxonomic_abundance": pa.array([60.0, 40.0], pa.float64()),
+                "sequence_abundance": pa.array([60.0, 40.0], pa.float64()),
+                "adjusted_ani": pa.array([0.99, 0.98], pa.float64()),
+                "eff_cov": pa.array([2.0, 1.0], pa.float64()),
+            }
+        )
+        return table, None
+
+    monkeypatch.setattr("qiita_control_plane.routes.run_feature_table.fetch_runs", _fetch)
+    try:
+        resp = await role_keyed_clients["wet"].post(
+            URL_FEATURE_TABLE_FEATURES, json=_body([p], prep_sample_idx=[run["ps_a"]])
+        )
+        assert resp.status_code == 200, resp.text
+        assert {r["feature"]: r["taxonomy"] for r in _arrow(resp).to_pylist()} == {
+            "/db/genomes/G000802255.fna.gz": "d__Bacteria;s__Burkholderia contaminans",
+            "/db/genomes/G999.fna.gz": None,
+        }
+    finally:
+        await db.execute("DELETE FROM qiita.profiling_taxonomy WHERE reference_idx = $1", ref)
+        await db.execute("DELETE FROM qiita.exported_identifier WHERE processing_idx = $1", p)
+        await db.execute("DELETE FROM qiita.processing WHERE processing_idx = $1", p)
+        run["runs"].remove(p)
+        await db.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", ref)

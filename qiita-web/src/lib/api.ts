@@ -131,7 +131,7 @@ export type FeatureTableRequest = {
   prep_sample_idx?: number[];
 };
 
-/** What a table's values are: reads counted per feature, or a fraction of the sample. */
+/** What a table's values are: reads counted per feature, or a percent of the sample. */
 export type FeatureTableValueKind = 'count' | 'relative_abundance';
 
 /** One column of a run feature table: a processed sample. */

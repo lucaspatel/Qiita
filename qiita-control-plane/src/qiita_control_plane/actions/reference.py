@@ -238,6 +238,10 @@ async def delete_reference_cascade(
             "DELETE FROM qiita.reference_index WHERE reference_idx = $1", reference_idx
         )
     )
+    # A profiling database's taxonomy rows, loaded with its sylph_taxonomy index row.
+    await conn.execute(
+        "DELETE FROM qiita.profiling_taxonomy WHERE reference_idx = $1", reference_idx
+    )
     membership_deleted = _rowcount(
         await conn.execute(
             "DELETE FROM qiita.reference_membership WHERE reference_idx = $1", reference_idx

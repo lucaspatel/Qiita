@@ -8,7 +8,7 @@ import { api, type ApiResult, type FeatureTableRequest, type FeatureTableValueKi
 export type FeatureTable = {
   /** The runs' method (`amplicon`, `taxonomic-profile`). */
   method: string;
-  /** Counts (rarefiable) or relative abundances (fractions; not rarefiable). */
+  /** Counts (rarefiable) or relative abundances (percent; not rarefiable). */
   valueKind: FeatureTableValueKind;
   /** Column names, by code: a processed sample's accession, else its QM. */
   samples: string[];
@@ -20,6 +20,9 @@ export type FeatureTable = {
   features: string[];
   /** Feature id -> its ASV sequence; empty for a profile. */
   sequenceOf: Map<string, string>;
+  /** Feature id -> a profiled genome's lineage (`d__...;s__...`), where its
+   *  database's taxonomy names it; empty for an amplicon table. */
+  taxonomyOf: Map<string, string>;
   /** The observations: sample code, feature code, value, one per nonzero cell. */
   s: Int32Array;
   f: Int32Array;
@@ -70,8 +73,13 @@ export async function loadFeatureTable(
   const ft = tableFromIPC(feats.data);
   const ids = ft.getChild('feature')!.toArray() as string[];
   const seqs = ft.getChild('sequence')!.toArray() as string[];
+  const taxa = ft.getChild('taxonomy')?.toArray() as (string | null)[] | undefined;
   const sequenceOf = new Map<string, string>();
-  for (let i = 0; i < ids.length; i++) if (seqs[i] != null) sequenceOf.set(ids[i], seqs[i]);
+  const taxonomyOf = new Map<string, string>();
+  for (let i = 0; i < ids.length; i++) {
+    if (seqs[i] != null) sequenceOf.set(ids[i], seqs[i]);
+    if (taxa?.[i] != null) taxonomyOf.set(ids[i], taxa[i]!);
+  }
 
   return {
     ok: true,
@@ -84,9 +92,35 @@ export async function loadFeatureTable(
       exportIdOf: Object.fromEntries(cols.data.samples.map((x) => [x.sample, x.export_id])),
       features,
       sequenceOf,
+      taxonomyOf,
       s,
       f,
       c
     }
   };
+}
+
+/** A profiled genome's display name: the species of its lineage, else its lowest
+ *  named rank (`g__Nonomuraea` -> "Nonomuraea (genus)"), else the genome's file
+ *  name without its directory. */
+export function genomeLabel(table: FeatureTable, feature: string): string {
+  const lineage = table.taxonomyOf.get(feature);
+  const file = feature.split('/').pop() ?? feature;
+  if (!lineage) return file;
+  const ranks: Record<string, string> = {
+    s: 'species',
+    g: 'genus',
+    f: 'family',
+    o: 'order',
+    c: 'class',
+    p: 'phylum',
+    d: 'domain'
+  };
+  const named = lineage
+    .split(';')
+    .map((t) => t.trim().match(/^([a-z])__(.+)$/))
+    .filter((m): m is RegExpMatchArray => m != null && m[2].trim() !== '');
+  const last = named.at(-1);
+  if (!last) return file;
+  return last[1] === 's' ? last[2] : `${last[2]} (${ranks[last[1]] ?? last[1]})`;
 }

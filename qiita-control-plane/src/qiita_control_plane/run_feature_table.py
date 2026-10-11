@@ -102,9 +102,16 @@ SOURCES: dict[str, Source] = {
 # 32-character md5 per observation, making the stream larger than a dense TSV.
 _NAME = pa.dictionary(pa.int32(), pa.string())
 VALUES_SCHEMA = pa.schema([("sample", _NAME), ("feature", _NAME), ("value", pa.float64())])
-# `sequence` and `length` are null for a method whose features are not sequences.
+# `sequence` and `length` are null for a method whose features are not sequences;
+# `taxonomy` is a profiled genome's lineage from its database's taxonomy file, null
+# for an ASV and for a genome the file does not name.
 FEATURES_SCHEMA = pa.schema(
-    [("feature", pa.string()), ("sequence", pa.string()), ("length", pa.int32())]
+    [
+        ("feature", pa.string()),
+        ("sequence", pa.string()),
+        ("length", pa.int32()),
+        ("taxonomy", pa.string()),
+    ]
 )
 
 
@@ -129,6 +136,9 @@ class Cohort:
     source: Source
     runs: list[int]
     samples: list[ProcessedSample]
+    # The profiling database the runs read (one, by the merge keys); None for
+    # amplicon runs.
+    reference_idx: int | None = None
 
     @property
     def prep_sample_idxs(self) -> list[int]:
@@ -140,7 +150,7 @@ def _params(row: asyncpg.Record) -> dict:
     return json.loads(params) if isinstance(params, str) else (params or {})
 
 
-def _source_of(runs: list[int], found: dict[int, asyncpg.Record]) -> Source:
+def _source_of(runs: list[int], found: dict[int, asyncpg.Record]) -> tuple[Source, dict]:
     """The one method the runs share, or a refusal naming what is wrong."""
     unknown = [p for p in runs if p not in found or found[p]["workflow"] not in SOURCES]
     if unknown:
@@ -164,7 +174,7 @@ def _source_of(runs: list[int], found: dict[int, asyncpg.Record]) -> Source:
             f"these runs' {source.noun} are not comparable"
             f" ({', '.join(source.merge_keys)} differ): {detail}",
         )
-    return source
+    return source, _params(found[runs[0]])
 
 
 async def resolve_cohort(pool: asyncpg.Pool, request: FeatureTableRequest) -> Cohort:
@@ -182,7 +192,7 @@ async def resolve_cohort(pool: asyncpg.Pool, request: FeatureTableRequest) -> Co
         " WHERE processing_idx = ANY($1::bigint[])",
         runs,
     )
-    source = _source_of(runs, {r["processing_idx"]: r for r in rows})
+    source, params = _source_of(runs, {r["processing_idx"]: r for r in rows})
 
     processed = await pool.fetch(
         "SELECT ei.processing_idx, ei.prep_sample_idx, ei.export_id,"
@@ -241,7 +251,12 @@ async def resolve_cohort(pool: asyncpg.Pool, request: FeatureTableRequest) -> Co
         )
         for r in processed
     ]
-    return Cohort(source=source, runs=runs, samples=samples)
+    return Cohort(
+        source=source,
+        runs=runs,
+        samples=samples,
+        reference_idx=params.get("sylph_reference_idx"),
+    )
 
 
 def cohort_scope(cohort: Cohort) -> dict[str, list[int]]:
@@ -293,7 +308,7 @@ def stage_features(con, *, chunks: str) -> None:
     con.execute(
         f"CREATE TEMP TABLE {FEATURE_RELATION} AS"
         " SELECT feature_idx, md5(seq) AS feature, seq AS sequence,"
-        "        length(seq)::INTEGER AS length"
+        "        length(seq)::INTEGER AS length, NULL::VARCHAR AS taxonomy"
         " FROM (SELECT feature_idx, string_agg(chunk_data, '' ORDER BY chunk_index) AS seq"
         f"       FROM {chunks} GROUP BY feature_idx)"
     )
@@ -323,7 +338,7 @@ def stage_values(
         con.execute(
             f"CREATE TEMP TABLE {FEATURE_RELATION} AS"
             " SELECT DISTINCT genome_name AS feature, NULL::VARCHAR AS sequence,"
-            f"        NULL::INTEGER AS length FROM {values}"
+            f"        NULL::INTEGER AS length, NULL::VARCHAR AS taxonomy FROM {values}"
         )
         con.execute(
             f"CREATE TEMP TABLE {VALUE_RELATION} AS"
@@ -390,28 +405,38 @@ def build_values(cohort: Cohort, values: pa.Table, chunks: pa.Table | None) -> p
     return table.cast(VALUES_SCHEMA)
 
 
-def build_features(cohort: Cohort, values: pa.Table | None, chunks: pa.Table | None) -> pa.Table:
-    """The features `(feature, sequence, length)` as Arrow, for the REST answer. An
-    amplicon table's needs only the chunks (the ticket already scopes them to the
-    ASVs the cohort observed); a profile's are read from its values."""
+def profiled_genomes(values: pa.Table) -> list[str]:
+    """The distinct genome names a profile's values carry, for the lineage lookup."""
+    return sorted(set(values.column("genome_name").to_pylist()))
+
+
+def build_features(
+    cohort: Cohort,
+    values: pa.Table | None,
+    chunks: pa.Table | None,
+    lineages: dict[str, str] | None = None,
+) -> pa.Table:
+    """The features `(feature, sequence, length, taxonomy)` as Arrow, for the REST
+    answer. An amplicon table's needs only the chunks (the ticket already scopes
+    them to the ASVs the cohort observed); a profile's are read from its values and
+    labelled from `lineages` (genome name -> lineage, `fetch_lineages`)."""
+    query = f"SELECT feature, sequence, length, taxonomy FROM {FEATURE_RELATION} ORDER BY feature"
     if cohort.source.sequences_table is not None:
         if chunks is None:
             raise RuntimeError(f"a {cohort.source.method} table needs its ASV chunks")
         with duckdb.connect() as duck:
             duck.register("chunks", chunks)
             stage_features(duck, chunks="chunks")
-            table = duck.execute(
-                f"SELECT feature, sequence, length FROM {FEATURE_RELATION} ORDER BY feature"
-            ).to_arrow_table()
+            table = duck.execute(query).to_arrow_table()
         return table.cast(FEATURES_SCHEMA)
     if values is None:
         raise RuntimeError(f"a {cohort.source.method} table's features come from its values")
-    table = _staged(
-        cohort,
-        values,
-        None,
-        f"SELECT feature, sequence, length FROM {FEATURE_RELATION} ORDER BY feature",
-    )
+    table = _staged(cohort, values, None, query)
+    if lineages:
+        named = [lineages.get(f) for f in table.column("feature").to_pylist()]
+        table = table.set_column(
+            table.schema.get_field_index("taxonomy"), "taxonomy", pa.array(named, pa.string())
+        )
     return table.cast(FEATURES_SCHEMA)
 
 

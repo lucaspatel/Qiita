@@ -37,6 +37,7 @@ from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
     INDEX_TYPE_SYLPH,
+    INDEX_TYPE_SYLPH_TAXONOMY,
     STORABLE_ACCESS_TIERS,
     BiosamplePatchRequest,
     BiosampleStudyFieldCreateRequest,
@@ -1596,21 +1597,29 @@ def _build_parser() -> argparse.ArgumentParser:
     p_reference_register = p_reference_sub.add_parser(
         "register-file",
         help=(
-            "Register a prebuilt profiling database (a sylph .syl2db/.syldb) where it sits"
-            " on disk, as an active profiling_database reference (system admin)"
+            "Register a file of a prebuilt profiling database where it sits on disk: a sylph"
+            " .syl2db/.syldb or its taxonomy TSV, on a new or existing release (system admin)"
         ),
     )
-    p_reference_register.add_argument("--name", required=True, help="Reference name, e.g. wol3")
+    p_reference_register.add_argument("--name", help="A new release's name, e.g. wol3")
+    p_reference_register.add_argument("--version", help="A new release's version, e.g. rc4-ani95")
     p_reference_register.add_argument(
-        "--version", required=True, help="Reference version, e.g. rc4-ani95"
+        "--reference-idx",
+        dest="reference_idx",
+        type=int,
+        help="An existing release to attach the file to, instead of --name/--version",
     )
     p_reference_register.add_argument(
         "--path",
         required=True,
-        help="The database file, on a path the control plane and compute nodes share",
+        help="The file, on a path the control plane and compute nodes share",
     )
     p_reference_register.add_argument(
-        "--index-type", dest="index_type", choices=(INDEX_TYPE_SYLPH,), default=INDEX_TYPE_SYLPH
+        "--index-type",
+        dest="index_type",
+        choices=(INDEX_TYPE_SYLPH, INDEX_TYPE_SYLPH_TAXONOMY),
+        default=INDEX_TYPE_SYLPH,
+        help="sylph (the database, default) or sylph_taxonomy (its genome -> lineage TSV)",
     )
     p_reference_register.set_defaults(handler=_handle_reference_register_file)
     p_reference_load = p_reference_sub.add_parser(

@@ -83,7 +83,7 @@ def _inputs(tmp_path, reads, syl2db, samples, **kw):
     )
 
 
-async def test_profiles_only_the_bound_samples_as_fractions(genomes, syl2db, tmp_path):
+async def test_profiles_only_the_bound_samples_in_percent(genomes, syl2db, tmp_path):
     reads = _reads(
         genomes,
         tmp_path,
@@ -109,8 +109,8 @@ async def test_profiles_only_the_bound_samples_as_fractions(genomes, syl2db, tmp
     for r in rows:
         totals[r[0]] = totals.get(r[0], 0.0) + r[3]
         assert 0 < r[4] <= 1
-    assert totals == pytest.approx({101: 1.0, 102: 1.0})
-    assert rows[0][3] == pytest.approx(0.8, abs=0.05)
+    assert totals == pytest.approx({101: 100.0, 102: 100.0})
+    assert rows[0][3] == pytest.approx(80, abs=5)
     assert counts == [(101, 2), (102, 1)]
 
 

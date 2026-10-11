@@ -13,7 +13,7 @@ PositiveIdx = Annotated[int, Field(gt=0)]
 MAX_FEATURE_TABLE_RUNS = 32
 
 # What a table's values are: reads counted per feature (amplicon ASVs), or each
-# feature's share of the sample (a profiler's relative abundance, a fraction).
+# feature's share of the sample (a profiler's relative abundance, in percent).
 FeatureTableValueKind = Literal["count", "relative_abundance"]
 
 

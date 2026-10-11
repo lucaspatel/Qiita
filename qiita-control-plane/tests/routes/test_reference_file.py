@@ -22,6 +22,10 @@ async def admin(postgres_pool, human_admin_session):
     ) as ac:
         yield ac
     await postgres_pool.execute(
+        "DELETE FROM qiita.profiling_taxonomy WHERE reference_idx IN"
+        " (SELECT reference_idx FROM qiita.reference WHERE name LIKE 'sylph-test-%')"
+    )
+    await postgres_pool.execute(
         "DELETE FROM qiita.reference_index WHERE reference_idx IN"
         " (SELECT reference_idx FROM qiita.reference WHERE name LIKE 'sylph-test-%')"
     )
@@ -123,6 +127,8 @@ async def test_refuses_a_directory(admin, tmp_path):
         {"sha256": "XYZ"},
         {"index_type": "rype"},
         {"kind": "sequence_reference"},
+        {"index_type": "sylph_taxonomy"},
+        {"reference_idx": 1},
     ],
 )
 async def test_refuses_a_malformed_request(admin, syl2db, override):
@@ -133,3 +139,46 @@ async def test_refuses_a_malformed_request(admin, syl2db, override):
 async def test_needs_a_system_admin(role_keyed_clients, syl2db):
     resp = await role_keyed_clients["wet"].post(URL_REFERENCE_FILE, json=_body(syl2db))
     assert resp.status_code == 403, resp.text
+
+
+async def test_attaches_a_taxonomy_file_to_the_release_and_loads_it(admin, syl2db, tmp_path):
+    created = (await admin.post(URL_REFERENCE_FILE, json=_body(syl2db))).json()
+    ref = created["reference"]["reference_idx"]
+    tsv = tmp_path / "wol3_rc4_ani95_taxonomy.tsv"
+    tsv.write_text(
+        "G000802255.fna.gz\td__Bacteria;s__Burkholderia contaminans\n"
+        "G024244725.fna.gz\td__Bacteria;p__Desulfobacterota_102087;g__;s__\n"
+    )
+    body = {k: v for k, v in _body(tsv).items() if k not in ("name", "version")}
+    resp = await admin.post(
+        URL_REFERENCE_FILE, json={**body, "reference_idx": ref, "index_type": "sylph_taxonomy"}
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["index"]["params"]["genome_count"] == 2
+    listed = await admin.get(URL_REFERENCE_INDEX.format(reference_idx=ref))
+    assert sorted(i["index_type"] for i in listed.json()) == ["sylph", "sylph_taxonomy"]
+
+
+async def test_refuses_a_malformed_taxonomy_line(admin, syl2db, tmp_path):
+    ref = (await admin.post(URL_REFERENCE_FILE, json=_body(syl2db))).json()["reference"][
+        "reference_idx"
+    ]
+    tsv = tmp_path / "bad.tsv"
+    tsv.write_text("G1.fna.gz\td__Bacteria\nno-tab-here\n")
+    body = {k: v for k, v in _body(tsv).items() if k not in ("name", "version")}
+    resp = await admin.post(
+        URL_REFERENCE_FILE, json={**body, "reference_idx": ref, "index_type": "sylph_taxonomy"}
+    )
+    assert resp.status_code == 422
+    assert ":2:" in resp.json()["detail"]
+
+
+async def test_refuses_attaching_to_a_missing_release(admin, tmp_path):
+    tsv = tmp_path / "t.tsv"
+    tsv.write_text("G1.fna.gz\td__Bacteria\n")
+    body = {k: v for k, v in _body(tsv).items() if k not in ("name", "version")}
+    resp = await admin.post(
+        URL_REFERENCE_FILE,
+        json={**body, "reference_idx": 2**62, "index_type": "sylph_taxonomy"},
+    )
+    assert resp.status_code == 404, resp.text

@@ -19,6 +19,7 @@
   import Spinner from './Spinner.svelte';
   import { pyworker, type Pcoa, type Permanova } from '$lib/pyodide/pyodide.svelte';
   import FeatureTableGrid from './FeatureTableGrid.svelte';
+  import ProfileSubmit from './ProfileSubmit.svelte';
   import { loadFeatureTable, type FeatureTable } from '$lib/featureTable';
   import ColorPanel from './ColorPanel.svelte';
   import { colorBy, fieldValue, natural, shapeBy } from '$lib/colorBy';
@@ -72,6 +73,9 @@
     shapeVar = shape;
     continuousFor = cont;
   }
+
+  // The prep protocols a shotgun profiler reads; their Reads node offers a profile.
+  const METAGENOMIC_PROTOCOLS = ['short_read_metagenomics', 'long_read_metagenomics'];
 
   const NODE_W = 170;
   const NODE_H = 76;
@@ -529,6 +533,9 @@
           {@const pc = ftIdx != null ? pcoaFor[ftIdx] : undefined}
           {@const shown = new Set((visible[g.prep_protocol] ?? []).map((r) => String(r.sample)))}
           <div class="border-t border-gray-200">
+            {#if selNode.kind === 'reads' && METAGENOMIC_PROTOCOLS.includes(g.prep_protocol)}
+              <ProfileSubmit samples={g.samples} onSubmitted={() => load(studyIdx)} />
+            {/if}
             {#if ftIdx != null}
               {@const meta = metaFor[g.prep_protocol]}
               {@const bio = pc?.state === 'ok' ? (k: string) => pc.table.biosampleOf[k] : same}
