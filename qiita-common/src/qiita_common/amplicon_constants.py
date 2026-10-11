@@ -16,3 +16,7 @@ AMPLICON_SEQUENCE_CHUNKS_TABLE = "amplicon_sequence_chunks"
 
 # register-files names a staged table after its file stem.
 AMPLICON_MEMBERSHIP_BASENAME = f"{AMPLICON_MEMBERSHIP_TABLE}.parquet"
+
+# The most amplicon runs one feature-table request may merge. The data plane
+# bounds its tickets the same way; the reason is at its `MAX_AMPLICON_RUNS`.
+MAX_AMPLICON_RUNS = 32

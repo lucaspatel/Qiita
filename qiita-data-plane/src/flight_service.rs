@@ -357,9 +357,9 @@ const ALLOWED_TABLES: &[&str] = &[
     // the MINTED namespace, which is the join into the shared feature space this
     // table cannot make.
     "bin_quality",
-    // One amplicon run's ASVs over a cohort, for the amplicon feature table. 16S
+    // Amplicon runs' ASVs over a cohort, for the amplicon feature table. 16S
     // amplicon output, not host sequence and not reads: per-sample ASV counts, and
-    // the ASV bytes themselves. Every form is scoped to exactly one run
+    // the ASV bytes themselves. Every form is scoped to a bounded set of runs
     // (`processing_idx`) over a non-empty `prep_sample_idx` set and nothing else
     // (`build_amplicon_run_query`); the sequence tables carry no prep_sample_idx, so
     // their scope resolves through `amplicon_membership`.
@@ -3670,7 +3670,12 @@ fn is_bin_quality_surface(table: &str) -> bool {
     table == "bin_quality"
 }
 
-/// The DoGet surfaces whose scope is one amplicon RUN over a cohort.
+/// The most amplicon runs one ticket may name. A feature table merges runs only
+/// when their ASVs are comparable (same trim and orientation), which a study does
+/// a handful of times, not hundreds; the bound keeps a ticket's SQL bounded.
+const MAX_AMPLICON_RUNS: usize = 32;
+
+/// The DoGet surfaces whose scope is a set of amplicon RUNS over a cohort.
 fn is_amplicon_run_surface(table: &str) -> bool {
     matches!(
         table,
@@ -3975,17 +3980,20 @@ fn build_bin_quality_query(filter: &auth::TicketFilter) -> Result<(String, Strin
 
 /// Build the run-scoped SELECT for an amplicon surface.
 ///
-/// Exactly one `processing_idx`, a non-empty `prep_sample_idx` set, and nothing
-/// else — the same two-halves rule as `build_bin_quality_query`, for the same
-/// reason: either half alone widens past the run. `amplicon_membership` carries
-/// both columns; the ASV sequence tables are keyed by the content-deduped
-/// `feature_idx` an ASV shares with every run that found it, so "this run's ASVs"
-/// is read from membership, as `build_assembly_run_query` reads contigs.
+/// A non-empty set of at most `MAX_AMPLICON_RUNS` `processing_idx`s, a non-empty
+/// `prep_sample_idx` set, and nothing else. Both halves are required because
+/// either alone widens past what was authorized — the runs alone are every sample
+/// they touched, the samples alone every run they ever had — and the `filter.len()`
+/// check stops a third column riding along. The control plane decides which runs
+/// may merge; this only bounds and scopes. `amplicon_membership` carries both
+/// columns; the ASV sequence tables are keyed by the content-deduped `feature_idx`
+/// an ASV shares with every run that found it, so "these runs' ASVs" is read from
+/// membership, as `build_assembly_run_query` reads contigs.
 fn build_amplicon_run_query(
     table: &str,
     filter: &auth::TicketFilter,
 ) -> Result<(String, String), Status> {
-    let processing_idx = single_i64_filter(filter, "processing_idx")?;
+    let mut runs = i64_list_filter(filter, "processing_idx")?;
     let prep_sample_idx = i64_list_filter(filter, "prep_sample_idx")?;
     if filter.len() != 2 {
         return Err(Status::invalid_argument(format!(
@@ -3993,13 +4001,26 @@ fn build_amplicon_run_query(
             filter.len()
         )));
     }
+    runs.sort_unstable();
+    runs.dedup();
+    if runs.len() > MAX_AMPLICON_RUNS {
+        return Err(Status::invalid_argument(format!(
+            "{table} accepts at most {MAX_AMPLICON_RUNS} processing_idx values, got {}",
+            runs.len()
+        )));
+    }
     let full_table = format!("qiita_lake.{table}");
-    let preps = prep_sample_idx
-        .iter()
-        .map(|v| v.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let run_scope = format!("processing_idx = {processing_idx} AND prep_sample_idx IN ({preps})");
+    let join = |v: &[i64]| {
+        v.iter()
+            .map(|x| x.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let run_scope = format!(
+        "processing_idx IN ({}) AND prep_sample_idx IN ({})",
+        join(&runs),
+        join(&prep_sample_idx)
+    );
     let sql = if table == "amplicon_membership" {
         format!("SELECT * FROM {full_table} WHERE {run_scope}")
     } else {

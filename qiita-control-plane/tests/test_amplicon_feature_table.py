@@ -1,9 +1,34 @@
-"""The amplicon feature table's rendering: ASV sequences by QM-labelled samples."""
+"""The amplicon feature table's COO: public names only, nothing densified."""
+
+import hashlib
 
 import pyarrow as pa
 import pytest
+from qiita_common.models.amplicon import AmpliconFeatureTableSample
 
-from qiita_control_plane.amplicon_feature_table import render_feature_table_tsv
+from qiita_control_plane.amplicon_feature_table import (
+    Cohort,
+    ProcessedSample,
+    arrow_stream_bytes,
+    build_coo,
+)
+
+
+def _cohort(*names):
+    """Processed samples (run 7, prep_sample i) named `names` in order."""
+    return Cohort(
+        runs=[7],
+        samples=[
+            ProcessedSample(
+                processing_idx=7,
+                prep_sample_idx=i,
+                column=AmpliconFeatureTableSample(
+                    sample=n, export_id=n, biosample=f"QB{i}", processing_idx=7
+                ),
+            )
+            for i, n in enumerate(names, start=1)
+        ],
+    )
 
 
 def _membership(rows):
@@ -27,41 +52,47 @@ def _chunks(rows):
     )
 
 
-def test_rows_are_asv_sequences_and_columns_are_export_ids():
-    membership = _membership([(1, 100, 5), (1, 200, 2), (2, 200, 9)])
-    # feature 200's sequence spans two chunks, out of order on the wire.
-    chunks = _chunks([(100, 0, "TTTT"), (200, 1, "GG"), (200, 0, "AACC")])
-    tsv = render_feature_table_tsv(membership, chunks, {1: "QM10", 2: "QM11"})
-    assert tsv.splitlines() == [
-        "#OTU ID\tQM10\tQM11",
-        "AACCGG\t2\t9",
-        "TTTT\t5\t0",
+def md5(s):
+    return hashlib.md5(s.encode()).hexdigest()
+
+
+def test_counts_are_sparse_and_named_by_column_and_md5():
+    counts, features = build_coo(
+        _cohort("QM1", "QM2"),
+        _membership([(1, 10, 5), (2, 20, 3)]),
+        _chunks([(10, 0, "ACGT"), (10, 1, "ACGT"), (20, 0, "TTTT")]),
+    )
+    # One row per observation: no zero for QM1 x TTTT or QM2 x ACGTACGT.
+    assert sorted(counts.to_pylist(), key=lambda r: r["sample"]) == [
+        {"sample": "QM1", "feature": md5("ACGTACGT"), "count": 5},
+        {"sample": "QM2", "feature": md5("TTTT"), "count": 3},
+    ]
+    assert sorted(features.to_pylist(), key=lambda r: r["sequence"]) == [
+        {"feature": md5("ACGTACGT"), "sequence": "ACGTACGT", "length": 8},
+        {"feature": md5("TTTT"), "sequence": "TTTT", "length": 4},
     ]
 
 
-def test_no_internal_identifier_reaches_the_table():
-    membership = _membership([(41, 9001, 3)])
-    chunks = _chunks([(9001, 0, "ACGT")])
-    tsv = render_feature_table_tsv(membership, chunks, {41: "QM5"})
-    assert "41" not in tsv
-    assert "9001" not in tsv
+def test_no_internal_identifier_reaches_the_output():
+    counts, features = build_coo(
+        _cohort("QM1"), _membership([(1, 10, 5)]), _chunks([(10, 0, "ACGT")])
+    )
+    assert counts.column_names == ["sample", "feature", "count"]
+    assert features.column_names == ["feature", "sequence", "length"]
+    # Names travel once, as dictionaries; rows carry codes.
+    assert all(pa.types.is_dictionary(counts.schema.field(c).type) for c in ("sample", "feature"))
 
 
-def test_a_sample_with_no_asvs_is_an_all_zero_column():
-    membership = _membership([(1, 100, 5)])
-    chunks = _chunks([(100, 0, "ACGT")])
-    tsv = render_feature_table_tsv(membership, chunks, {1: "QM1", 2: "QM2"})
-    assert tsv.splitlines() == ["#OTU ID\tQM1\tQM2", "ACGT\t5\t0"]
+def test_an_observation_of_an_unnamed_sample_is_refused():
+    with pytest.raises(RuntimeError, match="no QM"):
+        build_coo(_cohort("QM1"), _membership([(2, 10, 5)]), _chunks([(10, 0, "ACGT")]))
 
 
 def test_an_asv_without_a_sequence_is_refused():
     with pytest.raises(RuntimeError, match="no sequence"):
-        render_feature_table_tsv(_membership([(1, 100, 5)]), _chunks([]), {1: "QM1"})
+        build_coo(_cohort("QM1"), _membership([(1, 99, 5)]), _chunks([(10, 0, "ACGT")]))
 
 
-def test_a_counted_sample_without_a_label_is_refused():
-    """A row whose sample has no public label would need an internal id to print."""
-    with pytest.raises(RuntimeError, match="no export_id"):
-        render_feature_table_tsv(
-            _membership([(1, 100, 5), (3, 100, 1)]), _chunks([(100, 0, "A")]), {1: "QM1"}
-        )
+def test_the_counts_round_trip_through_an_arrow_stream():
+    counts, _ = build_coo(_cohort("QM1"), _membership([(1, 10, 5)]), _chunks([(10, 0, "ACGT")]))
+    assert pa.ipc.open_stream(arrow_stream_bytes(counts)).read_all().equals(counts)

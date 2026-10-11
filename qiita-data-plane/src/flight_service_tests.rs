@@ -6392,7 +6392,7 @@ fn mint_phylogeny_edge_id_is_all_or_nothing_and_replay_safe() {
 
 // ---------------------------------------------------------------------------
 // Amplicon run surfaces: amplicon_membership and the ASV sequence tables, all
-// scoped by one run (processing_idx) over a cohort (prep_sample_idx).
+// scoped by a bounded set of runs (processing_idx) over a cohort (prep_sample_idx).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -6422,7 +6422,7 @@ fn build_query_amplicon_membership_scopes_the_run_on_its_own_columns() {
     assert_eq!(
         sql,
         "SELECT * FROM qiita_lake.amplicon_membership \
-         WHERE processing_idx = 7 AND prep_sample_idx IN (42, 43)",
+         WHERE processing_idx IN (7) AND prep_sample_idx IN (42, 43)",
         "got: {sql}"
     );
 }
@@ -6437,11 +6437,33 @@ fn build_query_amplicon_sequences_resolve_the_run_through_membership() {
             format!(
                 "SELECT * FROM qiita_lake.{table} WHERE feature_idx IN (\
                  SELECT feature_idx FROM qiita_lake.amplicon_membership \
-                 WHERE processing_idx = 7 AND prep_sample_idx IN (42, 43))"
+                 WHERE processing_idx IN (7) AND prep_sample_idx IN (42, 43))"
             ),
             "got: {sql}"
         );
     }
+}
+
+#[test]
+fn build_query_amplicon_scopes_several_runs_sorted_and_deduplicated() {
+    let filter = filter_of(&[
+        ("prep_sample_idx", vec![serde_json::json!(42)]),
+        (
+            "processing_idx",
+            vec![
+                serde_json::json!(9),
+                serde_json::json!(7),
+                serde_json::json!(9),
+            ],
+        ),
+    ]);
+    let (sql, _) = build_query("amplicon_membership", &filter, &[], &[]).unwrap();
+    assert_eq!(
+        sql,
+        "SELECT * FROM qiita_lake.amplicon_membership \
+         WHERE processing_idx IN (7, 9) AND prep_sample_idx IN (42)",
+        "got: {sql}"
+    );
 }
 
 #[test]
@@ -6458,13 +6480,22 @@ fn build_query_amplicon_requires_exactly_the_run_key() {
             filter_of(&[("processing_idx", vec![serde_json::json!(7)])]),
         ),
         (
-            "two runs",
+            "more runs than the bound",
             filter_of(&[
                 ("prep_sample_idx", vec![serde_json::json!(42)]),
                 (
                     "processing_idx",
-                    vec![serde_json::json!(7), serde_json::json!(8)],
+                    (1..=(MAX_AMPLICON_RUNS as i64 + 1))
+                        .map(|r| serde_json::json!(r))
+                        .collect(),
                 ),
+            ]),
+        ),
+        (
+            "an empty run set",
+            filter_of(&[
+                ("prep_sample_idx", vec![serde_json::json!(42)]),
+                ("processing_idx", vec![]),
             ]),
         ),
         (

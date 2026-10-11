@@ -623,17 +623,21 @@ URL_ASSEMBLY_PREP_SAMPLE = f"{URL_ASSEMBLY_PREFIX}{PATH_ASSEMBLY_PREP_SAMPLE}"
 
 
 # =============================================================================
-# /amplicon/* — an amplicon run's feature table
+# /amplicon/* — an amplicon feature table, as a query over a cohort
 # =============================================================================
-# Keyed on the run's processing_idx, the identity a completed amplicon ticket
-# minted. The table itself is labelled only with public handles: ASV sequences
-# for rows, the samples' QM identifiers (minted at load) for columns.
+# One request body (runs + a study or a sample list) answered three ways: the
+# samples (JSON), the counts as sparse COO rows, and the features' sequences
+# (both Arrow IPC streams). Labelled only with public handles.
 
 PATH_AMPLICON_PREFIX = "/amplicon"
-PATH_AMPLICON_FEATURE_TABLE = "/{processing_idx}/feature-table"
+PATH_AMPLICON_FEATURE_TABLE_SAMPLES = "/feature-table/samples"
+PATH_AMPLICON_FEATURE_TABLE_COUNTS = "/feature-table/counts"
+PATH_AMPLICON_FEATURE_TABLE_FEATURES = "/feature-table/features"
 
 URL_AMPLICON_PREFIX = f"{API_PREFIX}{PATH_AMPLICON_PREFIX}"
-URL_AMPLICON_FEATURE_TABLE = f"{URL_AMPLICON_PREFIX}{PATH_AMPLICON_FEATURE_TABLE}"
+URL_AMPLICON_FEATURE_TABLE_SAMPLES = f"{URL_AMPLICON_PREFIX}{PATH_AMPLICON_FEATURE_TABLE_SAMPLES}"
+URL_AMPLICON_FEATURE_TABLE_COUNTS = f"{URL_AMPLICON_PREFIX}{PATH_AMPLICON_FEATURE_TABLE_COUNTS}"
+URL_AMPLICON_FEATURE_TABLE_FEATURES = f"{URL_AMPLICON_PREFIX}{PATH_AMPLICON_FEATURE_TABLE_FEATURES}"
 
 
 # =============================================================================
