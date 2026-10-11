@@ -53,7 +53,7 @@ Every rule has one home. Spawn a family only if one of its rules fired in step 2
 ## Scope discipline
 
 - **Flag-but-defer what is wider than the PR.** A pre-existing problem in a sibling file, or a fix that would sprawl, is flagged with a proposed follow-up issue, not a request to expand the PR. Don't fail a PR for a problem it inherited. An existing sibling doing the same thing does not excuse a new site: flag the new one, offer the old ones as the follow-up.
-- **Write a deferral so it survives being handed on.** Each deferred or `[needs-probe]` finding states why it is out of scope ("pre-existing in a sibling", "needs the deploy host") and whether it pre-dates this branch or was introduced by it. Bare "deferred" is not a reason.
+- **Write a deferral so it survives being handed on.** Each deferred or `[needs-probe]` finding states why it is out of scope ("pre-existing in a sibling", "needs the deploy host") and whether it pre-dates this branch or was introduced by it. Bare "deferred" is not a reason. A deferred finding also carries a title for its follow-up issue and what would close it; the `qiita-review` skill says when that issue is opened.
 - **Verify your premises.** A finding that rests on a claim about a file you have not read ("this diverges from how the runner does it") is confirmed by opening that file, or softened to a question. A claim about what DuckDB, Arrow, Parquet or a tool does with a type or a value is a premise too: it is `[needs-probe]`, and the probe must exercise the path the code uses.
 
 ## Standing policies
@@ -137,7 +137,7 @@ Always run, in this order.
    - **If it is Qiita-specific** it stays, composed from miint and DuckDB primitives.
 
    File under **R6**, one grouped finding. A site you could not settle after the lookup goes to the handoff, stating what you searched.
-2. **Docs follow the code.** For every name, command, Make target, env var, path, route constant, table or column, scope, CLI flag, workflow, job module or documented behaviour the diff adds, renames, removes or changes, `grep` the tracked Markdown: `CLAUDE.md`, `README*`, `docs/**`, component READMEs, `.claude/**`. Skip the provenance logs (`CHANGELOG.md`, `docs/changelog-archive/`, `docs/deploy-archive/`). Flag a doc that still describes the old state, a new instance of something a doc enumerates with no entry, and a miint workaround added or removed without its "Open upstream gaps" row changing. File under **R2**, `[verified]` with the `grep`.
+2. **Docs follow the code.** For every name, command, Make target, env var, path, route constant, table or column, scope, CLI flag, workflow, job module or documented behaviour the diff adds, renames, removes or changes, `grep` the tracked Markdown: `CLAUDE.md`, `CHANGELOG.md`, `README*`, `docs/**`, component READMEs, `.claude/**`. Skip the provenance logs (`docs/changelog-pending/`, `docs/changelog-archive/`, `docs/deploy-archive/`). Flag a doc that still describes the old state, a new instance of something a doc enumerates with no entry, and a miint workaround added or removed without its "Open upstream gaps" row changing. File under **R2**, `[verified]` with the `grep`.
 3. **Duplication.** Scan the diff for a new block near-identical to an existing one (**R9**), a constant or literal defined a second time (**R1**), and a comment or doc restating `CLAUDE.md` or a sibling (**R2**). One grouped finding per owning rule.
 4. **Documented toil.** When the diff documents a manual workaround (copy this file first, run this by hand), ask whether an issue exists to remove the need. A question, not a blocker.
 5. **CI gates the diff must satisfy**, each described in `CLAUDE.md`: `changelog-check`, `deploy-note-check`, `review-loop-check`, and the REST path-constant parity test.
@@ -231,7 +231,7 @@ Safety must not rest on convention or a comment; and a guard must be real, so do
 - **The orchestrator has no database access**: no Postgres driver, no `qiita.<table>` query, no DB credentials, no path that reads or writes DB state except through the control plane's REST API.
 - **A native `module:` step imports only declared dependencies** (`CLAUDE.md`, "Workflow runtimes"). A trust-boundary dependency is pinned directly, not inherited transitively.
 - **A component owns its schema.** Inline SQL against another component's tables means the owner is missing an accessor.
-- **An `_idx` does not leave the system** (`CLAUDE.md`, opaque identifiers). Ask whether `qiita.exported_identifier` applies.
+- **An `_idx` does not leave the system** (`CLAUDE.md`, opaque identifiers). Ask whether `qiita.exported_identifier` (or, for a study or biosample, `qiita.exported_entity`) applies.
 - When `CLAUDE.md` or `docs/architecture/` declares a component contract, flag a violation even if it works.
 
 ### R8 — Query and model shaping
