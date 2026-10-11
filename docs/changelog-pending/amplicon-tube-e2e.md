@@ -44,7 +44,8 @@
 - **`GET /study/{idx}/lineage` describes a study's processing as a graph.** One DAG per
   prep protocol (run, reads, mask, processing, product), with per-sample states backed by a
   new `qiita.amplicon_sample` gate, sample labels by accession, else QB, and each sample's
-  `biosample_idx` for joining metadata.
+  `biosample_idx` for joining metadata. A sample whose reads have not landed shows its
+  pool's ingest ticket state, from bcl-convert, golay-demux or an ENA download.
 
 ### Fixed
 

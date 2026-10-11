@@ -14,11 +14,12 @@ disallow-without-delete checks are never duplicated here.
 
 from __future__ import annotations
 
+from qiita_common.actions import DOWNLOAD_ENA_STUDY_ACTION_ID
 from qiita_common.models import ScopeTargetKind, WorkTicketCreateRequest
 
-# action_id + version for the download-ena-study workflow. Pinned here so a
-# caller can't drift from the workflow YAML the deploy syncs into qiita.action.
-DOWNLOAD_ENA_STUDY_ACTION_ID = "download-ena-study"
+# The version of the download-ena-study workflow this importer submits. Pinned
+# here so a caller can't drift from the workflow YAML the deploy syncs into
+# qiita.action; the bare id is shared with readers in `qiita_common.actions`.
 DOWNLOAD_ENA_STUDY_ACTION_VERSION = "1.0.0"
 
 

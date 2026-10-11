@@ -4,10 +4,14 @@ import secrets
 import uuid
 
 import pytest
+from qiita_common.actions import DOWNLOAD_ENA_STUDY_ACTION_ID
 from qiita_common.api_paths import URL_STUDY_LINEAGE
 
+from qiita_control_plane.ena_import.submit import DOWNLOAD_ENA_STUDY_ACTION_VERSION
 from qiita_control_plane.repositories.processing import mint_processing
 from qiita_control_plane.testing.db_seeds import (
+    delete_action_if_created,
+    seed_action_if_absent,
     seed_biosample_to_study_link,
     seed_biosample_with_sequenced_prep_sample,
     seed_prep_sample_to_study_link,
@@ -71,7 +75,7 @@ async def amplicon_study(role_keyed_clients):
         ps_b,
         ps_c,
     )
-    yield {"study_idx": study, "processing_idx": p, "ps": (ps_a, ps_b, ps_c)}
+    yield {"study_idx": study, "processing_idx": p, "ps": (ps_a, ps_b, ps_c), "pool_idx": pool_idx}
     await db.execute("DELETE FROM qiita.amplicon_sample WHERE processing_idx = $1", p)
     await db.execute("DELETE FROM qiita.processing WHERE processing_idx = $1", p)
     await teardown_entity_graph(
@@ -99,6 +103,50 @@ async def test_lineage_groups_the_amplicon_dag(role_keyed_clients, amplicon_stud
     cells = {smp["prep_sample_idx"]: smp["cells"] for smp in group["samples"]}
     assert cells[s["ps"][0]][f"processing:{p}"] == {"state": "completed", "value": 12}
     assert cells[s["ps"][0]]["reads"] == {"state": "completed", "value": 10}
+
+
+@pytest.fixture
+async def ena_download_ticket(role_keyed_clients, amplicon_study):
+    """A download-ena-study ticket still processing the study's pool."""
+    db = role_keyed_clients["pool"]
+    created = await seed_action_if_absent(
+        db,
+        action_id=DOWNLOAD_ENA_STUDY_ACTION_ID,
+        version=DOWNLOAD_ENA_STUDY_ACTION_VERSION,
+        target_kind="sequenced_pool",
+    )
+    ticket = await db.fetchval(
+        "INSERT INTO qiita.work_ticket"
+        " (action_id, action_version, originator_principal_idx, scope_target_kind,"
+        "  sequenced_pool_idx, state)"
+        " VALUES ($1, $2, $3, 'sequenced_pool', $4, 'processing')"
+        " RETURNING work_ticket_idx",
+        DOWNLOAD_ENA_STUDY_ACTION_ID,
+        DOWNLOAD_ENA_STUDY_ACTION_VERSION,
+        role_keyed_clients["wet_session"]["principal_idx"],
+        amplicon_study["pool_idx"],
+    )
+    yield
+    await db.execute("DELETE FROM qiita.work_ticket WHERE work_ticket_idx = $1", ticket)
+    await delete_action_if_created(
+        db,
+        action_id=DOWNLOAD_ENA_STUDY_ACTION_ID,
+        version=DOWNLOAD_ENA_STUDY_ACTION_VERSION,
+        created=created,
+    )
+
+
+async def test_lineage_reads_follow_an_ena_download_in_progress(
+    role_keyed_clients, amplicon_study, ena_download_ticket
+):
+    resp = await role_keyed_clients["wet"].get(
+        URL_STUDY_LINEAGE.format(study_idx=amplicon_study["study_idx"])
+    )
+    assert resp.status_code == 200, resp.text
+    (group,) = resp.json()["groups"]
+    reads = next(n for n in group["nodes"] if n["id"] == "reads")
+    assert reads["detail"] == "download-ena-study"
+    assert reads["counts"] == {"completed": 1, "processing": 2}
 
 
 async def test_lineage_needs_study_access(role_keyed_clients, amplicon_study):

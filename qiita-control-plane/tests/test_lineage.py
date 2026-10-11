@@ -110,6 +110,19 @@ def test_reads_state_follows_the_pool_ingest_ticket_when_none_landed():
     assert reads.counts == {"failed": 1, "not_started": 1}
 
 
+def test_an_ena_download_ticket_names_the_reads_and_gives_their_state():
+    rows = _rows(
+        samples=[_sample(1, "p", read_count=None), _sample(2, "p", read_count=None)],
+        ingest=[
+            {"sequenced_pool_idx": 7, "action_id": "download-ena-study", "state": "processing"}
+        ],
+    )
+    (group,) = build_study_lineage(9, rows).groups
+    reads = next(n for n in group.nodes if n.id == "reads")
+    assert reads.detail == "download-ena-study"
+    assert reads.counts == {"processing": 2}
+
+
 def test_a_sample_with_no_accession_and_no_qb_is_refused():
     rows = _rows(samples=[{**_sample(1, "short_read_amplicon"), "label": None}])
     with pytest.raises(RuntimeError, match="no accession and no QB"):

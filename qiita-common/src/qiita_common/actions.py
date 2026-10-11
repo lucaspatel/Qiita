@@ -163,6 +163,11 @@ BCL_CONVERT_ACTION_ID = "bcl-convert"
 # other pool-scoped action that lands a pool's reads, alongside bcl-convert.
 GOLAY_DEMUX_ACTION_ID = "golay-demux"
 
+# The ENA download's bare id (workflows/download-ena-study/<version>.yaml): the
+# pool-scoped action that lands an ENA-imported pool's reads, the third way a
+# pool's reads arrive alongside the two demultiplexers.
+DOWNLOAD_ENA_STUDY_ACTION_ID = "download-ena-study"
+
 # The two BLOCK-scoped actions' bare ids (their YAML lives at
 # workflows/read-mask-block/<version>.yaml and workflows/align/<version>.yaml).
 # Bare ids for the same reason as the two above — and here the version-agnosticism

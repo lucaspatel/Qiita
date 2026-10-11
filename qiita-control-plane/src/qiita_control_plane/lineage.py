@@ -19,7 +19,12 @@ from collections import defaultdict
 from typing import Any
 
 import asyncpg
-from qiita_common.actions import AMPLICON_ACTION_ID, BCL_CONVERT_ACTION_ID, GOLAY_DEMUX_ACTION_ID
+from qiita_common.actions import (
+    AMPLICON_ACTION_ID,
+    BCL_CONVERT_ACTION_ID,
+    DOWNLOAD_ENA_STUDY_ACTION_ID,
+    GOLAY_DEMUX_ACTION_ID,
+)
 from qiita_common.models.lineage import (
     LineageCell,
     LineageEdge,
@@ -32,8 +37,13 @@ from qiita_common.models.lineage import (
 
 from .sample_names import BIOSAMPLE_NAME_JOIN, BIOSAMPLE_NAME_SQL
 
-# The pool-scoped actions that land a pool's reads.
-POOL_INGEST_ACTION_IDS = (BCL_CONVERT_ACTION_ID, GOLAY_DEMUX_ACTION_ID)
+# The pool-scoped actions that land a pool's reads: the two demultiplexers, and
+# the ENA download for an imported pool.
+POOL_INGEST_ACTION_IDS = (
+    BCL_CONVERT_ACTION_ID,
+    GOLAY_DEMUX_ACTION_ID,
+    DOWNLOAD_ENA_STUDY_ACTION_ID,
+)
 
 RUN_NODE = "run"
 READS_NODE = "reads"
