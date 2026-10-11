@@ -2846,6 +2846,33 @@ def test_submit_bcl_convert_rejects_non_sqlite_preflight(tmp_path, capsys, prefl
     assert "preflight query failed" in err
 
 
+def test_submit_bcl_convert_surfaces_missing_accession_refusal(tmp_path, capsys, preflight_stub):
+    """The library refuses a row missing a required accession; its message,
+    which names the offenders, reaches the operator verbatim."""
+    from qiita_control_plane.cli.user import main
+
+    folder = _seed_bcl_folder(tmp_path, "230101_A00123_0001_BHXYZ")
+    blob = preflight_stub(
+        raises=ValueError("missing required accession: illumina_sample_idx 3"),
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        main(
+            [
+                "submit-bcl-convert",
+                "--bcl-input-dir",
+                str(folder),
+                "--preflight-blob",
+                str(blob),
+                "--prep-protocol-idx",
+                "7",
+            ]
+        )
+    assert exc_info.value.code == 2
+    err = capsys.readouterr().err
+    assert "missing required accession: illumina_sample_idx 3" in err
+    assert "verify the file is a kl-run-preflight SQLite" not in err
+
+
 def test_submit_bcl_convert_dedups_repeated_accessions_in_lookup(
     monkeypatch, tmp_path, preflight_stub
 ):

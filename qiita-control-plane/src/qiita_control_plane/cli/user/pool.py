@@ -84,7 +84,7 @@ _READ_MASK_ACTION_VERSION = "1.0.0"
 class _PreflightRow(NamedTuple):
     """One illumina_sample row pulled from the kl-run-preflight SQLite.
 
-    Mirrors `run_preflight.get_illumina_sample_info`'s 4-tuple.
+    The fields of `run_preflight.PlatformSampleInfo` that ingest needs.
     `secondary_project_accessions` is empty for non-control samples; controls carry
     one entry per non-primary plate project, sorted by accession value.
 
@@ -122,21 +122,24 @@ def _read_preflight_rows(
 ) -> list[_PreflightRow]:
     """Load the preflight SQLite and return one `_PreflightRow` per illumina_sample row.
 
-    Errors that the operator can fix (an unloadable preflight, library raises on a
-    malformed row, a row missing biosample_accession or primary_project_accession)
-    raise via parser.error so the CLI surfaces a single stderr line and exits 2
-    before any network call.
+    Errors that the operator can fix (an unloadable preflight, or the library
+    refusing a row with a missing accession) raise via parser.error so the CLI
+    surfaces a single stderr line and exits 2 before any network call.
     """
     from run_preflight import get_illumina_sample_info  # noqa: PLC0415
 
     conn = _load_preflight_conn(preflight_blob, parser, flag="--preflight-blob")
     try:
         illumina_samples = get_illumina_sample_info(conn)
-    except (sqlite3.DatabaseError, ValueError) as exc:
+    except sqlite3.DatabaseError as exc:
         parser.error(
             f"--preflight-blob {preflight_blob}: preflight query failed ({exc});"
             " verify the file is a kl-run-preflight SQLite"
         )
+    except ValueError as exc:
+        # The library's refusal of a row with a missing accession names every
+        # offender; surface it verbatim.
+        parser.error(f"--preflight-blob {preflight_blob}: {exc}")
     finally:
         conn.close()
 
@@ -146,33 +149,15 @@ def _read_preflight_rows(
             " a bcl-convert submission needs at least one sample to demultiplex"
         )
 
-    parsed: list[_PreflightRow] = []
-    for info in illumina_samples:
-        illumina_sample_idx = info.sample_idx
-        biosample_accession = info.biosample_accession
-        primary = info.primary_bioproject_accession
-        secondary = info.secondary_bioproject_accessions
-        if not biosample_accession:
-            parser.error(
-                f"--preflight-blob {preflight_blob}: illumina_sample_idx"
-                f" {illumina_sample_idx} carries no biosample_accession; populate"
-                " upstream before re-submitting"
-            )
-        if not primary:
-            parser.error(
-                f"--preflight-blob {preflight_blob}: illumina_sample_idx"
-                f" {illumina_sample_idx} carries no primary_project_accession;"
-                " populate upstream before re-submitting"
-            )
-        parsed.append(
-            _PreflightRow(
-                illumina_sample_idx=int(illumina_sample_idx),
-                biosample_accession=biosample_accession,
-                primary_project_accession=primary,
-                secondary_project_accessions=list(secondary),
-            )
+    return [
+        _PreflightRow(
+            illumina_sample_idx=info.sample_idx,
+            biosample_accession=info.biosample_accession,
+            primary_project_accession=info.primary_bioproject_accession,
+            secondary_project_accessions=list(info.secondary_bioproject_accessions),
         )
-    return parsed
+        for info in illumina_samples
+    ]
 
 
 def _dedup_accessions(preflight_rows: list[Any]) -> tuple[list[str], list[str]]:
