@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -29,6 +31,7 @@ from qiita_common.models import (
     StepStatusWire,
     WorkTicketFailureStage,
 )
+from qiita_common.step_log import COMPLETED_KIND, capture_to, receipt, summarize, write_receipt
 
 from .. import step_progress
 from ..actions.library import (
@@ -56,6 +59,8 @@ from ._read_ingest import (
     SHARD_MAPPING_BINDING,
     _stage_shard_mapping,
 )
+
+_LOG = logging.getLogger(__name__)
 
 # =============================================================================
 # Restart-recovery output reconstruction
@@ -253,6 +258,14 @@ async def _reconstruct_plan_shards_outputs(
     return {ROUTER_PENDING_BINDING: True, SHARD_MAPPING_BINDING: mapping_path}
 
 
+def _closed(completed: int, no_data: int) -> None:
+    """Log and summarize how a finalize action closed its samples."""
+    _LOG.info(
+        "closed %d samples: %d completed, %d no data", completed + no_data, completed, no_data
+    )
+    summarize(completed=completed, no_data=no_data)
+
+
 async def _dispatch_action(
     pool: asyncpg.Pool,
     entry: WorkflowAction,
@@ -290,42 +303,58 @@ async def _dispatch_action(
         step_name=entry.name,
         compute_target=ComputeTarget.CONTROL_PLANE,
     )
-    try:
-        outputs = await _run_action_primitive(
-            pool,
-            entry,
-            bound,
-            workspace,
-            scope_target,
-            work_ticket_idx=work_ticket_idx,
-            signing_key=signing_key,
-            data_plane_url=data_plane_url,
-            dispatch_cb=dispatch_cb,
-            max_inflight=max_inflight,
-        )
-    except BackendFailure as exc:
-        await _best_effort_record_failed(
-            pool,
-            work_ticket_idx=work_ticket_idx,
-            step_index=step_index,
-            attempt=attempt,
-            failure_kind=exc.kind.value,
-            failure_reason=exc.reason[:2000],
-        )
-        raise
-    except Exception as exc:
-        # Plain Python from a LIBRARY primitive (untyped failure / bug). The
-        # outer run_workflow handler classifies it UNKNOWN_PERMANENT; record
-        # the same on the progress row, then re-raise unchanged.
-        await _best_effort_record_failed(
-            pool,
-            work_ticket_idx=work_ticket_idx,
-            step_index=step_index,
-            attempt=attempt,
-            failure_kind=FailureKind.UNKNOWN_PERMANENT.value,
-            failure_reason=f"{type(exc).__name__}: {exc!s}"[:2000],
-        )
-        raise
+    # No scheduler captures an in-process action's output, so its step log
+    # (`qiita_common.step_log`) is written here, to the files a SLURM step's
+    # land in.
+    logs_dir = step_logs_dir(workspace)
+    started = time.monotonic()
+    with capture_to(logs_dir, entry.name) as scope:
+        _LOG.info("started: %s on the control plane", entry.name)
+        try:
+            outputs = await _run_action_primitive(
+                pool,
+                entry,
+                bound,
+                workspace,
+                scope_target,
+                work_ticket_idx=work_ticket_idx,
+                signing_key=signing_key,
+                data_plane_url=data_plane_url,
+                dispatch_cb=dispatch_cb,
+                max_inflight=max_inflight,
+            )
+        except BackendFailure as exc:
+            _LOG.error("failed after %.0fs: %s", time.monotonic() - started, exc.reason)
+            write_receipt(logs_dir, receipt(exc.kind.value, entry.name, reason=exc.reason))
+            await _best_effort_record_failed(
+                pool,
+                work_ticket_idx=work_ticket_idx,
+                step_index=step_index,
+                attempt=attempt,
+                failure_kind=exc.kind.value,
+                failure_reason=exc.reason[:2000],
+            )
+            raise
+        except Exception as exc:
+            # Plain Python from a LIBRARY primitive (untyped failure / bug). The
+            # outer run_workflow handler classifies it UNKNOWN_PERMANENT; record
+            # the same on the progress row, then re-raise unchanged.
+            reason = f"{type(exc).__name__}: {exc!s}"
+            _LOG.error("failed after %.0fs: %s", time.monotonic() - started, reason)
+            write_receipt(
+                logs_dir, receipt(FailureKind.UNKNOWN_PERMANENT.value, entry.name, reason=reason)
+            )
+            await _best_effort_record_failed(
+                pool,
+                work_ticket_idx=work_ticket_idx,
+                step_index=step_index,
+                attempt=attempt,
+                failure_kind=FailureKind.UNKNOWN_PERMANENT.value,
+                failure_reason=reason[:2000],
+            )
+            raise
+        _LOG.info("completed in %.0fs", time.monotonic() - started)
+        write_receipt(logs_dir, receipt(COMPLETED_KIND, entry.name, summary=scope.summary))
     await step_progress.record_completed(
         pool, work_ticket_idx=work_ticket_idx, step_index=step_index, attempt=attempt
     )
@@ -396,13 +425,15 @@ async def _run_action_primitive(
         # from `bound` so a ticket whose action_context carries it picks up
         # genome-association writes for free.
         genome_map = bound.get("genome_map_path")
-        feature_map_path, _, _ = await LIBRARY[LibraryPrimitive.MINT_FEATURES](
+        feature_map_path, minted, reused = await LIBRARY[LibraryPrimitive.MINT_FEATURES](
             pool,
             manifest_path,
             workspace,
             genome_map_path=Path(genome_map) if genome_map else None,
             scope=f"work_ticket {work_ticket_idx}",
         )
+        _LOG.info("%d features: %d new, %d already known", minted + reused, minted, reused)
+        summarize(features_new=minted, features_known=reused)
         # YAML declares one output (typically "feature_map"); bind it.
         return {entry.outputs[0]: feature_map_path}
 
@@ -496,6 +527,13 @@ async def _run_action_primitive(
             raise RuntimeError(
                 f"register-files: staging_dir {staging_dir} contains no Parquet files"
             )
+        tables: dict[str, int] = {}
+        for table in files.values():
+            tables[table] = tables.get(table, 0) + 1
+        _LOG.info(
+            "registering %s",
+            ", ".join(f"{t} ({n} file{'s' if n > 1 else ''})" for t, n in tables.items()),
+        )
         await LIBRARY[LibraryPrimitive.REGISTER_FILES](
             staging_dir=str(staging_dir),
             files=files,
@@ -503,6 +541,7 @@ async def _run_action_primitive(
             signing_key=signing_key,
             data_plane_url=data_plane_url,
         )
+        summarize(tables=tables)
         return {}
 
     if entry.name == LibraryPrimitive.MINT_AMPLICON_IDENTIFIERS:
@@ -520,12 +559,14 @@ async def _run_action_primitive(
         )
         if originator_idx is None:
             raise RuntimeError(f"work_ticket {work_ticket_idx} not found")
-        await LIBRARY[LibraryPrimitive.MINT_AMPLICON_IDENTIFIERS](
+        samples = await LIBRARY[LibraryPrimitive.MINT_AMPLICON_IDENTIFIERS](
             pool,
             processing_idx=bound[PROCESSING_IDX_BINDING],
             asv_counts_path=Path(bound["asv_counts"]),
             created_by_idx=originator_idx,
         )
+        _LOG.info("identifiers for %d processed samples", samples)
+        summarize(samples=samples)
         return {}
 
     if entry.name == LibraryPrimitive.FINALIZE_AMPLICON_SAMPLE:
@@ -536,7 +577,7 @@ async def _run_action_primitive(
             raise RuntimeError(
                 f"finalize-amplicon-sample expects inputs [asv_counts]; got {entry.inputs!r}"
             )
-        await LIBRARY[LibraryPrimitive.FINALIZE_AMPLICON_SAMPLE](
+        completed, no_data = await LIBRARY[LibraryPrimitive.FINALIZE_AMPLICON_SAMPLE](
             pool,
             processing_idx=bound[PROCESSING_IDX_BINDING],
             prep_sample_idxs=await list_pool_prep_sample_idxs(
@@ -544,6 +585,7 @@ async def _run_action_primitive(
             ),
             asv_counts_path=Path(bound["asv_counts"]),
         )
+        _closed(completed, no_data)
         return {}
 
     if entry.name == LibraryPrimitive.FINALIZE_TAXONOMIC_PROFILE_SAMPLE:
@@ -563,13 +605,14 @@ async def _run_action_primitive(
         )
         if originator_idx is None:
             raise RuntimeError(f"work_ticket {work_ticket_idx} not found")
-        await LIBRARY[LibraryPrimitive.FINALIZE_TAXONOMIC_PROFILE_SAMPLE](
+        completed, no_data = await LIBRARY[LibraryPrimitive.FINALIZE_TAXONOMIC_PROFILE_SAMPLE](
             pool,
             processing_idx=bound[PROCESSING_IDX_BINDING],
             prep_sample_idxs=json.loads(Path(bound[PROFILE_SAMPLES_BINDING]).read_text()),
             profile_counts_path=Path(bound["profile_counts"]),
             created_by_idx=originator_idx,
         )
+        _closed(completed, no_data)
         return {}
 
     if entry.name == LibraryPrimitive.REGISTER_INDEX:

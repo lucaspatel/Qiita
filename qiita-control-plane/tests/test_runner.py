@@ -428,8 +428,9 @@ async def _run(
 
 
 async def test_success_path_advances_state_and_status(
-    postgres_pool, pending_work_ticket, library_spy, tmp_path
+    postgres_pool, pending_work_ticket, library_spy, tmp_path, caplog
 ):
+    caplog.set_level(logging.INFO)  # the services' level, `configure_logging`
     workspace_root = tmp_path / "ws"
     work_ticket_idx = pending_work_ticket["work_ticket_idx"]
 
@@ -459,6 +460,18 @@ async def test_success_path_advances_state_and_status(
         "write-membership",
         "register-files",
     ]
+
+    # An in-process action writes its step log where a SLURM step's lands: its
+    # own lines on stderr, one receipt on stdout.
+    logs = workspace_root / str(work_ticket_idx) / "register-files" / "attempt-0" / "logs"
+    stderr = (logs / "stderr").read_text()
+    assert "INFO register-files: started: register-files on the control plane" in stderr
+    assert "INFO register-files: completed in" in stderr
+    assert "write-membership" not in stderr
+    receipt = json.loads((logs / "stdout").read_text())
+    assert receipt["kind"] == "completed"
+    assert receipt["step_name"] == "register-files"
+    assert receipt["summary"]["tables"]
 
 
 async def test_rerun_advances_to_fresh_attempt_dir(

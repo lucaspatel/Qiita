@@ -19,14 +19,17 @@ chunk directory carrying each ASV's bytes so amplicon_load can store them).
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
+import time
 from pathlib import Path
 
 from pydantic import BaseModel, field_validator
 from qiita_common.backend_failure import StepNoData
 from qiita_common.chunking import canonical_sequence_hash_expr, sequence_split_expr
 from qiita_common.parquet import validate_parquet_path
+from qiita_common.step_log import listed, summarize
 
 from ..miint import (
     PARQUET_OPTS,
@@ -40,6 +43,8 @@ from ..miint import (
 from ..read_source import bind_step_reads
 
 YAML_STEP_NAME = "denoise"
+
+_LOG = logging.getLogger(__name__)
 
 # reserve headroom for miint's in-process co-consumers (SortMeRNA/MAFFT/deblur
 # link statically and share this process's memory), so DuckDB stays modest.
@@ -147,6 +152,28 @@ def _set_session_vars(conn, *, trim: int, sortmerna_ref: Path) -> None:
     conn.execute(f"SET VARIABLE miint_sortmerna_ref = '{safe_ref}';")
 
 
+def _kept(conn, table: str, stage: str, before: list[int]) -> list[int]:
+    """Log what a stage left in `table` (sample_id, sequence1, abundance), warn on
+    the samples it dropped from `before`, and return the samples it kept."""
+    per_sample = conn.execute(
+        f"SELECT sample_id::BIGINT, sum(abundance)::BIGINT FROM {table} GROUP BY 1 ORDER BY 1"
+    ).fetchall()
+    unique = conn.execute(f"SELECT count(DISTINCT sequence1) FROM {table}").fetchone()[0]
+    kept = [sample for sample, _ in per_sample]
+    _LOG.info(
+        "%s: %d unique sequences, %d reads, %d of %d samples",
+        stage,
+        unique,
+        sum(reads for _, reads in per_sample),
+        len(kept),
+        len(before),
+    )
+    dropped = sorted(set(before) - set(kept))
+    if dropped:
+        _LOG.warning("%s dropped %d samples: %s", stage, len(dropped), listed(dropped))
+    return kept
+
+
 async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     """denoise the pool's reads into ASVs; emit the manifest and counts.
     StepNoData when nothing survives."""
@@ -161,6 +188,15 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     chunks_dir = workspace / "asv_chunks"
     memory_gb = resolve_duckdb_memory_gb(
         _DUCKDB_FALLBACK_MEMORY_GB, threads=_DUCKDB_THREADS, reserve_gb=_DUCKDB_RESERVE_GB
+    )
+    _LOG.info(
+        "pool %d (run %d): trim %d, rRNA reference %s; duckdb %d GB, %d threads",
+        inputs.sequenced_pool_idx,
+        inputs.sequencing_run_idx,
+        inputs.trim,
+        inputs.sortmerna_ref.name,
+        memory_gb,
+        _DUCKDB_THREADS,
     )
 
     with (
@@ -184,19 +220,37 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 "SELECT prep_sample_idx AS sample_id, sequence_idx AS sequence_index, sequence1 "
                 f"FROM {reads_rel}"
             )
+            reads_in = conn.execute("SELECT count(*) FROM _inputs").fetchone()[0]
+            samples_in = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT DISTINCT sample_id::BIGINT FROM _inputs ORDER BY 1"
+                ).fetchall()
+            ]
+            _LOG.info("input: %d reads over %d samples", reads_in, len(samples_in))
+            started = time.monotonic()
             conn.execute(_FILTER_SQL)
-            if conn.execute("SELECT count(*) FROM alignable").fetchone()[0] == 0:
+            derep = _kept(conn, "derep", "trim and dereplicate (>=2 copies)", samples_in)
+            alignable = _kept(conn, "alignable", "16S filter (>=2 sequences)", derep)
+            _LOG.info("filtered in %.0fs", time.monotonic() - started)
+            if not alignable:
                 raise StepNoData(
                     step_name=YAML_STEP_NAME,
                     reason="no prep_sample retained >=2 unique 16S-matching dereplicated sequences",
                 )
+            started = time.monotonic()
             conn.execute(_CHIMERA_SQL)
-            if conn.execute("SELECT count(*) FROM alignable2").fetchone()[0] == 0:
+            nonchimeric = _kept(conn, "alignable2", "chimera filter", alignable)
+            _LOG.info("chimera filter took %.0fs", time.monotonic() - started)
+            if not nonchimeric:
                 raise StepNoData(
                     step_name=YAML_STEP_NAME,
                     reason="no non-chimeric prep_sample retained >=2 unique sequences",
                 )
+            started = time.monotonic()
             conn.execute(_DENOISE_SQL)
+            denoised = _kept(conn, "deblurred", "align and deblur", nonchimeric)
+            _LOG.info("aligned and deblurred in %.0fs", time.monotonic() - started)
 
             canon = canonical_sequence_hash_expr("sequence1")
             conn.execute(
@@ -205,7 +259,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 f"       SUM(abundance)::BIGINT AS count "
                 f"FROM deblurred GROUP BY prep_sample_idx, sequence_hash"
             )
-            if conn.execute("SELECT count(*) FROM asv").fetchone()[0] == 0:
+            if not denoised:
                 raise StepNoData(step_name=YAML_STEP_NAME, reason="no ASV survived denoising")
 
             # one representative sequence per canonical hash, so the ASV bytes are
@@ -221,6 +275,17 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
 
             _write_outputs(
                 conn, counts_out=counts_out, manifest_out=manifest_out, chunks_dir=chunks_dir
+            )
+            asvs, reads = conn.execute(
+                "SELECT count(DISTINCT sequence_hash), sum(count)::BIGINT FROM asv"
+            ).fetchone()
+            _LOG.info("wrote %d ASVs, %d reads over %d samples", asvs, reads, len(denoised))
+            summarize(
+                samples_in=len(samples_in),
+                samples=len(denoised),
+                reads_in=reads_in,
+                reads=reads,
+                asvs=asvs,
             )
 
     return {"asv_counts": counts_out, "manifest": manifest_out, "asv_chunks": chunks_dir}

@@ -32,6 +32,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 from qiita_common.backend_failure import StepNoData
 from qiita_common.parquet import validate_parquet_path
+from qiita_common.step_log import listed, summarize
 from qiita_common.taxonomic_profile_constants import TAXONOMIC_PROFILE_BASENAME
 
 from ..miint import (
@@ -46,9 +47,6 @@ from ..read_source import bind_step_reads
 YAML_STEP_NAME = "profile"
 
 _LOG = logging.getLogger(__name__)
-
-# How many sample idxs a log line or error names before it summarizes the rest.
-_NAMED_SAMPLES = 20
 
 # sylph's sketching runs in-process beside DuckDB and shares this job's memory; a
 # two-stage database keeps only its screen index resident, so the reserve is for
@@ -88,12 +86,6 @@ def _sql_str(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def _named(idxs: list[int]) -> str:
-    shown = ", ".join(map(str, idxs[:_NAMED_SAMPLES]))
-    rest = len(idxs) - _NAMED_SAMPLES
-    return shown + (f", … ({rest} more)" if rest > 0 else "")
-
-
 def _check_streamed(conn, reads_rel: str, samples: list[int]) -> None:
     """Log what the read stream returned against what the runner asked for, and
     fail loud when it returned no read for any of them.
@@ -119,14 +111,14 @@ def _check_streamed(conn, reads_rel: str, samples: list[int]) -> None:
         len(samples),
     )
     if missing:
-        _LOG.warning("requested samples with no streamed reads: %s", _named(missing))
+        _LOG.warning("requested samples with no streamed reads: %s", listed(missing))
     if extra:
-        _LOG.info("streamed samples not profiled (not metagenomic): %s", _named(extra))
+        _LOG.info("streamed samples not profiled (not metagenomic): %s", listed(extra))
     if not matched:
         raise RuntimeError(
             f"the read stream returned no read for any of the {len(samples)} samples"
-            f" bound for profiling ({_named(samples)}); it returned {total} reads over"
-            f" {len(streamed)} other samples ({_named(sorted(streamed))}). Every bound"
+            f" bound for profiling ({listed(samples)}); it returned {total} reads over"
+            f" {len(streamed)} other samples ({listed(sorted(streamed))}). Every bound"
             " sample has stored reads, so the stream or its scope is wrong"
         )
 
@@ -227,15 +219,17 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             ).fetchall()
         )
         unprofiled = sorted(set(samples) - set(per_sample))
+        genomes = conn.execute("SELECT count(DISTINCT genome_name) FROM profile").fetchone()[0]
         _LOG.info(
             "sylph reported %d genomes over %d samples (%d to %d per sample)",
-            conn.execute("SELECT count(DISTINCT genome_name) FROM profile").fetchone()[0],
+            genomes,
             len(per_sample),
             min(per_sample.values()),
             max(per_sample.values()),
         )
         if unprofiled:
-            _LOG.warning("samples with no genome reported: %s", _named(unprofiled))
+            _LOG.warning("samples with no genome reported: %s", listed(unprofiled))
+        summarize(samples=len(samples), samples_profiled=len(per_sample), genomes=genomes)
         # `genome_index` is left out: it is the genome's rank within the sample's
         # rows, not its offset in the database, so it identifies nothing.
         conn.execute(

@@ -17,12 +17,14 @@ sequence tables are replace-keyed on feature_idx.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import duckdb
 from pydantic import BaseModel
 from qiita_common.amplicon_constants import AMPLICON_MEMBERSHIP_BASENAME
 from qiita_common.parquet import validate_parquet_path
+from qiita_common.step_log import summarize
 
 from ..miint import (
     PARQUET_OPTS,
@@ -38,6 +40,8 @@ from ._feature_load import (
 )
 
 YAML_STEP_NAME = "amplicon_load"
+
+_LOG = logging.getLogger(__name__)
 
 # the join is light; DuckDB stays modest.
 _DUCKDB_MEMORY_GB = 4
@@ -96,7 +100,7 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             # gap check: every manifest hash must have a minted feature_idx. runs
             # first so the membership join below can never silently drop a count.
             build_feature_id_map(conn, inputs.manifest)
-            _write_amplicon_membership(
+            membership = _write_amplicon_membership(
                 conn,
                 asv_counts_path=inputs.asv_counts,
                 processing_idx=inputs.processing_idx,
@@ -104,6 +108,22 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             )
             write_feature_sequences(conn, sequences_out)
             write_feature_sequence_chunks(conn, inputs.asv_chunks, chunks_dir)
+            samples, features = conn.execute(
+                "SELECT count(DISTINCT prep_sample_idx), count(DISTINCT feature_idx)"
+                " FROM read_parquet(?)",
+                [membership_out],
+            ).fetchone()
+            sequences = conn.execute(
+                "SELECT count(*) FROM read_parquet(?)", [sequences_out]
+            ).fetchone()[0]
+            _LOG.info(
+                "staged %d membership rows (%d samples, %d features), %d ASV sequences",
+                membership,
+                samples,
+                features,
+                sequences,
+            )
+            summarize(membership_rows=membership, samples=samples, sequences=sequences)
         success = True
     finally:
         if not success:
@@ -122,13 +142,14 @@ def _write_amplicon_membership(
     asv_counts_path: Path,
     processing_idx: int,
     out: str,
-) -> None:
+) -> int:
     """write `amplicon_membership`: one row per (prep_sample, processing,
     feature_idx) with its count. joins asv_counts to the feature_map TEMP TABLE on
     sequence_hash and stamps processing_idx, sorted for pruning. the inner join
     drops nothing: `build_feature_id_map` already failed loud on any manifest hash
-    without a feature_idx, and asv_counts carries the same hash set."""
-    conn.execute(
+    without a feature_idx, and asv_counts carries the same hash set. returns the
+    rows written."""
+    return conn.execute(
         "COPY ("
         "  SELECT"
         "    c.prep_sample_idx,"
@@ -140,4 +161,4 @@ def _write_amplicon_membership(
         "  ORDER BY prep_sample_idx, feature_idx"
         f") TO '{out}' ({PARQUET_OPTS})",
         [str(asv_counts_path)],
-    )
+    ).fetchone()[0]

@@ -17,9 +17,10 @@ import asyncio
 from pathlib import Path
 
 from qiita_common.actions import STEP_LOGS_SUBDIR, STEP_OUTPUT_SUBDIR
-from qiita_common.backend_failure import BackendFailure, FailureKind
+from qiita_common.backend_failure import BackendFailure, FailureKind, StepNoData
 from qiita_common.log_tail import read_text_tail
 from qiita_common.models import StepStatus, WorkTicketFailureStage
+from qiita_common.step_log import COMPLETED_KIND, capture_to, receipt, write_receipt
 
 from ..backend import (
     ComputeBackend,
@@ -31,6 +32,7 @@ from ..backend import (
 )
 from ..jobs import flatten_native_inputs, run_native_job
 from ..slurm.contract import JOB_PARAMS_FILENAME, JobParams
+from ..slurm.launcher_failure import NO_DATA_MARKER_KIND
 from ..slurm.verify import parse_outputs_map, verify_container_output
 from .local_container import IMAGES_ENV, DockerRuntime
 
@@ -121,7 +123,19 @@ class LocalBackend(ComputeBackend):
             scope_target=scope_target,
             work_ticket_idx=work_ticket_idx,
         )
-        outputs = await run_native_job(module, raw_inputs, workspace, step_name=name)
+        # In-process, so nothing captures the job's output the way SLURM does:
+        # write its step log (`qiita_common.step_log`) to the same files.
+        logs_path = workspace / STEP_LOGS_SUBDIR
+        with capture_to(logs_path, name) as scope:
+            try:
+                outputs = await run_native_job(module, raw_inputs, workspace, step_name=name)
+            except StepNoData as exc:
+                write_receipt(logs_path, receipt(NO_DATA_MARKER_KIND, name, reason=exc.reason))
+                raise
+            except BackendFailure as exc:
+                write_receipt(logs_path, receipt(exc.kind.value, name, reason=exc.reason))
+                raise
+            write_receipt(logs_path, receipt(COMPLETED_KIND, name, summary=scope.summary))
         return LocalStepHandle(step_name=name, terminal_outputs=outputs)
 
     async def _run_container(
