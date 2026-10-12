@@ -3,7 +3,8 @@
   // database that method can read (a sylph method lists only profiling databases
   // with a registered sylph file), and submit one ticket per pool the group's
   // samples sit on. Each method + database is its own run, so its own branch of
-  // the lineage once submitted.
+  // the lineage once submitted. sylph's own default minimum ANI applies; the job
+  // takes `min_ani` already, for when the form offers it again.
   import { api, type LineageSample, type Reference } from '$lib/api';
   import Select from './Select.svelte';
 
@@ -39,7 +40,6 @@
   let databases = $state<Database[] | null>(null);
   let databasesError = $state('');
   let referenceIdx = $state<number | undefined>(undefined);
-  let minAni = $state('');
   let submitting = $state(false);
   let result = $state<{ ok: boolean; text: string } | null>(null);
 
@@ -89,10 +89,8 @@
     })();
   });
 
-  const aniValue = $derived(minAni.trim() === '' ? null : Number(minAni));
-  const aniValid = $derived(aniValue === null || (aniValue >= 0 && aniValue <= 1));
   const canSubmit = $derived(
-    !!method.action && referenceIdx != null && aniValid && pools.length > 0 && !submitting
+    !!method.action && referenceIdx != null && pools.length > 0 && !submitting
   );
 
   async function submit() {
@@ -106,10 +104,7 @@
         action_id: method.action.id,
         action_version: method.action.version,
         scope_target: { kind: 'sequenced_pool', sequenced_pool_idx: pool, sequencing_run_idx: run },
-        action_context: {
-          sylph_reference_idx: referenceIdx,
-          ...(aniValue !== null ? { min_ani: aniValue } : {})
-        }
+        action_context: { sylph_reference_idx: referenceIdx }
       });
       if (r.ok) done.push(`#${r.data.work_ticket_idx}`);
       else failed.push(`pool ${pool}: ${r.detail}`);
@@ -150,17 +145,6 @@
         {/each}
       </Select>
     {/if}
-  </label>
-  <label class="flex flex-col gap-1 text-xs text-gray-600">
-    Min ANI (0–1, optional)
-    <input
-      bind:value={minAni}
-      inputmode="decimal"
-      placeholder="sylph default"
-      class="w-32 rounded-md border px-3 py-1.5 text-sm text-gray-900 focus:ring-1 focus:outline-none {aniValid
-        ? 'border-gray-300 focus:border-teal-500 focus:ring-teal-500'
-        : 'border-red-400 focus:border-red-500 focus:ring-red-500'}"
-    />
   </label>
   <button
     type="button"

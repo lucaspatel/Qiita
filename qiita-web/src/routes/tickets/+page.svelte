@@ -1,7 +1,7 @@
 <script lang="ts">
   import { auth } from '$lib/auth.svelte';
   import { api, type WorkTicketSummary, type ApiResult, type WorkTicketListResponse } from '$lib/api';
-  import { scopeLabel, STATE_CLASS, ticketSubject, when } from '$lib/tickets';
+  import { actionLabel, scopeLabel, STATE_CLASS, ticketSubject, when } from '$lib/tickets';
   import { isAdminRole } from '$lib/roles';
   import PageHeading from '$lib/ui/PageHeading.svelte';
   import Card from '$lib/ui/Card.svelte';
@@ -18,6 +18,17 @@
   let everyone = $state(false);
 
   const tickets = $derived<WorkTicketSummary[]>(res?.ok ? res.data.tickets : []);
+
+  // Reference names, for a row whose context names a database.
+  let refNames = $state<Record<number, string>>({});
+  $effect(() => {
+    if (!auth.isSet) return;
+    api.references().then((r) => {
+      if (r.ok)
+        refNames = Object.fromEntries(r.data.map((x) => [x.reference_idx, `${x.name} ${x.version}`]));
+    });
+  });
+  const subject = (t: WorkTicketSummary) => ticketSubject(t, (i) => refNames[i] ?? null);
 
   async function load() {
     const seq = ++loadSeq;
@@ -107,11 +118,12 @@
                   <a href="/tickets/{t.work_ticket_idx}" class="text-teal-700 hover:underline">#{t.work_ticket_idx}</a>
                 </td>
                 <td class="px-3 py-2 whitespace-nowrap text-gray-700">
-                  {t.action_id}<span class="text-gray-400"> @{t.action_version}</span>
+                  {actionLabel(t.action_id)}
+                  <span class="block text-xs text-gray-400">{t.action_id} @{t.action_version}</span>
                 </td>
                 <td class="px-3 py-2 whitespace-nowrap text-gray-600">
-                  {#if ticketSubject(t)}
-                    <span class="font-medium text-gray-800">{ticketSubject(t)}</span>
+                  {#if subject(t)}
+                    <span class="font-medium text-gray-800">{subject(t)}</span>
                     <span class="block text-xs text-gray-400">{scopeLabel(t.scope_target)}</span>
                   {:else}{scopeLabel(t.scope_target)}{/if}
                 </td>
