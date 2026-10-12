@@ -5,7 +5,8 @@
   // abundant first, and only the columns in view render: the rest are spacer
   // cells sized to keep the scroll width true. Rows sort by the sample or by any
   // feature's value (the arrow in its header); tapping a header's name expands
-  // it to the whole species name or sequence, with a copy button.
+  // its column to the width of the whole species name or sequence (one line, for
+  // reading and copying), with a copy button; another tap collapses it.
   import { genomeLabel, type FeatureTable } from '$lib/featureTable';
 
   let {
@@ -85,12 +86,35 @@
   const clamped = $derived(Math.min(page, pageCount - 1));
   const paged = $derived(filtered.slice(clamped * PAGE, clamped * PAGE + PAGE));
 
-  // Horizontal windowing.
+  // Horizontal windowing. Columns are COL_W wide unless expanded, so each one's
+  // left edge is a prefix sum and the columns in view are found by bisection.
   const nCols = $derived(view.order.length);
   let scrollLeft = $state(0);
   let viewW = $state(0);
-  const first = $derived(Math.max(0, Math.floor(scrollLeft / COL_W) - 2));
-  const last = $derived(Math.min(nCols, Math.ceil((scrollLeft + viewW - ID_W) / COL_W) + 2));
+  // An 11px monospace glyph is ~6.7px; the padding and the sort arrow add ~44px.
+  const CHAR_W = 6.7;
+  const widthOf = (f: number) =>
+    expanded.has(f)
+      ? Math.max(COL_W, Math.ceil(Math.max(sequence(f).length, table.features[f].length) * CHAR_W) + 44)
+      : COL_W;
+  const edges = $derived.by(() => {
+    const out = new Float64Array(nCols + 1);
+    for (let k = 0; k < nCols; k++) out[k + 1] = out[k] + widthOf(view.order[k]);
+    return out;
+  });
+  // The column whose span holds pixel x (0..nCols).
+  function colAt(x: number): number {
+    let lo = 0;
+    let hi = nCols;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (edges[mid + 1] <= x) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+  const first = $derived(Math.max(0, colAt(scrollLeft) - 2));
+  const last = $derived(Math.min(nCols, colAt(scrollLeft + viewW - ID_W) + 3));
   const cols = $derived(Array.from({ length: Math.max(0, last - first) }, (_, k) => view.order[first + k]));
   // A column is headed by its ASV — the first bases, the whole sequence (and its
   // md5 feature id) on hover, and a click copies the sequence — or, for a profile,
@@ -146,7 +170,7 @@
     bind:clientWidth={viewW}
     onscroll={(e) => (scrollLeft = (e.currentTarget as HTMLElement).scrollLeft)}
   >
-    <table class="text-sm" style="table-layout:fixed;width:{ID_W + nCols * COL_W}px">
+    <table class="text-sm" style="table-layout:fixed;width:{ID_W + edges[nCols]}px">
       <thead class="bg-gray-50">
         <tr>
           <th
@@ -161,15 +185,15 @@
               >{idHeader}<span class="text-gray-400">{sortKey === 'sample' ? (sortDir === 'asc' ? '↑' : '↓') : ''}</span></button
             >
           </th>
-          {#if first > 0}<th style="width:{first * COL_W}px"></th>{/if}
+          {#if first > 0}<th style="width:{edges[first]}px"></th>{/if}
           {#each cols as f (f)}
             {@const open = expanded.has(f)}
-            <th class="p-0 text-left align-top" style="width:{COL_W}px">
+            <th class="p-0 text-left align-top" style="width:{widthOf(f)}px">
               <div class="flex items-start">
                 <button
                   type="button"
                   class="min-w-0 flex-1 px-2 py-2 text-left font-mono text-[11px] font-normal {open
-                    ? 'break-all whitespace-normal text-gray-800'
+                    ? 'whitespace-nowrap text-gray-800 select-text'
                     : 'truncate whitespace-nowrap text-gray-500 hover:text-gray-800'}"
                   title={open ? undefined : headerTitle(f)}
                   aria-expanded={open}
@@ -186,7 +210,7 @@
                 >
               </div>
               {#if open}
-                <div class="px-2 pb-2 text-[10px] font-normal break-all whitespace-normal text-gray-400">
+                <div class="px-2 pb-2 text-[10px] font-normal whitespace-nowrap text-gray-400">
                   {#if !table.sequenceOf.has(table.features[f])}<div class="font-mono">{table.features[f]}</div>{/if}
                   <button
                     type="button"
@@ -202,7 +226,7 @@
               {/if}
             </th>
           {/each}
-          {#if last < nCols}<th style="width:{(nCols - last) * COL_W}px"></th>{/if}
+          {#if last < nCols}<th style="width:{edges[nCols] - edges[last]}px"></th>{/if}
         </tr>
       </thead>
       <tbody class="divide-y divide-gray-100">
@@ -214,7 +238,12 @@
             {#if first > 0}<td></td>{/if}
             {#each cols as f (f)}
               {@const v = view.bySample[r.s].get(f)}
-              <td class="px-2 py-1.5 text-right tabular-nums {v ? 'text-gray-700' : 'text-gray-300'}">
+              <!-- An expanded column is wide; its values sit under the name's start. -->
+              <td
+                class="px-2 py-1.5 tabular-nums {expanded.has(f) ? 'text-left' : 'text-right'} {v
+                  ? 'text-gray-700'
+                  : 'text-gray-300'}"
+              >
                 {v ? cell(v) : '-'}
               </td>
             {/each}
