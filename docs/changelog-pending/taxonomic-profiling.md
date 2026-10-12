@@ -10,7 +10,9 @@
   registered database (`sylph_reference_idx`, optional `min_ani` as a fraction), writing
   DuckLake `taxonomic_profile` (relative abundances in percent, ANI as a fraction, effective
   coverage, per sample and genome). Only the pool's short- and long-read metagenomic
-  samples are profiled; a pool with none is refused. The run identity hashes the database
+  samples with stored reads are profiled; a pool with none is refused. A read stream that
+  returns none of those samples fails the step instead of ending as no data, and the step
+  log records what was requested, what streamed, and per-stage timings. The run identity hashes the database
   reference, its file's sha256 and the threshold, so each method and database is its own
   run. A closing action records each sample in `qiita.taxonomic_profile_sample` and mints
   its QM. Reads are not host-filtered yet.
@@ -27,3 +29,12 @@
   percentages.
 - **A run's feature table node appears once a sample completed**, so a run still pending
   no longer offers a table there is nothing in.
+
+### Fixed
+
+- **Closing a run's per-sample status touches only the ticket's own samples.** Amplicon
+  and taxonomic-profile runs are keyed on their parameters, not the pool, so two pools
+  processed alike share a run; closing one ticket, or ending it as no data, used to mark
+  the other pool's still-running samples `no_data`.
+- **Native jobs' log lines reach the step log.** The job launcher sends INFO-and-above
+  logging to stderr, which SLURM captures and the step-log route serves.

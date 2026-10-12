@@ -25,6 +25,8 @@ Outputs:
 from __future__ import annotations
 
 import json
+import logging
+import time
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -42,6 +44,11 @@ from ..miint import (
 from ..read_source import bind_step_reads
 
 YAML_STEP_NAME = "profile"
+
+_LOG = logging.getLogger(__name__)
+
+# How many sample idxs a log line or error names before it summarizes the rest.
+_NAMED_SAMPLES = 20
 
 # sylph's sketching runs in-process beside DuckDB and shares this job's memory; a
 # two-stage database keeps only its screen index resident, so the reserve is for
@@ -79,6 +86,49 @@ class Inputs(BaseModel):
 
 def _sql_str(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
+
+
+def _named(idxs: list[int]) -> str:
+    shown = ", ".join(map(str, idxs[:_NAMED_SAMPLES]))
+    rest = len(idxs) - _NAMED_SAMPLES
+    return shown + (f", … ({rest} more)" if rest > 0 else "")
+
+
+def _check_streamed(conn, reads_rel: str, samples: list[int]) -> None:
+    """Log what the read stream returned against what the runner asked for, and
+    fail loud when it returned no read for any of them.
+
+    The runner binds only samples with stored reads, so an empty result here is a
+    fault in the stream or its scope, not an empty pool: ending as no_data would
+    close every sample as having nothing to profile. A sample missing while others
+    streamed is logged and closes 'no_data' at the finalize action."""
+    streamed = dict(
+        conn.execute(
+            f"SELECT prep_sample_idx, count(*) FROM {reads_rel} GROUP BY 1 ORDER BY 1"
+        ).fetchall()
+    )
+    total = sum(streamed.values())
+    matched = sorted(set(streamed) & set(samples))
+    missing = sorted(set(samples) - set(streamed))
+    extra = sorted(set(streamed) - set(samples))
+    _LOG.info(
+        "read stream: %d reads over %d samples; %d of %d requested samples streamed",
+        total,
+        len(streamed),
+        len(matched),
+        len(samples),
+    )
+    if missing:
+        _LOG.warning("requested samples with no streamed reads: %s", _named(missing))
+    if extra:
+        _LOG.info("streamed samples not profiled (not metagenomic): %s", _named(extra))
+    if not matched:
+        raise RuntimeError(
+            f"the read stream returned no read for any of the {len(samples)} samples"
+            f" bound for profiling ({_named(samples)}); it returned {total} reads over"
+            f" {len(streamed)} other samples ({_named(sorted(streamed))}). Every bound"
+            " sample has stored reads, so the stream or its scope is wrong"
+        )
 
 
 def _check_units(conn, sample_col: str) -> None:
@@ -122,6 +172,18 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         _DUCKDB_FALLBACK_MEMORY_GB, threads=_DUCKDB_THREADS, reserve_gb=_DUCKDB_RESERVE_GB
     )
     options = f", min_ani := {float(inputs.min_ani)}" if inputs.min_ani is not None else ""
+    _LOG.info(
+        "profiling %d samples of pool %d (run %d) against %s (%d bytes); min_ani %s;"
+        " duckdb %d GB, %d threads",
+        len(samples),
+        inputs.sequenced_pool_idx,
+        inputs.sequencing_run_idx,
+        database,
+        database.stat().st_size,
+        "sylph default" if inputs.min_ani is None else inputs.min_ani,
+        memory_gb,
+        _DUCKDB_THREADS,
+    )
 
     with duckdb_tmp_dir(workspace) as duckdb_tmp, open_miint_conn() as conn:
         apply_duckdb_settings(conn, duckdb_tmp, memory_gb=memory_gb, threads=_DUCKDB_THREADS)
@@ -131,21 +193,22 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
             work_ticket_idx=inputs.work_ticket_idx,
             workspace=duckdb_tmp,
         ) as reads_rel:
+            started = time.monotonic()
+            _check_streamed(conn, reads_rel, samples)
             conn.execute(
                 f"CREATE TABLE {_READS_TABLE} AS"
                 " SELECT prep_sample_idx, read_id::VARCHAR AS read_id,"
                 "        sequence1::VARCHAR AS sequence1, sequence2::VARCHAR AS sequence2"
                 f" FROM {reads_rel} WHERE prep_sample_idx IN ({', '.join(map(str, samples))})"
             )
-        if conn.execute(f"SELECT count(*) FROM {_READS_TABLE}").fetchone()[0] == 0:
-            raise StepNoData(
-                step_name=YAML_STEP_NAME, reason="the pool's metagenomic samples have no reads"
-            )
+        _LOG.info("staged the reads in %.0fs", time.monotonic() - started)
+        started = time.monotonic()
         conn.execute(
             "CREATE TABLE profile AS SELECT * FROM sylph_profile("
             f"{_sql_str(_READS_TABLE)}, {_sql_str(str(database))},"
             f" sample_id := 'prep_sample_idx'{options})"
         )
+        _LOG.info("sylph_profile finished in %.0fs", time.monotonic() - started)
         # The per-sample branch prepends the partition column. miint documents it
         # as the named column in one place and as `sample_id` in another; the
         # staged build names it `sample_id`.
@@ -158,6 +221,21 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
                 step_name=YAML_STEP_NAME, reason="sylph found no database genome in any sample"
             )
         _check_units(conn, sample_col)
+        per_sample = dict(
+            conn.execute(
+                f"SELECT {sample_col}::BIGINT, count(DISTINCT genome_name) FROM profile GROUP BY 1"
+            ).fetchall()
+        )
+        unprofiled = sorted(set(samples) - set(per_sample))
+        _LOG.info(
+            "sylph reported %d genomes over %d samples (%d to %d per sample)",
+            conn.execute("SELECT count(DISTINCT genome_name) FROM profile").fetchone()[0],
+            len(per_sample),
+            min(per_sample.values()),
+            max(per_sample.values()),
+        )
+        if unprofiled:
+            _LOG.warning("samples with no genome reported: %s", _named(unprofiled))
         # `genome_index` is left out: it is the genome's rank within the sample's
         # rows, not its offset in the database, so it identifies nothing.
         conn.execute(

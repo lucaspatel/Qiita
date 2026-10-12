@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -159,6 +160,15 @@ def main(argv: list[str] | None = None) -> int:
         help="short job name (the module path with NATIVE_MODULE_PREFIX stripped)",
     )
     args = parser.parse_args(argv)
+    # A job's own log lines are its step log: stderr is what SLURM captures and the
+    # step-log route serves. The structured outcome lines below are JSON on their
+    # own line, which `slurm.launcher_failure` picks out of the surrounding text.
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stderr,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
 
     input_path = Path(os.environ["QIITA_INPUT_PATH"])
     output_path = Path(os.environ["QIITA_OUTPUT_PATH"])

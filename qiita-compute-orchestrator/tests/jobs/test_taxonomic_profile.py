@@ -8,7 +8,6 @@ import random
 import duckdb
 import pytest
 from pydantic import ValidationError
-from qiita_common.backend_failure import StepNoData
 
 from qiita_compute_orchestrator.jobs.taxonomic_profile import Inputs, execute
 from qiita_compute_orchestrator.miint import open_miint_conn
@@ -83,7 +82,8 @@ def _inputs(tmp_path, reads, syl2db, samples, **kw):
     )
 
 
-async def test_profiles_only_the_bound_samples_in_percent(genomes, syl2db, tmp_path):
+async def test_profiles_only_the_bound_samples_in_percent(genomes, syl2db, tmp_path, caplog):
+    caplog.set_level("INFO", logger="qiita_compute_orchestrator.jobs.taxonomic_profile")
     reads = _reads(
         genomes,
         tmp_path,
@@ -112,11 +112,26 @@ async def test_profiles_only_the_bound_samples_in_percent(genomes, syl2db, tmp_p
     assert totals == pytest.approx({101: 100.0, 102: 100.0})
     assert rows[0][3] == pytest.approx(80, abs=5)
     assert counts == [(101, 2), (102, 1)]
+    assert "90000 reads over 3 samples; 2 of 2 requested samples streamed" in caplog.text
+    assert "not profiled (not metagenomic): 103" in caplog.text
 
 
-async def test_no_reads_for_the_bound_samples_is_no_data(genomes, syl2db, tmp_path):
+async def test_a_bound_sample_missing_from_the_stream_is_logged(genomes, syl2db, tmp_path, caplog):
     reads = _reads(genomes, tmp_path, {101: {"G000": 1.0}})
-    with pytest.raises(StepNoData, match="no reads"):
+    out = await execute(_inputs(tmp_path, reads, syl2db, [101, 555]), tmp_path / "ws")
+    with duckdb.connect() as con:
+        counts = con.execute(
+            "SELECT * FROM read_parquet(?)", [str(out["profile_counts"])]
+        ).fetchall()
+    assert counts == [(101, 1)]
+    assert "requested samples with no streamed reads: 555" in caplog.text
+
+
+async def test_a_stream_with_none_of_the_bound_samples_fails(genomes, syl2db, tmp_path):
+    """Every bound sample has stored reads, so an empty result is a fault in the
+    stream, not a no-data outcome."""
+    reads = _reads(genomes, tmp_path, {101: {"G000": 1.0}})
+    with pytest.raises(RuntimeError, match=r"no read for any of the 1 samples .*\(555\)"):
         await execute(_inputs(tmp_path, reads, syl2db, [555]), tmp_path / "ws")
 
 
