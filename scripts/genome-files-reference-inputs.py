@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import os
 import re
 import sys
 from multiprocessing import Pool
@@ -71,11 +72,14 @@ def main() -> int:
     p.add_argument("--jobs", type=int, default=16)
     args = p.parse_args()
 
-    paths = [
-        str(Path(line.strip()).resolve())
+    # Absolute, not resolved: a symlinked genome keeps the path it was listed under,
+    # and resolving costs a filesystem round trip per genome on a network mount.
+    listed = [
+        line.strip()
         for line in args.files.read_text().splitlines()
         if line.strip() and not line.startswith("#")
-    ][: args.limit]
+    ]
+    paths = [os.path.abspath(p) for p in listed[: args.limit]]
     by_genome: dict[str, str] = {}
     for path in paths:
         gid = genome_id(path)
