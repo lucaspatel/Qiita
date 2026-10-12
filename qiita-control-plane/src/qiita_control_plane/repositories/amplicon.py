@@ -41,11 +41,21 @@ async def create_amplicon_samples_pending(
 
 
 async def close_amplicon_samples(
-    conn: asyncpg.Connection, *, processing_idx: int, asv_counts: dict[int, int]
+    conn: asyncpg.Connection,
+    *,
+    processing_idx: int,
+    prep_sample_idxs: list[int],
+    asv_counts: dict[int, int],
 ) -> tuple[int, int]:
-    """Close the run's gate: 'completed' with its count for every sample in
-    `asv_counts` (prep_sample_idx -> ASVs counted, each > 0), 'no_data' for every
-    other row of the run still 'pending'. Returns (completed, no_data) written.
+    """Close one ticket's share of the run's gate: 'completed' with its count for
+    every sample in `asv_counts` (prep_sample_idx -> ASVs counted, each > 0),
+    'no_data' for every other still-'pending' row among `prep_sample_idxs`, the
+    ticket's pool population. Returns (completed, no_data) written.
+
+    Scoped to the pool because the run identity is the denoise knobs, not the
+    pool: two pools denoised alike share a processing_idx, and closing every
+    pending row of it would mark the other pool's samples 'no_data' while its
+    ticket is still running.
 
     An upsert for the counted samples, so a sample with no pending row (the run
     reached it some other way) is still recorded."""
@@ -71,6 +81,7 @@ async def close_amplicon_samples(
         "WITH written AS ("
         "  UPDATE qiita.amplicon_sample SET state = $3"
         "   WHERE processing_idx = $1 AND state = $2"
+        "     AND prep_sample_idx = ANY($5::bigint[])"
         "     AND prep_sample_idx <> ALL($4::bigint[])"
         "  RETURNING 1"
         ") SELECT count(*) FROM written",
@@ -78,5 +89,6 @@ async def close_amplicon_samples(
         AMPLICON_SAMPLE_PENDING,
         AMPLICON_SAMPLE_NO_DATA,
         list(asv_counts),
+        prep_sample_idxs,
     )
     return completed, no_data

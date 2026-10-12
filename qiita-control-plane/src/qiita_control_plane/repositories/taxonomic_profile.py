@@ -22,15 +22,20 @@ TAXONOMIC_PROFILE_SAMPLE_NO_DATA = "no_data"
 async def list_pool_metagenomic_prep_sample_idxs(
     conn: asyncpg.Connection | asyncpg.Pool, pool_idx: int
 ) -> list[int]:
-    """The pool's live metagenomic prep_samples, ascending: what a profiling run of
-    the pool covers. An ENA study's runs share one pool whatever their library, so
-    its amplicon samples are left out here rather than refused."""
+    """The pool's live metagenomic prep_samples with stored reads, ascending: what a
+    profiling run of the pool covers. An ENA study's runs share one pool whatever
+    their library, so its amplicon samples are left out here rather than refused,
+    and so are runs whose download failed: a sample with no `sequence_range` has
+    nothing for the read stream to return (`fetch_pool_members` drops it too), so
+    the profiler expects reads for every sample listed here."""
     rows = await conn.fetch(
         "SELECT ps.idx FROM qiita.sequenced_sample ss"
         "  JOIN qiita.prep_sample ps ON ps.idx = ss.prep_sample_idx"
         "  JOIN qiita.prep_protocol pp ON pp.idx = ps.prep_protocol_idx"
         " WHERE ss.sequenced_pool_idx = $1 AND ps.retired IS NOT TRUE"
         "   AND ss.ena_status IS NULL AND pp.name = ANY($2::text[])"
+        "   AND EXISTS (SELECT 1 FROM qiita.sequence_range sr"
+        "                WHERE sr.prep_sample_idx = ss.prep_sample_idx)"
         " ORDER BY ps.idx",
         pool_idx,
         list(METAGENOMIC_PREP_PROTOCOLS),
@@ -60,11 +65,21 @@ async def create_taxonomic_profile_samples_pending(
 
 
 async def close_taxonomic_profile_samples(
-    conn: asyncpg.Connection, *, processing_idx: int, genome_counts: dict[int, int]
+    conn: asyncpg.Connection,
+    *,
+    processing_idx: int,
+    prep_sample_idxs: list[int],
+    genome_counts: dict[int, int],
 ) -> tuple[int, int]:
-    """Close the run's gate: 'completed' with its count for every sample in
-    `genome_counts` (prep_sample_idx -> genomes reported, each > 0), 'no_data' for
-    every other row of the run still 'pending'. Returns (completed, no_data)."""
+    """Close one ticket's share of the run's gate: 'completed' with its count for
+    every sample in `genome_counts` (prep_sample_idx -> genomes reported, each > 0),
+    'no_data' for every other still-'pending' row among `prep_sample_idxs`, the
+    samples the ticket profiled. Returns (completed, no_data).
+
+    Scoped to the ticket's samples because the run identity is the profiler knobs,
+    not the pool: two pools profiled against one database share a processing_idx,
+    and closing every pending row of it would mark the other pool's samples
+    'no_data' while its ticket is still running."""
     require_transaction(conn)
     if any(n <= 0 for n in genome_counts.values()):
         raise ValueError("genome_counts must name only samples with at least one genome")
@@ -87,6 +102,7 @@ async def close_taxonomic_profile_samples(
         "WITH written AS ("
         "  UPDATE qiita.taxonomic_profile_sample SET state = $3"
         "   WHERE processing_idx = $1 AND state = $2"
+        "     AND prep_sample_idx = ANY($5::bigint[])"
         "     AND prep_sample_idx <> ALL($4::bigint[])"
         "  RETURNING 1"
         ") SELECT count(*) FROM written",
@@ -94,5 +110,6 @@ async def close_taxonomic_profile_samples(
         TAXONOMIC_PROFILE_SAMPLE_PENDING,
         TAXONOMIC_PROFILE_SAMPLE_NO_DATA,
         list(genome_counts),
+        prep_sample_idxs,
     )
     return completed, no_data

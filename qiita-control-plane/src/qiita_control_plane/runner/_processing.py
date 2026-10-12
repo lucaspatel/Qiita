@@ -236,15 +236,18 @@ async def _create_taxonomic_profile_gate_pending(
 
 
 async def _record_taxonomic_profile_gate_no_data(
-    pool: asyncpg.Pool, *, processing_idx: int
+    pool: asyncpg.Pool, *, processing_idx: int, prep_sample_idxs: list[int]
 ) -> None:
-    """Close this run's still-'pending' taxonomic_profile_sample rows at 'no_data'.
+    """Close this ticket's still-'pending' taxonomic_profile_sample rows, the
+    samples it profiled (`prep_sample_idxs`), at 'no_data'.
 
     Run from the StepNoData handler: the profiling job raises it when the profiler
     reported no genome in any sample, which abandons the closing action, so
     without this the rows would sit 'pending' for a run that has ended."""
     async with pool.acquire() as conn, conn.transaction():
-        await close_taxonomic_profile_samples(conn, processing_idx=processing_idx, genome_counts={})
+        await close_taxonomic_profile_samples(
+            conn, processing_idx=processing_idx, prep_sample_idxs=prep_sample_idxs, genome_counts={}
+        )
 
 
 async def _create_assembly_gate_pending(

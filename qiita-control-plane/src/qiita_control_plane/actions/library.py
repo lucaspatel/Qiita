@@ -3273,11 +3273,13 @@ async def finalize_amplicon_sample(
     pool: asyncpg.Pool,
     *,
     processing_idx: int,
+    prep_sample_idxs: list[int],
     asv_counts_path: Path,
 ) -> tuple[int, int]:
-    """Close an amplicon run's qiita.amplicon_sample gate from denoise's
-    `asv_counts` (one row per counted (prep_sample, ASV)), and return how many
-    samples were written (completed, no_data).
+    """Close an amplicon ticket's share of the qiita.amplicon_sample gate from
+    denoise's `asv_counts` (one row per counted (prep_sample, ASV)), and return how
+    many samples were written (completed, no_data). `prep_sample_idxs` is the
+    ticket's pool population, the rows `close_amplicon_samples` may close.
 
     Runs after register-files, so 'completed' never names a sample whose ASVs did
     not land. Read from the denoise output for the reason on
@@ -3291,20 +3293,27 @@ async def finalize_amplicon_sample(
             ).fetchall()
         )
     async with pool.acquire() as conn, conn.transaction():
-        return await close_amplicon_samples(conn, processing_idx=processing_idx, asv_counts=counts)
+        return await close_amplicon_samples(
+            conn,
+            processing_idx=processing_idx,
+            prep_sample_idxs=prep_sample_idxs,
+            asv_counts=counts,
+        )
 
 
 async def finalize_taxonomic_profile_sample(
     pool: asyncpg.Pool,
     *,
     processing_idx: int,
+    prep_sample_idxs: list[int],
     profile_counts_path: Path,
     created_by_idx: int,
 ) -> tuple[int, int]:
-    """Close a taxonomic-profile run's gate from the job's `profile_counts`
-    (prep_sample_idx, genome_count — one row per sample it reported genomes for),
-    and mint those samples' QM identifiers, in one transaction. Returns
-    (completed, no_data).
+    """Close a taxonomic-profile ticket's share of the gate from the job's
+    `profile_counts` (prep_sample_idx, genome_count — one row per sample it
+    reported genomes for), and mint those samples' QM identifiers, in one
+    transaction. `prep_sample_idxs` is the samples the ticket profiled, the rows
+    `close_taxonomic_profile_samples` may close. Returns (completed, no_data).
 
     One action rather than amplicon's two: both write from the same sample set and
     must agree. Runs after register-files, so neither names a sample whose profile
@@ -3326,7 +3335,10 @@ async def finalize_taxonomic_profile_sample(
                 created_by_idx=created_by_idx,
             )
         return await close_taxonomic_profile_samples(
-            conn, processing_idx=processing_idx, genome_counts=counts
+            conn,
+            processing_idx=processing_idx,
+            prep_sample_idxs=prep_sample_idxs,
+            genome_counts=counts,
         )
 
 

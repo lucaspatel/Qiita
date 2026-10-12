@@ -117,6 +117,7 @@ async def test_finalize_completes_counted_samples_and_closes_the_rest(postgres_p
     written = await finalize_amplicon_sample(
         postgres_pool,
         processing_idx=run["processing_idx"],
+        prep_sample_idxs=run["prep_sample_idxs"],
         asv_counts_path=_write_asv_counts(tmp_path, {a: 2, c: 5}),
     )
     assert written == (2, 1)
@@ -133,7 +134,9 @@ async def test_a_rerun_reopens_no_data_but_keeps_completed(postgres_pool, run):
         await create_amplicon_samples_pending(
             conn, processing_idx=run["processing_idx"], prep_sample_idxs=[a, b]
         )
-        await close_amplicon_samples(conn, processing_idx=run["processing_idx"], asv_counts={a: 4})
+        await close_amplicon_samples(
+            conn, processing_idx=run["processing_idx"], prep_sample_idxs=[a, b], asv_counts={a: 4}
+        )
         await create_amplicon_samples_pending(
             conn, processing_idx=run["processing_idx"], prep_sample_idxs=[a, b]
         )
@@ -148,5 +151,24 @@ async def test_a_zero_count_is_refused(postgres_pool, run):
     async with postgres_pool.acquire() as conn, conn.transaction():
         with pytest.raises(ValueError, match="at least one ASV"):
             await close_amplicon_samples(
-                conn, processing_idx=run["processing_idx"], asv_counts={a: 0}
+                conn, processing_idx=run["processing_idx"], prep_sample_idxs=[a], asv_counts={a: 0}
             )
+
+
+async def test_closing_leaves_another_pools_pending_rows_alone(postgres_pool, run):
+    """Two pools denoised alike share the processing_idx; one ticket's close must
+    not mark the other pool's still-running samples 'no_data'."""
+    a, b, other = run["prep_sample_idxs"]
+    async with postgres_pool.acquire() as conn, conn.transaction():
+        await create_amplicon_samples_pending(
+            conn, processing_idx=run["processing_idx"], prep_sample_idxs=[a, b, other]
+        )
+        written = await close_amplicon_samples(
+            conn, processing_idx=run["processing_idx"], prep_sample_idxs=[a, b], asv_counts={a: 1}
+        )
+    assert written == (1, 1)
+    assert await _states(postgres_pool, run["processing_idx"]) == {
+        a: ("completed", 1),
+        b: ("no_data", None),
+        other: ("pending", None),
+    }

@@ -37,6 +37,7 @@ from ..actions.library import (
     MINT_FEATURES_OUTPUT_BASENAME,
 )
 from ..fanout_dispatch import DEFAULT_FANOUT_MAX_INFLIGHT
+from ..repositories.alignment_definition import list_pool_prep_sample_idxs
 from ..repositories.assembly import AssemblySampleInvalidated
 from ..repositories.reference_membership import count_reference_shards
 from ..shard_orchestration import (
@@ -49,6 +50,7 @@ from ..shard_orchestration import (
 from ..workspace import step_attempt_dir, step_logs_dir, step_output_dir
 from ._dispatch import _best_effort_record_failed, _result_with_infra_retry
 from ._mask import MASK_IDX_BINDING
+from ._processing import PROFILE_SAMPLES_BINDING
 from ._read_ingest import (
     ROUTER_PENDING_BINDING,
     SHARD_MAPPING_BINDING,
@@ -529,7 +531,7 @@ async def _run_action_primitive(
     if entry.name == LibraryPrimitive.FINALIZE_AMPLICON_SAMPLE:
         # After register-files; processing_idx from `bound`, the run identity the
         # runner minted (and materialized the pool's 'pending' rows under) before
-        # the loop.
+        # the loop. Closes only this pool's rows: the identity spans pools.
         if set(entry.inputs) != {"asv_counts"}:
             raise RuntimeError(
                 f"finalize-amplicon-sample expects inputs [asv_counts]; got {entry.inputs!r}"
@@ -537,6 +539,9 @@ async def _run_action_primitive(
         await LIBRARY[LibraryPrimitive.FINALIZE_AMPLICON_SAMPLE](
             pool,
             processing_idx=bound[PROCESSING_IDX_BINDING],
+            prep_sample_idxs=await list_pool_prep_sample_idxs(
+                pool, scope_target["sequenced_pool_idx"]
+            ),
             asv_counts_path=Path(bound["asv_counts"]),
         )
         return {}
@@ -544,7 +549,9 @@ async def _run_action_primitive(
     if entry.name == LibraryPrimitive.FINALIZE_TAXONOMIC_PROFILE_SAMPLE:
         # After register-files; processing_idx from `bound`, the run identity the
         # runner minted (and materialized the pool's 'pending' rows under) before
-        # the loop. The identifiers are minted for the ticket's originator.
+        # the loop. The identifiers are minted for the ticket's originator, and
+        # only the samples the runner bound for this ticket are closed: the
+        # identity spans pools.
         if set(entry.inputs) != {"profile_counts"}:
             raise RuntimeError(
                 "finalize-taxonomic-profile-sample expects inputs [profile_counts];"
@@ -559,6 +566,7 @@ async def _run_action_primitive(
         await LIBRARY[LibraryPrimitive.FINALIZE_TAXONOMIC_PROFILE_SAMPLE](
             pool,
             processing_idx=bound[PROCESSING_IDX_BINDING],
+            prep_sample_idxs=json.loads(Path(bound[PROFILE_SAMPLES_BINDING]).read_text()),
             profile_counts_path=Path(bound["profile_counts"]),
             created_by_idx=originator_idx,
         )

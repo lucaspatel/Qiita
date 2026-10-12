@@ -241,6 +241,9 @@ async def run_workflow(
     # `processing_idx` there; before the mint overwrites it that value is another
     # run's identity, or none at all.
     minted_processing_idx: int | None = None
+    # The samples a taxonomic-profile ticket covers, bound before the mint; the
+    # StepNoData handler closes exactly these.
+    profile_samples: list[int] | None = None
 
     try:
         # Everything from the action fetch through the step loop is INSIDE the
@@ -407,7 +410,6 @@ async def run_workflow(
         # A pool with none is refused here, before a processing_idx is minted.
         if _workflow_declares_input(action.steps, SYLPH_DATABASE_BINDING):
             bound.update(await _resolve_sylph_database(pool, action_context=bound))
-        profile_samples: list[int] | None = None
         if _workflow_writes_taxonomic_profile_gate(action.steps):
             if scope_target["kind"] != ScopeTargetKind.SEQUENCED_POOL.value:
                 raise _submission_bad_input(
@@ -421,7 +423,7 @@ async def run_workflow(
             if not profile_samples:
                 raise _submission_bad_input(
                     f"sequenced_pool {scope_target['sequenced_pool_idx']} has no live"
-                    " metagenomic sample to profile"
+                    " metagenomic sample with stored reads to profile"
                 )
             samples_path = workspace / f"{PROFILE_SAMPLES_BINDING}.json"
             samples_path.write_text(json.dumps(profile_samples))
@@ -996,12 +998,10 @@ async def run_workflow(
                 processing_idx=minted_processing_idx,
                 prep_sample_idx=scope_target["prep_sample_idx"],
             )
-        if (
-            action is not None
-            and _workflow_writes_taxonomic_profile_gate(action.steps)
-            and minted_processing_idx is not None
-        ):
-            await _record_taxonomic_profile_gate_no_data(pool, processing_idx=minted_processing_idx)
+        if profile_samples is not None and minted_processing_idx is not None:
+            await _record_taxonomic_profile_gate_no_data(
+                pool, processing_idx=minted_processing_idx, prep_sample_idxs=profile_samples
+            )
         await _transition_to_no_data(pool, work_ticket_idx)
         return
     except BackendFailure as exc:

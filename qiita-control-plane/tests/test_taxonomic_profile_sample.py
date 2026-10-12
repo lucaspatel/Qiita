@@ -32,14 +32,16 @@ pytestmark = pytest.mark.db
 
 @pytest.fixture
 async def run(postgres_pool):
-    """A pool of two metagenomic prep_samples and one amplicon one (an ENA study's
-    runs share a pool), and a taxonomic-profile processing run."""
+    """A pool of two metagenomic prep_samples with reads, one amplicon one (an ENA
+    study's runs share a pool), and one metagenomic one whose download left no
+    reads; and a taxonomic-profile processing run."""
     owner = await seed_user_principal(
         postgres_pool, prefix="prof-gate", suffix=str(uuid.uuid4())[:8]
     )
     samples, run_idx, pool_idx = [], None, None
     for i, protocol in enumerate(
         ("short_read_metagenomics", "long_read_metagenomics", "short_read_amplicon")
+        + ("short_read_metagenomics",)
     ):
         bs, ps = await seed_biosample_with_sequenced_prep_sample(
             postgres_pool, owner_idx=owner, protocol_name=protocol
@@ -53,6 +55,14 @@ async def run(postgres_pool):
             sequenced_pool_idx=pool_idx,
         )
         samples.append((bs, ps))
+    for _, ps in samples[:3]:
+        await postgres_pool.execute(
+            "INSERT INTO qiita.sequence_range"
+            " (prep_sample_idx, sequence_idx_start, sequence_idx_stop, created_by_idx)"
+            " VALUES ($1, 1, 10, $2)",
+            ps,
+            owner,
+        )
     async with postgres_pool.acquire() as conn:
         processing = await mint_processing(
             conn,
@@ -67,6 +77,7 @@ async def run(postgres_pool):
         "owner": owner,
         "metagenomic": [samples[0][1], samples[1][1]],
         "amplicon": samples[2][1],
+        "unread": samples[3][1],
     }
     await postgres_pool.execute(
         "DELETE FROM qiita.exported_identifier WHERE processing_idx = $1", p
@@ -102,7 +113,7 @@ async def _pending(pool, run):
         )
 
 
-async def test_the_pool_population_is_its_metagenomic_samples(postgres_pool, run):
+async def test_the_pool_population_is_its_metagenomic_samples_with_reads(postgres_pool, run):
     assert await list_pool_metagenomic_prep_sample_idxs(postgres_pool, run["pool_idx"]) == sorted(
         run["metagenomic"]
     )
@@ -120,6 +131,7 @@ async def test_finalize_closes_the_gate_and_mints_identifiers(postgres_pool, run
     written = await finalize_taxonomic_profile_sample(
         postgres_pool,
         processing_idx=run["processing_idx"],
+        prep_sample_idxs=run["metagenomic"],
         profile_counts_path=counts,
         created_by_idx=run["owner"],
     )
@@ -139,10 +151,43 @@ async def test_finalize_closes_the_gate_and_mints_identifiers(postgres_pool, run
 async def test_a_no_data_run_closes_every_pending_row(postgres_pool, run):
     await _pending(postgres_pool, run)
     await _record_taxonomic_profile_gate_no_data(
-        postgres_pool, processing_idx=run["processing_idx"]
+        postgres_pool, processing_idx=run["processing_idx"], prep_sample_idxs=run["metagenomic"]
     )
     states = await _states(postgres_pool, run["processing_idx"])
     assert set(states.values()) == {("no_data", None)}
+
+
+async def test_closing_leaves_another_tickets_pending_rows_alone(postgres_pool, run, tmp_path):
+    """Two pools profiled against one database share the processing_idx; one
+    ticket's close, normal or no-data, must not touch the other's samples."""
+    a, b = run["metagenomic"]
+    other = run["unread"]
+    async with postgres_pool.acquire() as conn, conn.transaction():
+        await create_taxonomic_profile_samples_pending(
+            conn, processing_idx=run["processing_idx"], prep_sample_idxs=[a, b, other]
+        )
+    await _record_taxonomic_profile_gate_no_data(
+        postgres_pool, processing_idx=run["processing_idx"], prep_sample_idxs=[b]
+    )
+    counts = tmp_path / "profile_counts.parquet"
+    with duckdb.connect() as con:
+        con.execute(
+            f"COPY (SELECT {a}::BIGINT AS prep_sample_idx, 3::INTEGER AS genome_count)"
+            f" TO '{counts}' (FORMAT PARQUET)"
+        )
+    written = await finalize_taxonomic_profile_sample(
+        postgres_pool,
+        processing_idx=run["processing_idx"],
+        prep_sample_idxs=[a],
+        profile_counts_path=counts,
+        created_by_idx=run["owner"],
+    )
+    assert written == (1, 0)
+    assert await _states(postgres_pool, run["processing_idx"]) == {
+        a: ("completed", 3),
+        b: ("no_data", None),
+        other: ("pending", None),
+    }
 
 
 def test_the_identity_carries_the_database_file_and_threshold():
