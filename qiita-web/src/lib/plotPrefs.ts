@@ -16,6 +16,9 @@ export type PlotPrefs = {
   pcoaDepth?: number | null;
   /** The ASVs scatter's depth line; null for none. */
   asvDepth?: number | null;
+  /** The scatter's axis scales: log when true, linear from zero when false. */
+  xLog?: boolean;
+  yLog?: boolean;
 };
 
 const key = (studyIdx: number, protocol: string) => `qiita-web:plot-prefs:${studyIdx}:${protocol}`;
@@ -37,6 +40,8 @@ export function loadPlotPrefs(studyIdx: number, protocol: string): PlotPrefs {
     if (typeof o.continuous === 'boolean') out.continuous = o.continuous;
     if ('pcoaDepth' in o && isDepth(o.pcoaDepth)) out.pcoaDepth = o.pcoaDepth as number | null;
     if ('asvDepth' in o && isDepth(o.asvDepth)) out.asvDepth = o.asvDepth as number | null;
+    if (typeof o.xLog === 'boolean') out.xLog = o.xLog;
+    if (typeof o.yLog === 'boolean') out.yLog = o.yLog;
     return out;
   } catch {
     clearPlotPrefs(studyIdx, protocol);

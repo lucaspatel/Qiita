@@ -300,6 +300,8 @@
     if (studyIdx) studyMetadata.load(studyIdx);
   });
 
+  // Each scatter's axis scales, once switched this visit (else the saved ones).
+  let logFor = $state<Record<string, { xLog?: boolean; yLog?: boolean }>>({});
   // The variable each group's ordination is coloured by, and whether its palette
   // is continuous.
   let colorVar = $state<Record<string, string>>({});
@@ -603,6 +605,20 @@
                     symbolOf={shaping?.symbolOf ?? null}
                     initialDepth={loadPlotPrefs(studyIdx, g.prep_protocol).asvDepth ?? null}
                     onDepthChange={(d) => savePlotPrefs(studyIdx, g.prep_protocol, { asvDepth: d })}
+                    bind:xLog={
+                      () => logFor[g.prep_protocol]?.xLog ?? loadPlotPrefs(studyIdx, g.prep_protocol).xLog ?? true,
+                      (v) => {
+                        logFor = { ...logFor, [g.prep_protocol]: { ...logFor[g.prep_protocol], xLog: v } };
+                        savePlotPrefs(studyIdx, g.prep_protocol, { xLog: v });
+                      }
+                    }
+                    bind:yLog={
+                      () => logFor[g.prep_protocol]?.yLog ?? loadPlotPrefs(studyIdx, g.prep_protocol).yLog ?? true,
+                      (v) => {
+                        logFor = { ...logFor, [g.prep_protocol]: { ...logFor[g.prep_protocol], yLog: v } };
+                        savePlotPrefs(studyIdx, g.prep_protocol, { yLog: v });
+                      }
+                    }
                   />
                 {:else}
                   <Spinner label="Loading sample metadata…" />
