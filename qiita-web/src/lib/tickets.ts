@@ -30,9 +30,10 @@ export function ticketSubject(
 ): string | null {
   const acc = t.action_context?.ena_study_accession;
   if (typeof acc === 'string' && acc) return acc;
-  // A profile is about the database it was run against.
-  const db = t.action_context?.sylph_reference_idx;
-  if (typeof db === 'number') return `sylph · ${referenceName(db) ?? `reference ${db}`}`;
+  // A profile is about the database it was run against: a sylph index row, which
+  // names no reference on its own.
+  const db = t.action_context?.sylph_index_idx;
+  if (typeof db === 'number') return `sylph · database ${db}`;
   return null;
 }
 
@@ -83,7 +84,7 @@ export type ContextField =
 
 // Labels for keys whose name doesn't say it plainly.
 const CONTEXT_LABEL: Record<string, string> = {
-  sylph_reference_idx: 'Database',
+  sylph_index_idx: 'Sylph database',
   sortmerna_reference_idx: 'rRNA reference',
   trim: 'Trim length',
   min_ani: 'Min ANI',

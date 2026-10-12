@@ -16,12 +16,12 @@ export type FeatureTable = {
   biosampleOf: Record<string, string>;
   /** Column name -> the processed sample's QM. */
   exportIdOf: Record<string, string>;
-  /** Feature ids (an ASV's sequence md5, or a profiled genome's name), by code. */
+  /** Feature ids (an ASV's sequence md5, or a genome's accession), by code. */
   features: string[];
   /** Feature id -> its ASV sequence; empty for a profile. */
   sequenceOf: Map<string, string>;
-  /** Feature id -> a profiled genome's lineage (`d__...;s__...`), where its
-   *  database's taxonomy names it; empty for an amplicon table. */
+  /** Feature id -> a genome's lineage (`d__...;s__...`), its named ranks from its
+   *  reference's taxonomy; empty for an amplicon table. */
   taxonomyOf: Map<string, string>;
   /** The observations: sample code, feature code, value, one per nonzero cell. */
   s: Int32Array;
@@ -73,12 +73,14 @@ export async function loadFeatureTable(
   const ft = tableFromIPC(feats.data);
   const ids = ft.getChild('feature')!.toArray() as string[];
   const seqs = ft.getChild('sequence')!.toArray() as string[];
-  const taxa = ft.getChild('taxonomy')?.toArray() as (string | null)[] | undefined;
+  // The eight rank columns, coarsest first, each prefixed (`d__Bacteria`).
+  const ranks = RANKS.map((r) => ft.getChild(r)?.toArray() as (string | null)[] | undefined);
   const sequenceOf = new Map<string, string>();
   const taxonomyOf = new Map<string, string>();
   for (let i = 0; i < ids.length; i++) {
     if (seqs[i] != null) sequenceOf.set(ids[i], seqs[i]);
-    if (taxa?.[i] != null) taxonomyOf.set(ids[i], taxa[i]!);
+    const named = ranks.map((col) => col?.[i]).filter((x): x is string => !!x);
+    if (named.length) taxonomyOf.set(ids[i], named.join(';'));
   }
 
   return {
@@ -100,13 +102,14 @@ export async function loadFeatureTable(
   };
 }
 
-/** A profiled genome's display name: the species of its lineage, else its lowest
- *  named rank (`g__Nonomuraea` -> "Nonomuraea (genus)"), else the genome's file
- *  name without its directory. */
+/** The features route's rank columns, coarsest first. */
+const RANKS = ['domain', 'phylum', 'class', 'order', 'family', 'genus', 'species', 'strain'];
+
+/** A genome's display name: the species of its lineage, else its lowest named
+ *  rank (`g__Nonomuraea` -> "Nonomuraea (genus)"), else its accession. */
 export function genomeLabel(table: FeatureTable, feature: string): string {
   const lineage = table.taxonomyOf.get(feature);
-  const file = feature.split('/').pop() ?? feature;
-  if (!lineage) return file;
+  if (!lineage) return feature;
   const ranks: Record<string, string> = {
     s: 'species',
     g: 'genus',
@@ -121,6 +124,6 @@ export function genomeLabel(table: FeatureTable, feature: string): string {
     .map((t) => t.trim().match(/^([a-z])__(.+)$/))
     .filter((m): m is RegExpMatchArray => m != null && m[2].trim() !== '');
   const last = named.at(-1);
-  if (!last) return file;
+  if (!last) return feature;
   return last[1] === 's' ? last[2] : `${last[2]} (${ranks[last[1]] ?? last[1]})`;
 }

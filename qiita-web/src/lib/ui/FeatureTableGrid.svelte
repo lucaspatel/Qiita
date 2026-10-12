@@ -121,7 +121,7 @@
   // by the genome's name, which a click copies.
   const isAbundance = $derived(table.valueKind === 'relative_abundance');
   // What a header shows and a click copies: an ASV's sequence, or a genome's
-  // species (its lineage's lowest named rank) with the genome name copied.
+  // species (its lineage's lowest named rank) with the genome's accession copied.
   const sequence = (f: number) =>
     table.sequenceOf.get(table.features[f]) ??
     (isAbundance ? genomeLabel(table, table.features[f]) : table.features[f]);
@@ -220,7 +220,7 @@
                       ? 'Copied'
                       : table.sequenceOf.has(table.features[f])
                         ? 'Copy sequence'
-                        : 'Copy genome name'}</button
+                        : 'Copy accession'}</button
                   >
                 </div>
               {/if}

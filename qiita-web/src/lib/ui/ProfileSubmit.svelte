@@ -1,10 +1,11 @@
 <script lang="ts">
   // Submit a taxonomic profile of a group's reads: pick the method, then a
-  // database that method can read (a sylph method lists only profiling databases
-  // with a registered sylph file), and submit one ticket per pool the group's
-  // samples sit on. Each method + database is its own run, so its own branch of
-  // the lineage once submitted. sylph's own default minimum ANI applies; the job
-  // takes `min_ani` already, for when the form offers it again.
+  // database that method can read (for sylph, a sylph file registered on an active
+  // sequence reference, which a reference may carry several of), and submit one
+  // ticket per pool the group's samples sit on. Each method + database is its own
+  // run, so its own branch of the lineage once submitted. sylph's own default
+  // minimum ANI applies; the job takes `min_ani` already, for when the form offers
+  // it again.
   import { api, type LineageSample, type Reference } from '$lib/api';
   import Select from './Select.svelte';
 
@@ -33,13 +34,15 @@
     { id: 'woltka', label: 'woltka (alignment-based OGUs)', note: 'not available yet' }
   ];
 
-  type Database = { ref: Reference; format: string; taxonomy: boolean };
+  /** One database file: its index row, the reference it belongs to, and how the
+   *  registration labelled it (e.g. `ani95`), else its format. */
+  type Database = { indexIdx: number; ref: Reference; label: string };
 
   let methodId = $state('sylph');
   const method = $derived(METHODS.find((m) => m.id === methodId)!);
   let databases = $state<Database[] | null>(null);
   let databasesError = $state('');
-  let referenceIdx = $state<number | undefined>(undefined);
+  let indexIdx = $state<number | undefined>(undefined);
   let submitting = $state(false);
   let result = $state<{ ok: boolean; text: string } | null>(null);
 
@@ -58,7 +61,7 @@
     const indexType = method.action?.indexType;
     databases = null;
     databasesError = '';
-    referenceIdx = undefined;
+    indexIdx = undefined;
     if (!indexType) {
       databases = [];
       return;
@@ -70,27 +73,26 @@
         return;
       }
       const candidates = refs.data.filter(
-        (r) => r.kind === 'profiling_database' && r.status === 'active'
+        (r) => r.kind === 'sequence_reference' && r.status === 'active' && !r.is_host
       );
       const found: Database[] = [];
       for (const ref of candidates) {
         const idx = await api.referenceIndices(ref.reference_idx);
         if (!idx.ok) continue;
-        const file = idx.data.find((i) => i.index_type === indexType);
-        if (!file) continue;
-        found.push({
-          ref,
-          format: String(file.params?.format ?? ''),
-          taxonomy: idx.data.some((i) => i.index_type === `${indexType}_taxonomy`)
-        });
+        for (const file of idx.data.filter((i) => i.index_type === indexType))
+          found.push({
+            indexIdx: file.reference_index_idx,
+            ref,
+            label: String(file.params?.label ?? file.params?.format ?? '')
+          });
       }
       databases = found;
-      if (found.length === 1) referenceIdx = found[0].ref.reference_idx;
+      if (found.length === 1) indexIdx = found[0].indexIdx;
     })();
   });
 
   const canSubmit = $derived(
-    !!method.action && referenceIdx != null && pools.length > 0 && !submitting
+    !!method.action && indexIdx != null && pools.length > 0 && !submitting
   );
 
   async function submit() {
@@ -104,7 +106,7 @@
         action_id: method.action.id,
         action_version: method.action.version,
         scope_target: { kind: 'sequenced_pool', sequenced_pool_idx: pool, sequencing_run_idx: run },
-        action_context: { sylph_reference_idx: referenceIdx }
+        action_context: { sylph_index_idx: indexIdx }
       });
       if (r.ok) done.push(`#${r.data.work_ticket_idx}`);
       else failed.push(`pool ${pool}: ${r.detail}`);
@@ -136,12 +138,10 @@
     {:else if databases.length === 0}
       <span class="py-1.5 text-sm text-gray-500">No {method.label.split(' ')[0]} database is registered</span>
     {:else}
-      <Select bind:value={referenceIdx} class="w-64">
+      <Select bind:value={indexIdx} class="w-64">
         {#if databases.length > 1}<option value={undefined}>Choose…</option>{/if}
-        {#each databases as d (d.ref.reference_idx)}
-          <option value={d.ref.reference_idx}
-            >{d.ref.name} {d.ref.version} · {d.format}{d.taxonomy ? '' : ' · no taxonomy'}</option
-          >
+        {#each databases as d (d.indexIdx)}
+          <option value={d.indexIdx}>{d.ref.name} {d.ref.version} · {d.label}</option>
         {/each}
       </Select>
     {/if}
