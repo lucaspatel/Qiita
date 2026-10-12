@@ -19,8 +19,9 @@ METAGENOMIC_PREP_PROTOCOLS = ("short_read_metagenomics", "long_read_metagenomics
 # What a profiled genome's name reduces to: the `source_id` of a `qiita.genome` row
 # of the database's sequence reference. sylph names a genome by the path it was
 # sketched from (`.../G000802255.fna.gz`), so the key is the file name without its
-# directory and its FASTA suffixes. A DuckDB `regexp_replace` over that file name.
-GENOME_FILE_SUFFIX_PATTERN = r"\.(fna|fa|fasta|fas|ffn)(\.gz)?$"
+# directory, its FASTA suffixes, and NCBI's `_genomic` (`GCA_000005845.2_genomic.fna.gz`
+# is `GCA_000005845.2`). A DuckDB `regexp_replace` over that file name.
+GENOME_FILE_SUFFIX_PATTERN = r"(_genomic)?\.(fna|fa|fasta|fas|ffn)(\.gz)?$"
 
 
 def genome_source_id_sql(column: str) -> str:
