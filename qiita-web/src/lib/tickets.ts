@@ -150,6 +150,54 @@ export function classifyLog(text: string): LogLine[] {
   });
 }
 
+/** A step's receipt: the one JSON line it writes to stdout when it ends, with
+ *  the counts it summarized (`qiita_common.step_log`). */
+export type Receipt = {
+  outcome: string;
+  step?: string;
+  reason?: string;
+  summary: { label: string; value: string }[];
+};
+
+function receiptValue(v: unknown): string {
+  if (typeof v === 'number') return v.toLocaleString();
+  if (v && typeof v === 'object')
+    return Object.entries(v as Record<string, unknown>)
+      .map(([k, n]) => `${k} ${receiptValue(n)}`)
+      .join(', ');
+  return String(v);
+}
+
+/** The receipt at the end of a step's stdout; null for a step that wrote none
+ *  (one that ran before steps wrote receipts, or one still running). */
+export function stepReceipt(stdout: string): Receipt | null {
+  const lines = stdout.trim().split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const t = lines[i].trim();
+    if (!t.startsWith('{')) continue;
+    try {
+      const o = JSON.parse(t) as Record<string, unknown>;
+      if (typeof o.kind !== 'string') continue;
+      const summary =
+        o.summary && typeof o.summary === 'object'
+          ? Object.entries(o.summary as Record<string, unknown>).map(([k, v]) => ({
+              label: k.replaceAll('_', ' '),
+              value: receiptValue(v)
+            }))
+          : [];
+      return {
+        outcome: o.kind,
+        step: typeof o.step_name === 'string' ? o.step_name : undefined,
+        reason: typeof o.reason === 'string' ? o.reason : undefined,
+        summary
+      };
+    } catch {
+      // Not JSON after all: keep looking.
+    }
+  }
+  return null;
+}
+
 /** "3m 12s" between two timestamps; '' when either is unreadable. */
 export function duration(fromIso: string, toIso: string): string {
   const ms = new Date(toIso).getTime() - new Date(fromIso).getTime();

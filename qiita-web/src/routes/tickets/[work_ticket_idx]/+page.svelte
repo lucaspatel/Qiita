@@ -11,6 +11,7 @@
   import {
     actionLabel,
     classifyLog,
+    stepReceipt,
     contextFields,
     duration,
     scopeLabel,
@@ -117,6 +118,7 @@
 
   const stderrLines = $derived(logs?.ok ? classifyLog(logs.data.stderr) : []);
   const outcomes = $derived(stderrLines.flatMap((l) => (l.kind === 'outcome' ? [l] : [])));
+  const receipt = $derived(logs?.ok ? stepReceipt(logs.data.stdout) : null);
   const selected = $derived(steps?.find((s) => s.index === stepIndex) ?? null);
 
   let copied = $state(false);
@@ -363,14 +365,37 @@
             <p class="py-6 text-center text-sm text-red-700">HTTP {logs.status} — {logs.detail}</p>
           {:else}
             {@const d = logs.data}
-            {#each outcomes as o}
-              <p class="mb-2 rounded-md bg-gray-50 px-3 py-2 text-sm text-gray-700 ring-1 ring-gray-200">
-                <span class="font-medium">{o.outcome.replace('_', ' ')}</span>{o.step
-                  ? ` at ${o.step}`
-                  : ''}: {o.reason}
-              </p>
-            {/each}
-            <!-- A job's logging goes to stderr, so it leads; stdout is usually empty. -->
+            {#if receipt}
+              <div
+                class="mb-3 rounded-md px-3 py-2 text-sm ring-1 {receipt.outcome === 'completed'
+                  ? 'bg-teal-50 text-teal-900 ring-teal-200'
+                  : receipt.outcome === 'no_data'
+                    ? 'bg-gray-50 text-gray-700 ring-gray-200'
+                    : 'bg-red-50 text-red-900 ring-red-200'}"
+              >
+                <span class="font-medium">{receipt.outcome.replace('_', ' ')}</span
+                >{receipt.reason ? `: ${receipt.reason}` : ''}
+                {#if receipt.summary.length}
+                  <dl class="mt-1 flex flex-wrap gap-x-5 gap-y-1">
+                    {#each receipt.summary as f (f.label)}
+                      <div class="flex gap-1.5">
+                        <dt class="text-xs opacity-70">{f.label}</dt>
+                        <dd class="text-xs font-medium tabular-nums">{f.value}</dd>
+                      </div>
+                    {/each}
+                  </dl>
+                {/if}
+              </div>
+            {:else}
+              {#each outcomes as o}
+                <p class="mb-2 rounded-md bg-gray-50 px-3 py-2 text-sm text-gray-700 ring-1 ring-gray-200">
+                  <span class="font-medium">{o.outcome.replace('_', ' ')}</span>{o.step
+                    ? ` at ${o.step}`
+                    : ''}: {o.reason}
+                </p>
+              {/each}
+            {/if}
+            <!-- The step's narrative is on stderr, so it leads; stdout holds the receipt above. -->
             <div class="mb-1 flex items-center gap-2 text-xs font-semibold tracking-wide text-gray-500 uppercase">
               stderr
               {#if d.stderr_truncated}
