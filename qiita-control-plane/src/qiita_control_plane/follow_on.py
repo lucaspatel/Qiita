@@ -105,12 +105,15 @@ async def reconcile_follow_ons(app: FastAPI) -> None:
     Runs at startup after `reconcile_inflight_tickets`, so a follow-on created
     here is dispatched only by its own submission."""
     pool: asyncpg.Pool = app.state.pool
+    # The literal 'completed' (not a bound parameter) matches the partial index
+    # predicate verbatim, so the planner uses work_ticket_follow_on_pending_idx
+    # whichever plan it picks — a parameterized `state = $1` is only provably
+    # index-eligible under a custom plan.
     rows = await pool.fetch(
         "SELECT work_ticket_idx FROM qiita.work_ticket"
-        " WHERE state = $1::qiita.work_ticket_state AND on_success IS NOT NULL"
+        " WHERE state = 'completed' AND on_success IS NOT NULL"
         "   AND follow_on_work_ticket_idx IS NULL AND follow_on_error IS NULL"
         " ORDER BY work_ticket_idx",
-        WorkTicketState.COMPLETED.value,
     )
     for row in rows:
         try:

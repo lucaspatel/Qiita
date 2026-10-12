@@ -4,7 +4,10 @@
 -- on the same scope target, once this ticket COMPLETES. It lets one gesture run
 -- a chain whose later stage needs the earlier stage's output to exist.
 --
--- `on_success` is the follow-on's {action_id, action_version, action_context}.
+-- `on_success` is the follow-on's {action_id, action_version, action_context},
+-- and optionally its own `on_success` — the next link, which the created
+-- follow-on arms when it completes, so one gesture runs a chain of stages in
+-- order (each ticket still has exactly one immediate follow-on).
 -- Its outcome is recorded here, exactly one of:
 --   follow_on_work_ticket_idx  the ticket it created, written in the same
 --                              transaction as that ticket's INSERT, so a created
@@ -33,7 +36,7 @@ ALTER TABLE qiita.work_ticket
 COMMENT ON COLUMN qiita.work_ticket.on_success IS
     'Follow-on {action_id, action_version, action_context} the control plane '
     'submits as the originator, on this ticket''s scope target, once it COMPLETES. '
-    'NULL = no follow-on.';
+    'May nest its own on_success as the next link of a chain. NULL = no follow-on.';
 COMMENT ON COLUMN qiita.work_ticket.follow_on_work_ticket_idx IS
     'The ticket the follow-on submission created, recorded in the transaction '
     'that created it. No FK: deleting that ticket must not re-arm the follow-on.';

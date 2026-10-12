@@ -4324,6 +4324,7 @@ async def test_submit_on_success_persists_and_round_trips(
         "action_id": follow_on_action[0],
         "action_version": follow_on_action[1],
         "action_context": {"trim": 150},
+        "on_success": None,
     }
     assert ticket["follow_on_work_ticket_idx"] is None
     assert ticket["follow_on_error"] is None
@@ -4816,15 +4817,119 @@ async def test_on_success_refused_from_a_service_account(postgres_pool):
     assert exc.value.detail == {"reason": "on_success is only accepted from a human caller"}
 
 
-def test_a_follow_on_carries_no_follow_on():
-    from pydantic import ValidationError
-    from qiita_common.models import WorkTicketFollowOn
+async def test_follow_on_chain_runs_in_order(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    sequenced_pool_action,
+    follow_on_action,
+    sequenced_pool_for_wt,
+    ingest_dir,
+):
+    """A follow-on that carries its own on_success runs as a chain: completing
+    each stage arms the next, on the same pool as the originator, and the last
+    stage carries no follow-on."""
+    from qiita_control_plane.follow_on import submit_follow_on
+    from qiita_control_plane.main import app
 
-    with pytest.raises(ValidationError):
-        WorkTicketFollowOn.model_validate(
-            {
-                "action_id": "b",
-                "action_version": "1.0.0",
-                "on_success": {"action_id": "c", "action_version": "1.0.0"},
-            }
+    token, admin_idx = admin_token
+    stage_c = await _seed_action(
+        postgres_pool,
+        context_schema={"type": "object", "properties": {}},
+        target_kind="sequenced_pool",
+        action_id="wt-follow-on-stage-c",
+        scopes=[],
+    )
+    try:
+        a_id, a_ver = sequenced_pool_action
+        b_id, b_ver = follow_on_action
+        run_idx, pool_idx = sequenced_pool_for_wt
+        body = _sequenced_pool_body(a_id, a_ver, pool_idx, run_idx, ingest_dir)
+        body["on_success"] = {
+            "action_id": b_id,
+            "action_version": b_ver,
+            "action_context": {"trim": 150},
+            "on_success": {
+                "action_id": stage_c[0],
+                "action_version": stage_c[1],
+                "action_context": {},
+            },
+        }
+        resp = await wt_client.post(
+            URL_WORK_TICKET_PREFIX, json=body, headers={"Authorization": f"Bearer {token}"}
         )
+        assert resp.status_code == 202, resp.text
+        a_idx = resp.json()["work_ticket_idx"]
+
+        # A completes -> B is submitted, carrying C as its own on_success.
+        await _complete(postgres_pool, a_idx)
+        await submit_follow_on(app, a_idx)
+        b_idx, b_err = await _follow_on_outcome(postgres_pool, a_idx)
+        assert b_err is None
+        assert b_idx is not None
+        b = await postgres_pool.fetchrow(
+            "SELECT action_id, on_success FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+            b_idx,
+        )
+        assert b["action_id"] == b_id
+        assert json.loads(b["on_success"])["action_id"] == stage_c[0]
+
+        # B completes -> C is submitted; the last stage carries no follow-on.
+        await _complete(postgres_pool, b_idx)
+        await submit_follow_on(app, b_idx)
+        c_idx, c_err = await _follow_on_outcome(postgres_pool, b_idx)
+        assert c_err is None
+        assert c_idx is not None
+        c = await postgres_pool.fetchrow(
+            "SELECT action_id, on_success, originator_principal_idx"
+            " FROM qiita.work_ticket WHERE work_ticket_idx = $1",
+            c_idx,
+        )
+        assert c["action_id"] == stage_c[0]
+        assert c["on_success"] is None
+        assert c["originator_principal_idx"] == admin_idx
+    finally:
+        await _drop_action(postgres_pool, *stage_c)
+
+
+async def test_submit_on_success_chain_deep_link_refused_up_front(
+    wt_client,
+    postgres_pool,
+    admin_token,
+    sequenced_pool_action,
+    follow_on_action,
+    sequenced_pool_for_wt,
+    ingest_dir,
+):
+    """A later link of a chain that could never pass its own gate refuses the
+    parent at submit, before anything is inserted."""
+    token, _ = admin_token
+    a_id, a_ver = sequenced_pool_action
+    b_id, b_ver = follow_on_action
+    run_idx, pool_idx = sequenced_pool_for_wt
+    body = _sequenced_pool_body(a_id, a_ver, pool_idx, run_idx, ingest_dir)
+    body["on_success"] = {
+        "action_id": b_id,
+        "action_version": b_ver,
+        "action_context": {"trim": 150},  # valid
+        "on_success": {
+            "action_id": b_id,
+            "action_version": b_ver,
+            "action_context": {"trim": 2},  # invalid: trim below the schema minimum
+        },
+    }
+    resp = await wt_client.post(
+        URL_WORK_TICKET_PREFIX, json=body, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "on_success was refused"
+    assert detail["on_success_detail"]["reason"] == (
+        "action_context does not match action.context_schema"
+    )
+    assert (
+        await postgres_pool.fetchval(
+            "SELECT count(*) FROM qiita.work_ticket WHERE sequenced_pool_idx = $1", pool_idx
+        )
+        == 0
+    )

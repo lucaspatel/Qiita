@@ -89,6 +89,7 @@ from qiita_common.models import (
     WorkTicketCancelResponse,
     WorkTicketCancelResult,
     WorkTicketCreateRequest,
+    WorkTicketFollowOn,
     WorkTicketListResponse,
     WorkTicketReadOutcome,
     WorkTicketResponse,
@@ -902,10 +903,11 @@ async def _gate_follow_on(
     principal: Principal,
     parent: WorkTicketCreateRequest,
 ) -> None:
-    """Run `_gate_submission` over `parent.on_success` on the parent's scope
-    target, so a follow-on these gates refuse is refused with its parent rather
-    than at the parent's completion. State that changes in between, and the
-    in-flight dedupe these gates leave out, can still refuse it then.
+    """Run `_gate_submission` over every link of `parent.on_success` on the
+    parent's scope target, so a follow-on these gates refuse is refused with its
+    parent rather than at a later stage's completion. State that changes in
+    between, and the in-flight dedupe these gates leave out, can still refuse a
+    link when its own stage completes.
 
     Human callers only: the completion hook re-loads the originator with
     `load_human_user`, and there is no equivalent for a service account."""
@@ -915,14 +917,17 @@ async def _gate_follow_on(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail={"reason": "on_success is only accepted from a human caller"},
         )
-    follow_on = parent.on_success.as_request(parent.scope_target)
-    try:
-        await _gate_submission(pool=pool, settings=settings, principal=principal, body=follow_on)
-    except HTTPException as exc:
-        raise HTTPException(
-            status_code=exc.status_code,
-            detail={"reason": "on_success was refused", "on_success_detail": exc.detail},
-        ) from exc
+    node: WorkTicketFollowOn | None = parent.on_success
+    while node is not None:
+        link = node.as_request(parent.scope_target)
+        try:
+            await _gate_submission(pool=pool, settings=settings, principal=principal, body=link)
+        except HTTPException as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"reason": "on_success was refused", "on_success_detail": exc.detail},
+            ) from exc
+        node = node.on_success
 
 
 class FollowOnAlreadyRecordedError(Exception):
@@ -1201,7 +1206,7 @@ def _row_to_work_ticket(row: asyncpg.Record) -> WorkTicket:
 
 async def fetch_work_ticket(pool: asyncpg.Pool, work_ticket_idx: int) -> WorkTicket | None:
     """Read one ticket with no caller gate, for in-process callers that already
-    own it (the follow-on hook). Routes gate before calling this."""
+    own it. Routes gate before calling this."""
     row = await pool.fetchrow(
         f"SELECT {_WORK_TICKET_COLUMNS}{_WORK_TICKET_FROM} WHERE wt.work_ticket_idx = $1",
         work_ticket_idx,

@@ -371,6 +371,7 @@ from qiita_common.models.user import ORCID_PATTERN, UserCreate, UserResponse, Us
 from qiita_common.models.work_ticket import (
     LIVE_STEP_PROGRESS_STATES,
     MAX_FANOUT_OVERRIDE,
+    MAX_FOLLOW_ON_CHAIN_DEPTH,
     NON_TERMINAL_WORK_TICKET_STATES,
     REDRIVABLE_WORK_TICKET_STATES,
     TERMINAL_STEP_PROGRESS_STATES,
@@ -694,6 +695,7 @@ __all__ = [
     "FanoutOverrideRequest",
     "FanoutPumpResponse",
     "MAX_FANOUT_OVERRIDE",
+    "MAX_FOLLOW_ON_CHAIN_DEPTH",
     "WorkTicketCancelRequest",
     "WorkTicketCancelResponse",
     "WorkTicketCancelResult",

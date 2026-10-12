@@ -155,7 +155,9 @@ def _handle_ticket_submit(args: argparse.Namespace, parser: argparse.ArgumentPar
 
     follow_on = _follow_on_from_args(args, parser)
     if follow_on is not None:
-        args.on_success = follow_on.model_dump(mode="json")
+        # exclude_unset drops the follow-on's own `on_success` when the CLI did
+        # not set it (the CLI chains a single follow-on), keeping the body stable.
+        args.on_success = follow_on.model_dump(mode="json", exclude_unset=True)
 
     body = _build_body(WorkTicketCreateRequest, args, parser)
     return _common.run_http_subcommand(lambda t: _post_work_ticket(args.base_url, t, body))
