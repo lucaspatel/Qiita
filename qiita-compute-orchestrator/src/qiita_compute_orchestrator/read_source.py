@@ -57,6 +57,8 @@ nothing outside this one job ever learns the path.
 
 from __future__ import annotations
 
+import logging
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -69,6 +71,8 @@ from .miint import PARQUET_OPTS
 
 if TYPE_CHECKING:
     import duckdb
+
+_LOG = logging.getLogger(__name__)
 
 # The relation a job binds its reads as. A single name so every consumer's SQL
 # reads identically regardless of which branch bound it.
@@ -132,13 +136,20 @@ async def bind_step_reads(
     workspace.mkdir(parents=True, exist_ok=True)
     spilled = workspace / _STREAM_SPILL_FILENAME
     try:
+        started = time.monotonic()
         async with open_read_block_stream(
             conn, work_ticket_idx=work_ticket_idx, relation=_STREAM_RELATION
         ) as stream_rel:
-            conn.execute(
+            drained = conn.execute(
                 f"COPY (SELECT * FROM {stream_rel}) "
                 f"TO '{validate_parquet_path(spilled)}' ({PARQUET_OPTS})"
-            )
+            ).fetchone()
+        _LOG.info(
+            "streamed %s reads for work ticket %d from the data plane in %.0fs",
+            drained[0] if drained else "?",
+            work_ticket_idx,
+            time.monotonic() - started,
+        )
         async with _bind_parquet_view(conn, spilled, relation) as rel:
             yield rel
     finally:
