@@ -140,14 +140,10 @@ async def test_reference_index_accepts_bowtie2_type(postgres_pool):
         await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
 
 
-async def test_reference_index_accepts_sylph_on_a_profiling_database(postgres_pool):
-    """A `profiling_database` reference carries one 'sylph' index row naming the
-    staged file, with its format, sha256 and size."""
-    idx = await postgres_pool.fetchval(
-        "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
-        " VALUES ('schema-refindex-sylph', '1', 'profiling_database', 'active', 1)"
-        " RETURNING reference_idx"
-    )
+async def test_reference_index_accepts_sylph_on_a_sequence_reference(postgres_pool):
+    """A sequence reference carries 'sylph' index rows naming staged files, with
+    their format, sha256 and size."""
+    idx = await _make_reference(postgres_pool, "schema-refindex-sylph")
     try:
         rii = await postgres_pool.fetchval(
             "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params)"
@@ -168,6 +164,29 @@ async def test_reference_index_accepts_sylph_on_a_profiling_database(postgres_po
             "DELETE FROM qiita.reference_index WHERE reference_idx = $1", idx
         )
         await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
+
+
+async def test_profiling_kinds_and_taxonomy_files_are_gone(postgres_pool):
+    """A sylph database is an index of a sequence reference, not a reference kind of
+    its own, and its taxonomy is the reference's."""
+    import asyncpg
+
+    with pytest.raises(asyncpg.CheckViolationError):
+        await postgres_pool.execute(
+            "INSERT INTO qiita.reference (name, version, kind, created_by_idx)"
+            " VALUES ('schema-profiling', '1', 'profiling_database', 1)"
+        )
+    idx = await _make_reference(postgres_pool, "schema-refindex-sylph-tax")
+    try:
+        with pytest.raises(asyncpg.CheckViolationError):
+            await postgres_pool.execute(
+                "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params)"
+                " VALUES ($1, 'sylph_taxonomy', '/srv/db/t.tsv', '{}'::jsonb)",
+                idx,
+            )
+    finally:
+        await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
+    assert await postgres_pool.fetchval("SELECT to_regclass('qiita.profiling_taxonomy')") is None
 
 
 async def test_reference_index_rejects_unknown_type(postgres_pool):

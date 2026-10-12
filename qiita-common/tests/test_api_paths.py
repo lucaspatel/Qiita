@@ -456,11 +456,6 @@ _TRIPLES: list[tuple[str, str, str]] = [
         "PATH_FEATURE_TABLE_PREFIX",
         "PATH_FEATURE_TABLE_FEATURES",
     ),
-    (
-        "URL_FEATURE_TABLE_TICKET",
-        "PATH_FEATURE_TABLE_PREFIX",
-        "PATH_FEATURE_TABLE_TICKET",
-    ),
     # /assembly (Flight DoGet ticket for one assembly run's contigs, and that
     # run's contig -> genome map)
     ("URL_ASSEMBLY_DOGET", "PATH_ASSEMBLY_PREFIX", "PATH_ASSEMBLY_DOGET"),

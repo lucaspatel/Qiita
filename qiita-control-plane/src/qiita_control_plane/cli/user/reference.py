@@ -45,30 +45,22 @@ def _sha256_of(path: Path) -> str:
 def _handle_reference_register_file(
     args: argparse.Namespace, parser: argparse.ArgumentParser
 ) -> int:
-    """Register one file of a prebuilt profiling database where it sits on disk: a
-    sylph `.syl2db`/`.syldb` (`--index-type sylph`) or its taxonomy TSV
-    (`--index-type sylph_taxonomy`), on a new release (`--name`/`--version`) or an
-    existing one (`--reference-idx`). Hashes the file here, so run it on a host
-    that sees the same path the control plane and the compute nodes do."""
+    """Register a prebuilt index file of a sequence reference where it sits on disk:
+    a sylph `.syl2db`/`.syldb` sketched from the reference's genomes. Hashes the file
+    here, so run it on a host that sees the same path the control plane and the
+    compute nodes do."""
     path = Path(args.path).resolve()
     if not path.is_file():
         parser.error(f"--path {args.path}: not a file")
-    if (args.reference_idx is None) == (args.name is None or args.version is None):
-        parser.error(
-            "name a new release with --name and --version, or an existing one with --reference-idx"
-        )
-    target = (
-        {"reference_idx": args.reference_idx}
-        if args.reference_idx is not None
-        else {"name": args.name, "version": args.version}
-    )
     body = {
-        **target,
+        "reference_idx": args.reference_idx,
         "index_type": args.index_type,
         "fs_path": str(path),
         "sha256": _sha256_of(path),
         "size_bytes": path.stat().st_size,
     }
+    if args.label:
+        body["label"] = args.label
     return _common.run_http_subcommand(
         lambda token: _common.call(
             "POST", args.base_url, token, f"{PATH_REFERENCE_PREFIX}{PATH_REFERENCE_FILE}", json=body

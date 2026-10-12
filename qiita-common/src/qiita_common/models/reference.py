@@ -215,17 +215,12 @@ class Tier(StrEnum):
 STORABLE_ACCESS_TIERS: frozenset[Tier] = frozenset({Tier.VIEWER, Tier.MEMBER, Tier.ADMIN})
 
 
-ReferenceKind = Literal[
-    "sequence_reference", "taxonomy_authority", "artifact_sequence_set", "profiling_database"
-]
+ReferenceKind = Literal["sequence_reference", "taxonomy_authority", "artifact_sequence_set"]
 """Kinds of reference, mirroring the `qiita.reference.kind` TEXT/CHECK column
 (NOT a Postgres ENUM — see the reference migrations). `artifact_sequence_set` is
 an indexless set of artifact sequences (e.g. the canonical adapter set the QC
 step trims against): ingested through the same kind-agnostic reference-add flow,
-but carries no taxonomy and builds no rype/minimap2 index. `profiling_database`
-is a prebuilt file a profiler reads whole (a sylph database), registered where
-an operator staged it (`ReferenceFileRegisterRequest`) rather than ingested: it
-has no sequences, only its one index row naming the file."""
+but carries no taxonomy and builds no rype/minimap2 index."""
 
 
 class ReferenceCreateRequest(BaseModel):
@@ -304,23 +299,18 @@ INDEX_TYPE_BOWTIE2 = "bowtie2"
 # carried it yet.
 INDEX_TYPE_RYPE_ROUTER = "rype_router"
 
-# A sylph database (`.syl2db`, or a plain `.syldb`): the one index row of a
-# `profiling_database` reference, recording a file an operator staged rather
-# than one a workflow built. Its params are the file's format, sha256 and size,
-# which a profiling run's identity carries so a file replaced in place is a new
-# run. Admitted by 20261011000000_profiling_database_reference.sql.
+# A sylph database (`.syl2db`, or a plain `.syldb`) sketched from a sequence
+# reference's genomes: one more index row of that reference, beside its aligner
+# indexes, recording a file an operator staged rather than one a workflow built.
+# Its params are the file's format, sha256 and size, which a profiling run's
+# identity carries so a file replaced in place is a new run. Admitted by
+# 20261011000000_profiling_database_reference.sql.
 INDEX_TYPE_SYLPH = "sylph"
 
-# A sylph release's taxonomy file: one `<genome file>\t<lineage>` line per genome
-# (GTDB-style `d__...;s__...`). Its rows load into qiita.profiling_taxonomy, which
-# labels a profiled genome. Admitted by 20261011000002_profiling_taxonomy.sql.
-INDEX_TYPE_SYLPH_TAXONOMY = "sylph_taxonomy"
-
-# The files a profiling database may register, by index type: suffix -> the format
+# The prebuilt files a reference may register, by index type: suffix -> the format
 # recorded. miint reads either sylph format and tells them apart by content.
 REFERENCE_FILE_SUFFIXES = {
     INDEX_TYPE_SYLPH: {".syl2db": "syl2db", ".syldb": "syldb"},
-    INDEX_TYPE_SYLPH_TAXONOMY: {".tsv": "tsv"},
 }
 
 
@@ -348,14 +338,9 @@ class ReferenceIndex(BaseModel):
 
 
 class ReferenceFileRegisterRequest(BaseModel):
-    """Register a file of a prebuilt profiling database where it already sits on
-    disk, as one index row of a `profiling_database` reference.
-
-    One reference is one database release (name + version, e.g. `wol3` /
-    `rc4-ani95`); each file the release ships is one index row of a typed kind
-    (`REFERENCE_FILE_SUFFIXES`), the newest row of a kind winning. Name a new
-    release by `name` + `version` (it is created, active at once — there is
-    nothing to ingest), or attach a file to an existing one by `reference_idx`.
+    """Register a prebuilt index file of a sequence reference where it already sits
+    on disk: a sylph database sketched from the reference's genomes, which a
+    profile then reports in terms of those genomes. The newest row of a type wins.
 
     The caller (the CLI, on a host that sees the file) hashes it; the control
     plane checks the path is an absolute, readable file of `size_bytes` before
@@ -363,23 +348,17 @@ class ReferenceFileRegisterRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    reference_idx: Annotated[int, Field(gt=0)] | None = None
-    name: str | None = Field(default=None, min_length=1, max_length=MAX_NAME_LENGTH)
-    version: str | None = Field(default=None, min_length=1, max_length=MAX_VERSION_LENGTH)
-    index_type: Literal["sylph", "sylph_taxonomy"] = INDEX_TYPE_SYLPH
+    reference_idx: Annotated[int, Field(gt=0)]
+    index_type: Literal["sylph"] = INDEX_TYPE_SYLPH
+    # Tells this file apart from the reference's others of its type, e.g. `ani95`
+    # beside `ani99`; shown wherever a run names its database.
+    label: str | None = Field(default=None, min_length=1, max_length=64)
     fs_path: str = Field(min_length=2, max_length=4096)
     sha256: str = Field(pattern=SHA256_HEX_PATTERN)
     size_bytes: int = Field(gt=0)
 
     @model_validator(mode="after")
-    def _one_target_an_absolute_path_and_a_known_suffix(self) -> Self:
-        if (self.reference_idx is None) == (self.name is None or self.version is None):
-            raise ValueError(
-                "name the release by name + version (new) or by reference_idx (existing),"
-                " not both and not neither"
-            )
-        if self.reference_idx is not None and (self.name or self.version):
-            raise ValueError("reference_idx names an existing release; drop name and version")
+    def _an_absolute_path_and_a_known_suffix(self) -> Self:
         if not self.fs_path.startswith("/"):
             raise ValueError(f"fs_path must be absolute, got {self.fs_path!r}")
         suffixes = REFERENCE_FILE_SUFFIXES[self.index_type]

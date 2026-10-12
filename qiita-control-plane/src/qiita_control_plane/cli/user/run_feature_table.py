@@ -1,35 +1,38 @@
-"""qiita user CLI — the client-side run feature table.
+"""qiita user CLI — the run feature table.
 
-`qiita feature-table runs` builds a feature table from processing runs on the
-caller's own machine, the way `feature-table build` builds a genome table: the
-control plane authorizes the cohort and signs Flight tickets (the values, and an
-amplicon table's ASV bytes), the data plane streams them, and the relabel and the
-write happen in the caller's DuckDB under the caller's credentials. Nothing is
-computed server-side and nothing is stored there.
+`qiita feature-table runs` writes a feature table of processing runs: the control
+plane's `/feature-table` routes answer the cohort's columns, its values as sparse
+COO `(sample, feature, value)`, and its features, and this writes them as a bundle.
+The routes are the one implementation of a run table, which the web UI reads too,
+so the two cannot disagree about one.
 
 A run is an amplicon run (ASV counts, features named by sequence md5) or a
-taxonomic profile (relative abundances, features named by the profiling
-database's genome identifiers). The table is written straight from its sparse COO
-rows — BIOM and Parquet both take `(feature_id, sample_id, value)` — so it is never
-made dense on the way to disk. The relabel itself is the control plane's
-`stage_values`, shared with the REST answer, so the two cannot disagree about a
-table.
+taxonomic profile (relative abundances over its reference's genomes, named by
+their `exported_feature` handles). The table is written straight from its COO rows
+— BIOM and Parquet both take `(feature_id, sample_id, value)` — so it is never made
+dense on the way to disk. An amplicon table's bundle carries each ASV's sequence; a
+profile's carries each genome's taxonomy.
 """
 
 from __future__ import annotations
 
 import argparse
-import base64
 import contextlib
 import sys
 from pathlib import Path
 from typing import Any
 
 from qiita_common import analytic as ft
-from qiita_common.api_paths import PATH_FEATURE_TABLE_PREFIX, PATH_FEATURE_TABLE_TICKET
+from qiita_common.api_paths import (
+    PATH_FEATURE_TABLE_FEATURES,
+    PATH_FEATURE_TABLE_PREFIX,
+    PATH_FEATURE_TABLE_SAMPLES,
+    PATH_FEATURE_TABLE_VALUES,
+)
 from qiita_common.models.run_feature_table import FeatureTableRequest
+from qiita_common.taxonomy import QUOTED_RANK_COLUMNS
 
-from ...run_feature_table import SOURCES, VALUE_RELATION, stage_values
+from ...run_feature_table import ARROW_STREAM_MEDIA_TYPE, FEATURE_RELATION, SOURCES
 from .. import _common
 from .feature_table import (
     IDENTIFIER_MAP_NOTE,
@@ -38,7 +41,6 @@ from .feature_table import (
     _registered,
     _tool_versions,
     _write_bundle,
-    staged_stream,
 )
 
 MANIFEST_NOTE = (
@@ -51,7 +53,7 @@ MANIFEST_NOTE = (
 # What each method's feature ids are, for the manifest.
 _FEATURE_ID = {
     "amplicon": "md5 of the ASV sequence",
-    "taxonomic-profile": "the profiling database's genome identifier",
+    "taxonomic-profile": "the genome's exported_feature handle (its accession where free)",
 }
 
 
@@ -63,50 +65,55 @@ def _request(args: argparse.Namespace) -> FeatureTableRequest:
     )
 
 
-def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[str, int]]:
-    """Fetch the tickets, stream the cohort, relabel, and write the bundle."""
+def _arrow(args: argparse.Namespace, token: str, path: str, request: dict[str, Any]):
+    """One of the cohort's Arrow IPC answers, with dictionary columns decoded."""
     import pyarrow as pa  # noqa: PLC0415
-    import pyarrow.flight as flight  # noqa: PLC0415
 
-    request = _request(args)
-    response = _common.call(
+    body, content_type = _common.fetch_binary(
+        args.base_url,
+        token,
+        f"{PATH_FEATURE_TABLE_PREFIX}{path}",
+        accept=ARROW_STREAM_MEDIA_TYPE,
+        json=request,
+    )
+    if not content_type.startswith(ARROW_STREAM_MEDIA_TYPE):
+        raise RuntimeError(f"{path} answered {content_type!r}, not an Arrow stream")
+    table = pa.ipc.open_stream(body).read_all()
+    return pa.table(
+        {
+            name: (col.cast(col.type.value_type) if pa.types.is_dictionary(col.type) else col)
+            for name, col in zip(table.column_names, table.columns, strict=True)
+        }
+    )
+
+
+def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[str, int]]:
+    """Fetch the cohort's columns, values and features, and write the bundle."""
+    request = _request(args).model_dump(exclude_none=True)
+    columns = _common.call(
         "POST",
         args.base_url,
         token,
-        f"{PATH_FEATURE_TABLE_PREFIX}{PATH_FEATURE_TABLE_TICKET}",
-        json=request.model_dump(exclude_none=True),
+        f"{PATH_FEATURE_TABLE_PREFIX}{PATH_FEATURE_TABLE_SAMPLES}",
+        json=request,
     )
-    source = SOURCES[response["method"]]
-    samples: list[dict[str, Any]] = response["samples"]
-    names = pa.table(
-        {
-            "processing_idx": pa.array([s["processing_idx"] for s in samples], pa.int64()),
-            "prep_sample_idx": pa.array([s["prep_sample_idx"] for s in samples], pa.int64()),
-            "sample": pa.array([s["sample"] for s in samples], pa.string()),
-        }
-    )
-    streams = [("values_ticket", "run_values")]
-    if response["sequences_ticket"] is not None:
-        streams.append(("sequences_ticket", "chunks"))
-    with flight.FlightClient(args.data_plane_url) as client:
-        # Each stream is read once, into a table: the relabel scans both twice.
-        for key, relation in streams:
-            ticket = base64.b64decode(response[key])
-            with staged_stream(con, client, ticket, relation=f"{relation}_stream") as stream:
-                con.execute(f"CREATE TEMP TABLE {relation} AS SELECT * FROM {stream}")
-    with _registered(con, "names", names):
-        stage_values(
-            con,
-            source=source,
-            names="names",
-            values="run_values",
-            chunks="chunks" if len(streams) == 2 else None,
+    source = SOURCES[columns["method"]]
+    values = _arrow(args, token, PATH_FEATURE_TABLE_VALUES, request)
+    features = _arrow(args, token, PATH_FEATURE_TABLE_FEATURES, request)
+    with _registered(con, "run_values", values):
+        con.execute(
+            f"CREATE TEMP TABLE {ft.LABELLED_RELATION} AS"
+            " SELECT feature AS feature_id, sample AS sample_id, value"
+            " FROM run_values ORDER BY sample_id, feature_id"
         )
-    con.execute(
-        f"CREATE TEMP TABLE {ft.LABELLED_RELATION} AS"
-        " SELECT feature AS feature_id, sample AS sample_id, value"
-        f" FROM {VALUE_RELATION} ORDER BY sample_id, feature_id"
-    )
+    with _registered(con, "run_features", features):
+        con.execute(f"CREATE TEMP TABLE {FEATURE_RELATION} AS SELECT * FROM run_features")
+    unnamed = con.execute(
+        f"SELECT count(DISTINCT feature_id) FROM {ft.LABELLED_RELATION}"
+        f" WHERE feature_id NOT IN (SELECT feature FROM {FEATURE_RELATION})"
+    ).fetchone()[0]
+    if unnamed:
+        raise RuntimeError(f"{unnamed} feature(s) of the table are missing from its features")
     sizes = dict(
         zip(
             ("observations", "samples", "features"),
@@ -117,13 +124,26 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
             strict=True,
         )
     )
+    clearances: dict[str, Any] = {}
+    if source.sequences_table is not None:
+        clearances["sequences"] = SequencesClearance(features=sizes["features"])
+    else:
+        # A genome's ranks, as the alignment table's sidecar carries them; checked
+        # above to name every feature of the table.
+        con.execute(
+            f"CREATE VIEW {ft.TAXONOMY_SIDECAR_RELATION} AS"
+            f" SELECT feature AS feature_id, {', '.join(QUOTED_RANK_COLUMNS)}"
+            f" FROM {FEATURE_RELATION}"
+            f" WHERE feature IN (SELECT feature_id FROM {ft.LABELLED_RELATION})"
+        )
+        clearances["taxonomy"] = ft.TaxonomyClearance(rows=sizes["features"])
 
     def manifest(targets: list[Path]) -> dict[str, Any]:
         return {
             "note": MANIFEST_NOTE,
             "kind": source.method,
             "value_kind": source.value_kind,
-            "request": request.model_dump(exclude_none=True),
+            "request": request,
             "feature_id": _FEATURE_ID[source.method],
             **sizes,
             "files": [p.name for p in targets],
@@ -134,13 +154,9 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
         con,
         table_path=args.output,
         fmt=args.format,
-        identifiers=samples,
+        identifiers=columns["samples"],
         manifest=manifest,
-        clearances=(
-            {"sequences": SequencesClearance(features=sizes["features"])}
-            if source.sequences_table is not None
-            else {}
-        ),
+        clearances=clearances,
     )
     return written, sizes
 
@@ -149,7 +165,6 @@ def _handle_run_feature_table(args: argparse.Namespace, parser: argparse.Argumen
     """Entry point for `qiita feature-table runs`. Fails loudly (exit 1) on the
     first refusal; a failure part-way leaves no bundle file behind."""
     import duckdb  # noqa: PLC0415
-    import pyarrow.flight as flight  # noqa: PLC0415
     from pydantic import ValidationError  # noqa: PLC0415
 
     from ...miint import connect_with_miint  # noqa: PLC0415
@@ -160,9 +175,9 @@ def _handle_run_feature_table(args: argparse.Namespace, parser: argparse.Argumen
         print(f"error: {exc}", file=sys.stderr)
         return 1
     try:
-        # The refusals that need only the flags, before a connection or a stream.
-        # The method, and so whether a sequences companion is written, is known
-        # only from the ticket; the write checks the whole bundle again.
+        # The refusals that need only the flags, before a connection or a read.
+        # The method, and so which companion is written, is known only from the
+        # answer; the write checks the whole bundle again.
         _request(args)
         _bundle_targets(args.output, args.format)
         with contextlib.closing(connect_with_miint()) as con:
@@ -180,8 +195,8 @@ def _handle_run_feature_table(args: argparse.Namespace, parser: argparse.Argumen
             file=sys.stderr,
         )
         return 1
-    except flight.FlightError as exc:
-        print(f"flight error: {exc}", file=sys.stderr)
+    except _common.SlowResponseError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 1
     except duckdb.Error as exc:
         print(f"error: building the table failed on this machine: {exc}", file=sys.stderr)
@@ -198,6 +213,7 @@ def _handle_run_feature_table(args: argparse.Namespace, parser: argparse.Argumen
     print(f"and the map needed to read it: {map_path}")
     print(f"and the record of what produced it: {manifest_path}")
     for path in companions:
-        print(f"and each feature's sequence: {path}")
+        what = "sequence" if path.name.endswith(".sequences.parquet") else "taxonomy"
+        print(f"and each feature's {what}: {path}")
     print(IDENTIFIER_MAP_NOTE)
     return 0

@@ -2,9 +2,11 @@
 
 miint's `sylph_profile` sketches each sample's reads and reports, per genome of a
 sylph database it found, the sample's relative abundances, ANI and coverage. The
-database is a registered `profiling_database` reference's file, bound by the
-runner; the samples are the pool's metagenomic ones, also bound by the runner
-(an ENA study's amplicon runs share its pool and are left out).
+database is a `sylph` index of the sequence reference it was sketched from, bound
+by the runner with that reference's genome map, through which each genome sylph
+reports becomes the reference's `genome_idx`; the samples are the pool's
+metagenomic ones, also bound by the runner (an ENA study's amplicon runs share its
+pool and are left out).
 
 TODO: profile host-filtered reads rather than raw ones. A rype host-filter pass
 belongs in front of this step for metagenomic preps; host reads mostly match no
@@ -13,7 +15,7 @@ false genomes.
 
 Outputs:
   staging_dir     <staging>/taxonomic_profile.parquet, the DuckLake table rows
-                  (prep_sample_idx, processing_idx, genome_name, contig_name,
+                  (prep_sample_idx, processing_idx, genome_idx,
                   taxonomic_abundance, sequence_abundance, adjusted_ani, eff_cov),
                   abundances in percent and ANI as a fraction, as sylph reports
                   them, for register-files.
@@ -33,7 +35,10 @@ from pydantic import BaseModel, Field
 from qiita_common.backend_failure import StepNoData
 from qiita_common.parquet import validate_parquet_path
 from qiita_common.step_log import listed, summarize
-from qiita_common.taxonomic_profile_constants import TAXONOMIC_PROFILE_BASENAME
+from qiita_common.taxonomic_profile_constants import (
+    TAXONOMIC_PROFILE_BASENAME,
+    genome_source_id_sql,
+)
 
 from ..miint import (
     PARQUET_OPTS,
@@ -66,6 +71,8 @@ class Inputs(BaseModel):
 
     reads: unset in practice; the pool's reads stream from the data plane.
     sylph_database: the registered sylph `.syl2db`/`.syldb`, bound by the runner.
+    genome_map: its reference's genome map, (feature_idx, genome_idx, source,
+        source_id) Parquet, bound by the runner.
     profile_samples: JSON list of the prep_sample_idx to profile, bound by the runner.
     processing_idx: the run identity, threaded via the step's `params:`.
     min_ani: sylph's minimum adjusted ANI, a fraction in [0, 1], to report a
@@ -74,6 +81,7 @@ class Inputs(BaseModel):
 
     reads: Path | None = None
     sylph_database: Path
+    genome_map: Path
     profile_samples: Path
     processing_idx: int
     min_ani: float | None = Field(default=None, ge=0, le=1)
@@ -123,6 +131,43 @@ def _check_streamed(conn, reads_rel: str, samples: list[int]) -> None:
         )
 
 
+def _resolve_genomes(conn, genome_map: Path) -> None:
+    """Create `profiled_genome` (genome_name, genome_idx): each genome sylph reported,
+    resolved through its reference's genome map by `source_id`. A genome the
+    reference lacks, or names twice, is a database that was not sketched from this
+    reference: fail rather than drop its abundance."""
+    conn.execute(
+        "CREATE TABLE reference_genome AS"
+        " SELECT DISTINCT genome_idx, source_id FROM read_parquet(?)",
+        [str(genome_map)],
+    )
+    conn.execute(
+        "CREATE TABLE profiled_genome AS"
+        " SELECT p.genome_name, g.genome_idx"
+        f" FROM (SELECT DISTINCT genome_name, {genome_source_id_sql('genome_name')} AS source_id"
+        "       FROM profile) p"
+        " LEFT JOIN reference_genome g USING (source_id)"
+    )
+    unresolved = [
+        r[0]
+        for r in conn.execute(
+            "SELECT genome_name FROM profiled_genome WHERE genome_idx IS NULL ORDER BY 1"
+        ).fetchall()
+    ]
+    if unresolved:
+        raise ValueError(
+            f"{len(unresolved)} genome(s) sylph reported are not genomes of the database's"
+            f" reference: {listed(unresolved)}"
+        )
+    twice = conn.execute(
+        "SELECT genome_name FROM profiled_genome GROUP BY 1 HAVING count(*) > 1 ORDER BY 1"
+    ).fetchall()
+    if twice:
+        raise ValueError(
+            "genome(s) the reference names more than once: " + listed([r[0] for r in twice])
+        )
+
+
 def _check_units(conn, sample_col: str) -> None:
     """Fail loud unless sylph reported abundances in percent and ANI as a fraction.
 
@@ -151,6 +196,8 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
     database = inputs.sylph_database.resolve()
     if not database.is_file():
         raise FileNotFoundError(f"sylph database not found: {database}")
+    if not inputs.genome_map.is_file():
+        raise FileNotFoundError(f"genome map not found: {inputs.genome_map}")
     samples = json.loads(inputs.profile_samples.read_text())
     if not samples or not all(type(s) is int and s > 0 for s in samples):
         raise ValueError(f"profile_samples must be a non-empty list of idxs, got {samples!r}")
@@ -230,16 +277,18 @@ async def execute(inputs: Inputs, workspace: Path) -> dict[str, Path]:
         if unprofiled:
             _LOG.warning("samples with no genome reported: %s", listed(unprofiled))
         summarize(samples=len(samples), samples_profiled=len(per_sample), genomes=genomes)
+        _resolve_genomes(conn, inputs.genome_map)
         # `genome_index` is left out: it is the genome's rank within the sample's
         # rows, not its offset in the database, so it identifies nothing.
         conn.execute(
             "COPY ("
             f"  SELECT {sample_col}::BIGINT AS prep_sample_idx,"
             f"         CAST({inputs.processing_idx} AS BIGINT) AS processing_idx,"
-            "         genome_name, contig_name,"
+            "         g.genome_idx,"
             "         taxonomic_abundance, sequence_abundance,"
             "         adjusted_ani, eff_cov"
-            "  FROM profile ORDER BY prep_sample_idx, genome_name"
+            "  FROM profile JOIN profiled_genome g USING (genome_name)"
+            "  ORDER BY prep_sample_idx, genome_idx"
             f") TO '{profile_out}' ({PARQUET_OPTS})"
         )
         conn.execute(

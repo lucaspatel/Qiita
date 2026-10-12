@@ -11,13 +11,16 @@ description: >
   read_block DoGet amplicon's denoise uses) and profiles the pool's short- and
   long-read metagenomic samples, which the runner binds as `profile_samples`; an
   ENA study's amplicon runs share its pool and are left out. The database is a
-  registered `profiling_database` reference (`sylph_reference_idx`), read where an
-  operator staged it; the runner binds its path, and its sha256 into the run
-  identity, so profiling with a different database, file or threshold is a
-  different processing_idx.
+  `sylph` index of the sequence reference it was sketched from (`sylph_index_idx`,
+  one such index row), read where an operator staged it; the runner binds its
+  path, the reference's genome map, and the reference and the file's sha256 into
+  the run identity, so profiling with a different database, file or threshold is
+  a different processing_idx.
 
   The step writes one DuckLake `taxonomic_profile` row per (sample, genome) sylph
-  reported, with its taxonomic and sequence abundance, ANI and effective coverage;
+  reported, the genome resolved to the reference's `genome_idx` (a genome the
+  reference lacks fails the step), with its taxonomic and sequence abundance, ANI
+  and effective coverage;
   register-files loads it (replace-keyed on prep_sample + processing). The closing
   action records each sample's genome count in qiita.taxonomic_profile_sample and
   mints its public QM identifier, the label a feature table carries for it.
@@ -34,13 +37,13 @@ audience:
 
 context_schema:
   type: object
-  required: [sylph_reference_idx]
+  required: [sylph_index_idx]
   # a context naming an undeclared key is refused, not silently ignored.
   additionalProperties: false
   properties:
-    # a registered profiling_database reference; part of the run identity, with
-    # its file's sha256.
-    sylph_reference_idx:
+    # a `sylph` reference_index row; its reference and file sha256 are part of the
+    # run identity.
+    sylph_index_idx:
       type: integer
       minimum: 1
     # sylph's minimum adjusted ANI, a fraction in [0, 1], to report a genome;
@@ -52,12 +55,13 @@ context_schema:
 
 steps:
   # profile the pool's metagenomic samples. no reads input — the pool's reads
-  # stream at runtime; the database and the sample list are runner-resolved.
+  # stream at runtime; the database, its reference's genome map and the sample
+  # list are runner-resolved.
   # processing_idx rides params and signals the runner to mint it.
   - step: profile
     step_type: singleton
     module: qiita_compute_orchestrator.jobs.taxonomic_profile
-    inputs: [sylph_database, profile_samples]
+    inputs: [sylph_database, genome_map, profile_samples]
     params: {processing_idx: processing_idx, min_ani: min_ani}
     outputs: [staging_dir, profile_counts]
     baseline_resources:

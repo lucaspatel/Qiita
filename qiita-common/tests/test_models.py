@@ -88,7 +88,7 @@ def test_reference_file_register_request_reads_the_format_from_the_suffix():
 
     from qiita_common.models import ReferenceFileRegisterRequest
 
-    base = {"name": "wol3", "version": "rc4", "sha256": "a" * 64, "size_bytes": 1}
+    base = {"reference_idx": 18, "sha256": "a" * 64, "size_bytes": 1}
     two = ReferenceFileRegisterRequest(fs_path="/db/wol3.syl2db", **base)
     one = ReferenceFileRegisterRequest(fs_path="/db/wol3.syldb", **base)
     assert (two.format, one.format, two.index_type) == ("syl2db", "syldb", "sylph")

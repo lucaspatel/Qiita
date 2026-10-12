@@ -128,11 +128,16 @@ async def fetch_study_lineage(pool: asyncpg.Pool, study_idx: int) -> dict[str, l
         " WHERE a.prep_sample_idx = ANY($1::bigint[])",
         prep_sample_idxs,
     )
-    # A profile names the database it read, by the profiling_database reference
-    # its run identity carries.
+    # A profile names the database it read: the reference its run identity carries,
+    # and the label of that reference's sylph file with the identity's sha256 (one
+    # reference may carry several).
     profiles = await pool.fetch(
         "SELECT t.processing_idx, t.prep_sample_idx, t.state, t.genome_count,"
-        "       p.workflow, p.version, r.name AS database_name, r.version AS database_version"
+        "       p.workflow, p.version, r.name AS database_name, r.version AS database_version,"
+        "       (SELECT ri.params->>'label' FROM qiita.reference_index ri"
+        "         WHERE ri.reference_idx = r.reference_idx AND ri.index_type = 'sylph'"
+        "           AND ri.params->>'sha256' = p.params->>'sylph_database_sha256'"
+        "         ORDER BY ri.created_at DESC LIMIT 1) AS database_label"
         "  FROM qiita.taxonomic_profile_sample t JOIN qiita.processing p USING (processing_idx)"
         "  LEFT JOIN qiita.reference r"
         "    ON r.reference_idx = (p.params->>'sylph_reference_idx')::bigint"
@@ -265,6 +270,7 @@ def build_study_lineage(study_idx: int, rows: dict[str, list[Any]]) -> StudyLine
             table_id = f"feature_table:{r['processing_idx']}"
             database = (
                 f" · {r['database_name']} {r['database_version']}"
+                + (f" {r['database_label']}" if r["database_label"] else "")
                 if r["database_name"] is not None
                 else ""
             )

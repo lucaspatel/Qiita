@@ -52,10 +52,11 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   `qiita.work_ticket`), `exported_identifier_processing` (amplicon QM identifiers) and
   `amplicon_sample` (the per-sample amplicon gate the study lineage reads). All additive;
   no out-of-band step.
-- `[operator]` `make migrate` applies `profiling_database_reference` (admits the
-  `profiling_database` reference kind and the `sylph` index type; CHECK widens only) and
-  `taxonomic_profile_sample` (the per-sample taxonomic-profile gate). Additive; no
-  out-of-band step.
+- `[operator]` `make migrate` applies `profiling_database_reference`,
+  `taxonomic_profile_sample`, `profiling_taxonomy` and `sylph_on_sequence_reference`.
+  Together they admit the `sylph` index type and add the per-sample taxonomic-profile gate;
+  the standalone profiling-database kind and taxonomy table the earlier two introduce, the
+  last removes. No out-of-band step.
 - `[operator]` `make migrate` applies `20261006000000_exported_entity.sql` (new table `qiita.exported_entity`, mint-on-insert triggers on `qiita.study` and `qiita.biosample`, and a backfill of one row per existing study and biosample, all in one transaction; it aborts and rolls back if any study or biosample is left without a row). (#682)
 
 ### 4. Deploy
@@ -66,14 +67,16 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
   feature table, and their per-sample lineage state.
 - `[operator]` The actions sync registers **`taxonomic-profile` 1.0.0** (sylph over a
   pool's metagenomic samples). The data plane creates the DuckLake `taxonomic_profile`
-  table at boot. To profile, register each sylph database where it sits, on a path the
-  control plane and the compute nodes share and the service accounts can read:
-  `qiita reference register-file --name wol3 --version rc4-ani95 --path /…/wol3_rc4_ani95.syl2db`
-  (system admin PAT), then submit with `{"sylph_reference_idx": <idx>}`.
+  table at boot. To profile, register each sylph database on the sequence reference whose
+  genomes it was sketched from, where it sits, on a path the control plane and the compute
+  nodes share and the service accounts can read:
+  `qiita reference register-file --reference-idx <web-of-life 3-rc4> --label ani95 --path /…/wol3_rc4_ani95.syl2db`
+  (system admin PAT), then submit with `{"sylph_index_idx": <the index row>}`.
 - `[api]` `/amplicon/feature-table/{samples,counts,features,ticket}` is now
-  `/feature-table/{samples,values,features,ticket}` (`counts` → `values`, a `value` DOUBLE
-  column; the samples and ticket answers add `method` and `value_kind`), and
-  `qiita feature-table amplicon` is now `qiita feature-table runs`.
+  `/feature-table/{samples,values,features}` (`counts` → `values`, a `value` DOUBLE column;
+  the samples answer adds `method` and `value_kind`; `ticket` is removed), and
+  `qiita feature-table amplicon` is now `qiita feature-table runs`, which reads the routes
+  and takes no `--data-plane-url`.
 
 ### 5. Verify
 

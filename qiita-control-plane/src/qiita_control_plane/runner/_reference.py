@@ -22,6 +22,7 @@ from qiita_common.models import (
 
 import qiita_control_plane.runner as _runner_pkg
 
+from ..actions.library import genome_map_parquet
 from ..actions.reference import (
     ReferenceNotFound,
 )
@@ -110,7 +111,7 @@ def _coerce_reference_idx(value: Any, field: str) -> int:
     return value
 
 
-async def _resolve_required_host_index(
+async def _resolve_required_index(
     pool: asyncpg.Pool | asyncpg.Connection,
     reference_idx: int,
     index_type: str,
@@ -206,7 +207,7 @@ async def _resolve_host_filter_two_reference(
     `host_minimap2_reference_idx` — each from its own reference. See
     `_resolve_host_filter_indexes`."""
     bound: dict[str, Path] = {
-        "host_rype_path": await _resolve_required_host_index(
+        "host_rype_path": await _resolve_required_index(
             pool,
             _coerce_reference_idx(rype_idx, "host_rype_reference_idx"),
             HOST_FILTER_INDEX_TYPE_RYPE,
@@ -214,7 +215,7 @@ async def _resolve_host_filter_two_reference(
         )
     }
     if minimap2_idx is not None:
-        bound["host_minimap2_path"] = await _resolve_required_host_index(
+        bound["host_minimap2_path"] = await _resolve_required_index(
             pool,
             _coerce_reference_idx(minimap2_idx, "host_minimap2_reference_idx"),
             HOST_FILTER_INDEX_TYPE_MINIMAP2,
@@ -242,7 +243,7 @@ async def _resolve_syndna_index(
     step loop. Gated by `syndna_enabled`; enabled without a reference is a contract
     error, not a silent no-op.
 
-    `_resolve_required_host_index` is named for its first caller but is generic —
+    `_resolve_required_index` is named for its first caller but is generic —
     it maps unknown / non-active / index-not-built to a SUBMISSION BAD_INPUT.
     """
     if not action_context.get("syndna_enabled"):
@@ -251,7 +252,7 @@ async def _resolve_syndna_index(
     if syndna_idx is None:
         raise _submission_bad_input("syndna_enabled requires syndna_reference_idx")
     return {
-        SYNDNA_MINIMAP2_BINDING: await _resolve_required_host_index(
+        SYNDNA_MINIMAP2_BINDING: await _resolve_required_index(
             pool,
             _coerce_reference_idx(syndna_idx, "syndna_reference_idx"),
             HOST_FILTER_INDEX_TYPE_MINIMAP2,
@@ -671,56 +672,65 @@ async def _resolve_qc_adapters(
 
 
 # =============================================================================
-# SortMeRNA reference resolution (amplicon denoise)
+# sylph database resolution (taxonomic-profile)
 # =============================================================================
 #
-# taxonomic-profile's step reads a sylph database a `profiling_database` reference
-# names. The file stays where the operator staged it; the runner binds its path,
-# and its sha256 for the run identity.
+# taxonomic-profile's step reads a sylph database registered on the sequence
+# reference whose genomes it was sketched from. The file stays where the operator
+# staged it; the runner binds its path, its sha256 for the run identity, and the
+# reference's genome map, which the step resolves each profiled genome through.
 
 SYLPH_DATABASE_BINDING = "sylph_database"
 SYLPH_DATABASE_SHA256_BINDING = "sylph_database_sha256"
-# action_context key: the profiling_database reference to profile against.
+SYLPH_GENOME_MAP_BINDING = "genome_map"
+# action_context key: the sylph index row to profile against. A reference may carry
+# several (sketched at different ANI thresholds, say), so the row is named, not
+# the reference.
+SYLPH_INDEX_IDX_KEY = "sylph_index_idx"
+# Bound from that row: the reference it belongs to, which the run identity carries.
 SYLPH_REFERENCE_IDX_KEY = "sylph_reference_idx"
 
 
 async def _resolve_sylph_database(
-    pool: asyncpg.Pool | asyncpg.Connection, *, action_context: dict[str, Any]
+    pool: asyncpg.Pool, *, action_context: dict[str, Any], workspace: Path
 ) -> dict[str, Any]:
-    """Bind the sylph database file of the action context's `sylph_reference_idx`,
-    and its sha256. The reference must be an ACTIVE `profiling_database` with a
-    `sylph` index row; anything else is a SUBMISSION BAD_INPUT, as is a file that
-    is no longer where it was registered."""
-    reference_idx = _coerce_reference_idx(
-        action_context.get(SYLPH_REFERENCE_IDX_KEY), SYLPH_REFERENCE_IDX_KEY
-    )
-    kind = await pool.fetchval(
-        "SELECT kind FROM qiita.reference WHERE reference_idx = $1", reference_idx
-    )
-    if kind is None:
-        raise _submission_bad_input(f"{SYLPH_REFERENCE_IDX_KEY} {reference_idx} does not exist")
-    if kind != "profiling_database":
-        raise _submission_bad_input(
-            f"{SYLPH_REFERENCE_IDX_KEY} {reference_idx} is a {kind!r}, not a 'profiling_database'"
-        )
-    fs_path = await _resolve_required_host_index(
-        pool, reference_idx, INDEX_TYPE_SYLPH, SYLPH_REFERENCE_IDX_KEY
-    )
-    params = await pool.fetchval(
-        "SELECT params FROM qiita.reference_index"
-        " WHERE reference_idx = $1 AND index_type = $2 AND fs_path = $3"
-        " ORDER BY created_at DESC, reference_index_idx DESC LIMIT 1",
-        reference_idx,
+    """Bind the sylph database the action context's `sylph_index_idx` names, its
+    sha256 and reference, and that reference's genome map (staged in `workspace`).
+    The row must be a `sylph` index of an active sequence reference; anything else
+    is a SUBMISSION BAD_INPUT, as is a file that is no longer where it was
+    registered."""
+    index_idx = _coerce_reference_idx(action_context.get(SYLPH_INDEX_IDX_KEY), SYLPH_INDEX_IDX_KEY)
+    row = await pool.fetchrow(
+        "SELECT ri.reference_idx, ri.fs_path, ri.params, r.kind, r.status"
+        "  FROM qiita.reference_index ri"
+        "  JOIN qiita.reference r ON r.reference_idx = ri.reference_idx"
+        " WHERE ri.reference_index_idx = $1 AND ri.index_type = $2",
+        index_idx,
         INDEX_TYPE_SYLPH,
-        str(fs_path),
     )
+    if row is None:
+        raise _submission_bad_input(f"{SYLPH_INDEX_IDX_KEY} {index_idx} is not a sylph index")
+    if row["kind"] != "sequence_reference" or row["status"] != "active":
+        raise _submission_bad_input(
+            f"{SYLPH_INDEX_IDX_KEY} {index_idx} belongs to reference {row['reference_idx']},"
+            f" a {row['status']} {row['kind']!r}, not an active sequence_reference"
+        )
+    fs_path = Path(row["fs_path"])
+    if not fs_path.is_file():
+        raise _submission_bad_input(
+            f"{SYLPH_INDEX_IDX_KEY} {index_idx}: {fs_path} is no longer a file"
+        )
+    params = row["params"]
     if isinstance(params, str):
         params = json.loads(params)
-    if not Path(fs_path).is_file():
-        raise _submission_bad_input(
-            f"{SYLPH_REFERENCE_IDX_KEY} {reference_idx}: {fs_path} is no longer a file"
-        )
-    return {SYLPH_DATABASE_BINDING: Path(fs_path), SYLPH_DATABASE_SHA256_BINDING: params["sha256"]}
+    genome_map = workspace / "sylph_genome_map.parquet"
+    genome_map.write_bytes(await genome_map_parquet(pool, row["reference_idx"]))
+    return {
+        SYLPH_DATABASE_BINDING: fs_path,
+        SYLPH_DATABASE_SHA256_BINDING: params["sha256"],
+        SYLPH_REFERENCE_IDX_KEY: row["reference_idx"],
+        SYLPH_GENOME_MAP_BINDING: genome_map,
+    }
 
 
 # amplicon's denoise step 16S-filters with SortMeRNA, which needs a FASTA. the

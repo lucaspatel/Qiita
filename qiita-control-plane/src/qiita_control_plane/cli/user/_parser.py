@@ -37,7 +37,6 @@ from qiita_common.models import (
     HOST_FILTER_INDEX_TYPE_MINIMAP2,
     HOST_FILTER_INDEX_TYPE_RYPE,
     INDEX_TYPE_SYLPH,
-    INDEX_TYPE_SYLPH_TAXONOMY,
     STORABLE_ACCESS_TIERS,
     BiosamplePatchRequest,
     BiosampleStudyFieldCreateRequest,
@@ -1369,8 +1368,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_ft_build.set_defaults(handler=_handle_feature_table_build)
 
     # `feature-table runs` — a table over a cohort from amplicon runs or taxonomic
-    # profiles, built client-side from signed Flight streams and written straight
-    # from its sparse rows.
+    # profiles, read from the `/feature-table` routes and written straight from its
+    # sparse rows.
     p_ft_runs = p_feature_table_sub.add_parser(
         "runs",
         help=(
@@ -1413,14 +1412,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Where to write the table. The rest of the bundle is named after it:"
             " <stem>.exported-identifier.json, <stem>.manifest.json and, for an amplicon"
-            " table, <stem>.sequences.parquet. None is overwritten if it exists, and a"
+            " table, <stem>.sequences.parquet, for a profile <stem>.taxonomy.parquet."
+            " None is overwritten if it exists, and a"
             " failure part-way leaves none of them behind."
         ),
-    )
-    p_ft_runs.add_argument(
-        "--data-plane-url",
-        required=True,
-        help="gRPC URL of the data plane the values and ASV bytes stream from.",
     )
     p_ft_runs.set_defaults(handler=_handle_run_feature_table)
 
@@ -1597,17 +1592,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_reference_register = p_reference_sub.add_parser(
         "register-file",
         help=(
-            "Register a file of a prebuilt profiling database where it sits on disk: a sylph"
-            " .syl2db/.syldb or its taxonomy TSV, on a new or existing release (system admin)"
+            "Register a prebuilt index file of a sequence reference where it sits on disk:"
+            " a sylph .syl2db/.syldb sketched from the reference's genomes (system admin)"
         ),
     )
-    p_reference_register.add_argument("--name", help="A new release's name, e.g. wol3")
-    p_reference_register.add_argument("--version", help="A new release's version, e.g. rc4-ani95")
     p_reference_register.add_argument(
         "--reference-idx",
         dest="reference_idx",
         type=int,
-        help="An existing release to attach the file to, instead of --name/--version",
+        required=True,
+        help="The active sequence reference whose genomes the file was built from",
     )
     p_reference_register.add_argument(
         "--path",
@@ -1617,9 +1611,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_reference_register.add_argument(
         "--index-type",
         dest="index_type",
-        choices=(INDEX_TYPE_SYLPH, INDEX_TYPE_SYLPH_TAXONOMY),
+        choices=(INDEX_TYPE_SYLPH,),
         default=INDEX_TYPE_SYLPH,
-        help="sylph (the database, default) or sylph_taxonomy (its genome -> lineage TSV)",
+        help="sylph (the default, and today the only one)",
+    )
+    p_reference_register.add_argument(
+        "--label",
+        help="Tells this file apart from the reference's others of its type, e.g. ani95",
     )
     p_reference_register.set_defaults(handler=_handle_reference_register_file)
     p_reference_load = p_reference_sub.add_parser(

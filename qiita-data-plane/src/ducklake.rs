@@ -821,22 +821,30 @@ pub fn ensure_amplicon_tables(conn: &Connection) -> Result<(), Box<dyn std::erro
 
 /// Create the taxonomic-profile table. One row per (sample, run, genome) a
 /// profiler reported: the `taxonomic-profile` workflow's sylph abundances (percent),
-/// ANI (a fraction) and effective coverage. `genome_name` is the profiling database's own genome identifier (not
-/// yet mapped to `qiita.genome`). Replace-keyed on `(prep_sample_idx,
-/// processing_idx)` in `flight_service::REPLACE_KEY_TABLES`, so a re-run replaces
-/// its own rows.
+/// ANI (a fraction) and effective coverage, the genome as the `genome_idx` of the
+/// sequence reference the database was sketched from. Replace-keyed on
+/// `(prep_sample_idx, processing_idx)` in `flight_service::REPLACE_KEY_TABLES`, so
+/// a re-run replaces its own rows.
 pub fn ensure_taxonomic_profile_table(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS qiita_lake.taxonomic_profile (
             prep_sample_idx BIGINT NOT NULL,
             processing_idx BIGINT NOT NULL,
-            genome_name VARCHAR NOT NULL,
-            contig_name VARCHAR,
             taxonomic_abundance DOUBLE NOT NULL,
             sequence_abundance DOUBLE NOT NULL,
             adjusted_ani DOUBLE NOT NULL,
-            eff_cov DOUBLE NOT NULL
+            eff_cov DOUBLE NOT NULL,
+            genome_idx BIGINT
         );",
+    )?;
+    // A lake from before genomes were resolved names them by the database's file
+    // path; move it to this shape, the CREATE's column order included, so a fresh
+    // and an evolved lake agree. Its old rows keep a NULL genome_idx, and the
+    // control plane retired the runs that wrote them.
+    conn.execute_batch(
+        "ALTER TABLE qiita_lake.taxonomic_profile DROP COLUMN IF EXISTS genome_name;
+         ALTER TABLE qiita_lake.taxonomic_profile DROP COLUMN IF EXISTS contig_name;
+         ALTER TABLE qiita_lake.taxonomic_profile ADD COLUMN IF NOT EXISTS genome_idx BIGINT;",
     )?;
     Ok(())
 }
@@ -1552,6 +1560,8 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
     fn ensure_taxonomic_profile_table_is_idempotent() {
         let conn = setup_conn();
         ensure_taxonomic_profile_table(&conn).expect("first ensure_taxonomic_profile_table");
@@ -1634,6 +1644,60 @@ mod tests {
     /// A lake created before the attribute columns existed gains them on the next
     /// boot: `CREATE TABLE IF NOT EXISTS` alone would leave it at five columns and
     /// `ducklake_add_data_files` would then reject every membership Parquet.
+    #[test]
+    #[serial]
+    #[cfg(feature = "integration")]
+    fn ensure_taxonomic_profile_table_moves_a_genome_name_table_to_genome_idx() {
+        let conn = setup_conn();
+        conn.execute_batch("DROP TABLE IF EXISTS qiita_lake.taxonomic_profile;")
+            .unwrap();
+        // The shape a lake held when genomes were named by the database's file path.
+        conn.execute_batch(
+            "CREATE TABLE qiita_lake.taxonomic_profile (
+                prep_sample_idx BIGINT NOT NULL,
+                processing_idx BIGINT NOT NULL,
+                genome_name VARCHAR NOT NULL,
+                contig_name VARCHAR,
+                taxonomic_abundance DOUBLE NOT NULL,
+                sequence_abundance DOUBLE NOT NULL,
+                adjusted_ani DOUBLE NOT NULL,
+                eff_cov DOUBLE NOT NULL
+            );
+            INSERT INTO qiita_lake.taxonomic_profile
+                VALUES (1, 2, '/db/G1.fna.gz', 'c1', 50.0, 40.0, 0.98, 3.0);",
+        )
+        .unwrap();
+
+        ensure_taxonomic_profile_table(&conn).expect("ensure over the genome_name shape");
+
+        let names: Vec<String> = table_schema(&conn, "taxonomic_profile")
+            .into_iter()
+            .map(|(n, _, _)| n)
+            .collect();
+        // The CREATE's columns, in its order: a fresh lake and an evolved one agree.
+        let fresh = [
+            "prep_sample_idx",
+            "processing_idx",
+            "taxonomic_abundance",
+            "sequence_abundance",
+            "adjusted_ani",
+            "eff_cov",
+            "genome_idx",
+        ];
+        assert_eq!(
+            names, fresh,
+            "an evolved lake must match a fresh one, in order"
+        );
+        let old_genome: Option<i64> = conn
+            .query_row(
+                "SELECT genome_idx FROM qiita_lake.taxonomic_profile",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_genome, None);
+    }
+
     #[test]
     #[serial]
     #[cfg(feature = "integration")]

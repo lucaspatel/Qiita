@@ -1036,3 +1036,46 @@ async def cleanup_reference_graph(
             "DELETE FROM qiita.genome WHERE genome_idx = ANY($1::bigint[])", list(genome_idxs)
         )
     await pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", reference_idx)
+
+
+async def seed_genome_reference(
+    pool: asyncpg.Pool, *, label: str, n_genomes: int, active: bool = True
+) -> dict:
+    """An active `sequence_reference` of `n_genomes` single-feature genomes, the
+    shape a sylph database is registered on. Returns `reference_idx`, the genomes
+    `(genome_idx, source_id)` in order, and `feature_idxs`, for
+    `cleanup_genome_reference`."""
+    reference_idx = await seed_bare_reference(pool, label=label)
+    if active:
+        await pool.execute(
+            "UPDATE qiita.reference SET status = $2 WHERE reference_idx = $1",
+            reference_idx,
+            ReferenceStatus.ACTIVE.value,
+        )
+    genomes, feature_idxs = [], []
+    for _ in range(n_genomes):
+        feature_idx = await seed_bare_feature(pool)
+        genome = await seed_genome(pool, source=GenomeSource.GENBANK)
+        await seed_reference_membership(pool, reference_idx=reference_idx, feature_idx=feature_idx)
+        await seed_feature_genome(pool, feature_idx=feature_idx, genome_idx=genome[0])
+        genomes.append(genome)
+        feature_idxs.append(feature_idx)
+    return {"reference_idx": reference_idx, "genomes": genomes, "feature_idxs": feature_idxs}
+
+
+async def cleanup_genome_reference(pool: asyncpg.Pool, seeded: dict) -> None:
+    """Undo `seed_genome_reference`, with any index rows and genome labels the test
+    registered on it."""
+    genome_idxs = [g for g, _ in seeded["genomes"]]
+    await pool.execute(
+        "DELETE FROM qiita.reference_index WHERE reference_idx = $1", seeded["reference_idx"]
+    )
+    await pool.execute(
+        "DELETE FROM qiita.exported_feature WHERE genome_idx = ANY($1::bigint[])", genome_idxs
+    )
+    await cleanup_reference_graph(
+        pool,
+        reference_idx=seeded["reference_idx"],
+        feature_idxs=seeded["feature_idxs"],
+        genome_idxs=genome_idxs,
+    )

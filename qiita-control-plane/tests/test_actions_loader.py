@@ -1691,9 +1691,9 @@ def test_load_actions_loads_taxonomic_profile_1_0_0():
         "finalize-taxonomic-profile-sample",
     ]
     profile = action.steps[0]
-    assert profile.inputs == ["sylph_database", "profile_samples"]
+    assert profile.inputs == ["sylph_database", "genome_map", "profile_samples"]
     assert profile.outputs == ["staging_dir", "profile_counts"]
     assert action.steps[-1].inputs == ["profile_counts"]
     assert action_threads_processing_idx(action.steps)
-    assert action.context_schema["required"] == ["sylph_reference_idx"]
+    assert action.context_schema["required"] == ["sylph_index_idx"]
     assert action.context_schema["additionalProperties"] is False

@@ -151,13 +151,19 @@ async def test_lineage_reads_follow_an_ena_download_in_progress(
 
 @pytest.fixture
 async def profile_run(role_keyed_clients, amplicon_study):
-    """A taxonomic-profile run over the study's first two samples, against a
-    registered profiling database."""
+    """A taxonomic-profile run over the study's first two samples, against a sylph
+    database labelled `ani95` on a sequence reference."""
     db = role_keyed_clients["pool"]
     ref = await db.fetchval(
         "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
-        " VALUES ($1, 'rc4-ani95', 'profiling_database', 'active', 1) RETURNING reference_idx",
+        " VALUES ($1, 'rc4', 'sequence_reference', 'active', 1) RETURNING reference_idx",
         f"wol3-{secrets.token_hex(4)}",
+    )
+    await db.execute(
+        "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params)"
+        " VALUES ($1, 'sylph', '/srv/wol3.syl2db', $2::jsonb)",
+        ref,
+        '{"format": "syl2db", "sha256": "' + "ab" * 32 + '", "size_bytes": 1, "label": "ani95"}',
     )
     async with db.acquire() as conn:
         run = await mint_processing(
@@ -168,6 +174,7 @@ async def profile_run(role_keyed_clients, amplicon_study):
                 "workflow": "taxonomic-profile",
                 "version": "1.0.0",
                 "sylph_reference_idx": ref,
+                "sylph_database_sha256": "ab" * 32,
                 "probe": str(uuid.uuid4()),
             },
         )
@@ -184,6 +191,7 @@ async def profile_run(role_keyed_clients, amplicon_study):
     yield {"processing_idx": p, "reference_idx": ref}
     await db.execute("DELETE FROM qiita.taxonomic_profile_sample WHERE processing_idx = $1", p)
     await db.execute("DELETE FROM qiita.processing WHERE processing_idx = $1", p)
+    await db.execute("DELETE FROM qiita.reference_index WHERE reference_idx = $1", ref)
     await db.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", ref)
 
 
@@ -200,7 +208,7 @@ async def test_lineage_branches_a_taxonomic_profile_to_its_feature_table(
     profile = nodes[f"processing:{p}"]
     assert profile["label"] == "Taxonomic profile"
     assert profile["detail"].startswith("taxonomic-profile 1.0.0 · wol3-")
-    assert profile["detail"].endswith(" rc4-ani95")
+    assert profile["detail"].endswith(" rc4 ani95")
     assert profile["counts"] == {"completed": 1, "no_data": 1, "not_started": 1}
     assert nodes[f"feature_table:{p}"]["counts"] == {"completed": 1}
     edges = {(e["source"], e["target"]) for e in group["edges"]}

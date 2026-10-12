@@ -444,11 +444,13 @@ def fetch_binary(
     path: str,
     *,
     accept: str,
+    json: dict | None = None,
     timeout: float = BULK_READ_HTTP_TIMEOUT_SECONDS,
     floor_rate: int = BULK_READ_FLOOR_BYTES_PER_SECOND,
     slack: float = BULK_READ_TRANSFER_SLACK_SECONDS,
 ) -> tuple[bytes, str]:
-    """GET a bulk binary body, refusing to wait on a link that will not finish.
+    """GET a bulk binary body (POST `json`, for a read whose request is a body),
+    refusing to wait on a link that will not finish.
 
     Returns `(body, content_type)`. The type is handed back rather than checked
     here because only the caller knows what it asked for; `PARQUET_MEDIA_TYPE`'s
@@ -473,9 +475,10 @@ def fetch_binary(
     check, which httpx raises when a peer closes early against a declared length.
     """
     with httpx.stream(
-        "GET",
+        "GET" if json is None else "POST",
         _api_url(base_url, path),
         headers=_auth_headers(token, Accept=accept),
+        json=json,
         # Only the READ phase gets the longer budget — it is the server building
         # the body. Every other phase keeps the shared one: connecting is no
         # slower here than on any other call, and a bare float would set all four,

@@ -42,8 +42,7 @@
   unique in the table and by QM otherwise; values are sparse COO in Arrow IPC (amplicon
   counts with md5 feature ids, whose features carry each ASV's sequence; profile relative
   abundances by genome name), and the samples answer names the method and `value_kind`.
-  `POST .../ticket` returns signed Flight tickets, and `qiita feature-table runs` builds a
-  BIOM or Parquet bundle from them.
+  `qiita feature-table runs` writes a BIOM or Parquet bundle from the same answers.
 - **`GET /study/{idx}/lineage` describes a study's processing as a graph.** One DAG per
   prep protocol (run, reads, mask, processing, product), with per-sample states backed by a
   new `qiita.amplicon_sample` gate, sample labels by accession, else QB, and each sample's

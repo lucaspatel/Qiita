@@ -1,21 +1,19 @@
 """The run feature table over REST: one cohort request, three answers.
 
-`POST /feature-table/{samples,values,features,ticket}` all take the same body
+`POST /feature-table/{samples,values,features}` all take the same body
 (`FeatureTableRequest`: runs, and a study or a sample list) and answer:
 
   * samples — the table's columns as JSON: each processed sample's column name,
     its QM, its biosample's public name (to join to metadata), and its run; with
     the runs' method and what their values are (`count` or `relative_abundance`);
   * values — sparse COO `(sample, feature, value)` as an Arrow IPC stream;
-  * features — `(feature, sequence, length, taxonomy)` for every feature the values
-    name, as an Arrow IPC stream (sequence and length null for a profile, whose
-    taxonomy is each genome's lineage from its database's taxonomy file);
-  * ticket — the same reads as signed Flight tickets, with the columns, for a
-    client that builds the table itself (the CLI).
+  * features — `(feature, sequence, length, <eight ranks>)` for every feature the
+    values name, as an Arrow IPC stream: an ASV's sequence, or a genome's taxonomy
+    from its reference.
 
 What a feature table is, which runs it can merge, and why COO, is in
-`run_feature_table`. REST carries it beside Flight because the web UI cannot speak
-Flight; Arrow IPC keeps the same columnar rows a Flight reader gets.
+`run_feature_table`. Arrow IPC keeps the same columnar rows a Flight reader gets,
+for the web UI and the CLI alike.
 
 Access is `authorize_prep_sample_cohort`, all-or-nothing over the cohort, at the
 tier the other cohort reads use, checked before anything is read from the data
@@ -24,7 +22,6 @@ is the authorization boundary.
 """
 
 import asyncio
-import base64
 
 import asyncpg
 import pyarrow as pa
@@ -35,31 +32,27 @@ from qiita_common.api_paths import (
     PATH_FEATURE_TABLE_FEATURES,
     PATH_FEATURE_TABLE_PREFIX,
     PATH_FEATURE_TABLE_SAMPLES,
-    PATH_FEATURE_TABLE_TICKET,
     PATH_FEATURE_TABLE_VALUES,
 )
 from qiita_common.auth_constants import Scope
-from qiita_common.models.run_feature_table import (
-    FeatureTableRequest,
-    FeatureTableSamples,
-    FeatureTableTicketResponse,
-    FeatureTableTicketSample,
-)
+from qiita_common.models.run_feature_table import FeatureTableRequest, FeatureTableSamples
 
 from ..auth.guards import COHORT_MIN_TIER, require_complete_profile, require_scope
 from ..auth.principal import HumanUser, Principal
 from ..deps import get_data_plane_url, get_db_pool, get_flight_signing_key
-from ..repositories.profiling_taxonomy import fetch_lineages
 from ..run_feature_table import (
     ARROW_STREAM_MEDIA_TYPE,
     Cohort,
     CohortError,
+    Genomes,
     arrow_stream_bytes,
     build_features,
     build_values,
-    cohort_tickets,
     fetch_runs,
-    profiled_genomes,
+    fetch_taxonomy,
+    genome_labels,
+    genome_members,
+    observed_genomes,
     resolve_cohort,
 )
 from ._helpers import authorize_prep_sample_cohort
@@ -115,6 +108,43 @@ async def feature_table_samples(
     )
 
 
+async def _genomes(
+    pool: asyncpg.Pool,
+    cohort: Cohort,
+    values: pa.Table,
+    caller: HumanUser,
+    *,
+    taxonomy: bool,
+    data_plane_url: str,
+    signing_key: bytes,
+) -> Genomes | None:
+    """What a genome-keyed table names its features with (and, for `taxonomy`, ranks
+    them by); None for a table whose features are ASVs."""
+    if cohort.source.feature_key != "genome_idx":
+        return None
+    observed = observed_genomes(values)
+    labels = await genome_labels(pool, observed, caller.principal_idx)
+    if not taxonomy:
+        return Genomes(labels=labels)
+    if cohort.reference_idx is None:
+        raise RuntimeError(f"a {cohort.source.method} run names no reference")
+    members = await genome_members(pool, cohort.reference_idx, observed)
+    try:
+        ranks = await asyncio.to_thread(
+            lambda: fetch_taxonomy(
+                data_plane_url=data_plane_url,
+                signing_key=signing_key,
+                reference_idx=cohort.reference_idx,
+                feature_idx=members.column("feature_idx").to_pylist(),
+            )
+        )
+    except flight.FlightError as exc:
+        raise HTTPException(
+            status_code=502, detail=f"data plane read of the reference's taxonomy failed: {exc}"
+        ) from exc
+    return Genomes(labels=labels, members=members, taxonomy=ranks)
+
+
 @router.post(PATH_FEATURE_TABLE_VALUES, response_class=Response)
 async def feature_table_values(
     request: FeatureTableRequest,
@@ -127,7 +157,16 @@ async def feature_table_values(
     """The values as sparse COO `(sample, feature, value)`, an Arrow IPC stream."""
     cohort = await _authorized_cohort(pool, caller, request)
     values, chunks = await _read(cohort, data_plane_url, signing_key, values=True)
-    table = build_values(cohort, values, chunks)
+    genomes = await _genomes(
+        pool,
+        cohort,
+        values,
+        caller,
+        taxonomy=False,
+        data_plane_url=data_plane_url,
+        signing_key=signing_key,
+    )
+    table = build_values(cohort, values, chunks, genomes)
     return Response(arrow_stream_bytes(table), media_type=ARROW_STREAM_MEDIA_TYPE)
 
 
@@ -140,46 +179,25 @@ async def feature_table_features(
     caller: HumanUser = Depends(require_complete_profile),
     _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
 ) -> Response:
-    """Every feature the values name, `(feature, sequence, length)`, an Arrow IPC
-    stream. An amplicon table reads only its ASV chunks (the ticket already scopes
-    them to the ASVs the cohort observed); a profile reads its values."""
+    """Every feature the values name, `(feature, sequence, length, <ranks>)`, an
+    Arrow IPC stream. An amplicon table reads only its ASV chunks (the ticket
+    already scopes them to the ASVs the cohort observed); a genome-keyed one reads
+    its values, then its genomes' taxonomy from their reference."""
     cohort = await _authorized_cohort(pool, caller, request)
     needs_values = cohort.source.sequences_table is None
     values, chunks = await _read(cohort, data_plane_url, signing_key, values=needs_values)
-    lineages = (
-        await fetch_lineages(
-            pool, reference_idx=cohort.reference_idx, genomes=profiled_genomes(values)
+    genomes = (
+        await _genomes(
+            pool,
+            cohort,
+            values,
+            caller,
+            taxonomy=True,
+            data_plane_url=data_plane_url,
+            signing_key=signing_key,
         )
-        if values is not None and cohort.reference_idx is not None
+        if values is not None
         else None
     )
-    table = build_features(cohort, values, chunks, lineages)
+    table = build_features(cohort, values, chunks, genomes)
     return Response(arrow_stream_bytes(table), media_type=ARROW_STREAM_MEDIA_TYPE)
-
-
-@router.post(PATH_FEATURE_TABLE_TICKET)
-async def feature_table_ticket(
-    request: FeatureTableRequest,
-    pool: asyncpg.Pool = Depends(get_db_pool),
-    signing_key: bytes = Depends(get_flight_signing_key),
-    caller: HumanUser = Depends(require_complete_profile),
-    _scope: Principal = Depends(require_scope(Scope.PREP_SAMPLE_READ)),
-) -> FeatureTableTicketResponse:
-    """The cohort as signed DoGet tickets — its values and, for an amplicon table,
-    its ASV chunks — and the columns to relabel the values to, for a client that
-    reads the data plane itself and builds the table there (`qiita feature-table
-    runs`)."""
-    cohort = await _authorized_cohort(pool, caller, request)
-    values_ticket, sequences_ticket = cohort_tickets(cohort, signing_key)
-    return FeatureTableTicketResponse(
-        method=cohort.source.method,
-        value_kind=cohort.source.value_kind,
-        samples=[
-            FeatureTableTicketSample(**s.column.model_dump(), prep_sample_idx=s.prep_sample_idx)
-            for s in cohort.samples
-        ],
-        values_ticket=base64.b64encode(values_ticket).decode(),
-        sequences_ticket=(
-            base64.b64encode(sequences_ticket).decode() if sequences_ticket is not None else None
-        ),
-    )

@@ -406,10 +406,13 @@ async def run_workflow(
             )
 
         # taxonomic-profile: bind the sylph database file (and its sha256, for the
-        # identity mint below), and the pool's metagenomic samples the run covers.
-        # A pool with none is refused here, before a processing_idx is minted.
+        # identity mint below) with its reference's genome map, and the pool's
+        # metagenomic samples the run covers. A pool with none is refused here,
+        # before a processing_idx is minted.
         if _workflow_declares_input(action.steps, SYLPH_DATABASE_BINDING):
-            bound.update(await _resolve_sylph_database(pool, action_context=bound))
+            bound.update(
+                await _resolve_sylph_database(pool, action_context=bound, workspace=workspace)
+            )
         if _workflow_writes_taxonomic_profile_gate(action.steps):
             if scope_target["kind"] != ScopeTargetKind.SEQUENCED_POOL.value:
                 raise _submission_bad_input(

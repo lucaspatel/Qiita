@@ -131,7 +131,9 @@ def test_an_ena_download_ticket_names_the_reads_and_gives_their_state():
     assert reads.counts == {"processing": 2}
 
 
-def _profile(idx, state, genome_count=None, processing_idx=21, database=("wol3", "rc4-ani95")):
+def _profile(
+    idx, state, genome_count=None, processing_idx=21, database=("web-of-life", "3-rc4", "ani95")
+):
     return {
         "processing_idx": processing_idx,
         "prep_sample_idx": idx,
@@ -141,6 +143,7 @@ def _profile(idx, state, genome_count=None, processing_idx=21, database=("wol3",
         "version": "1.0.0",
         "database_name": database[0],
         "database_version": database[1],
+        "database_label": database[2],
     }
 
 
@@ -150,14 +153,16 @@ def test_each_profiling_run_is_its_own_branch_to_a_feature_table():
         profiles=[
             _profile(1, "completed", 40),
             _profile(2, "no_data"),
-            _profile(1, "completed", 12, processing_idx=22, database=("wol3", "rc4-ani99")),
+            _profile(
+                1, "completed", 12, processing_idx=22, database=("web-of-life", "3-rc4", "ani99")
+            ),
         ],
     )
     (group,) = build_study_lineage(9, rows).groups
     nodes = {n.id: n for n in group.nodes}
     assert nodes["processing:21"].label == "Taxonomic profile"
-    assert nodes["processing:21"].detail == "taxonomic-profile 1.0.0 · wol3 rc4-ani95"
-    assert nodes["processing:22"].detail == "taxonomic-profile 1.0.0 · wol3 rc4-ani99"
+    assert nodes["processing:21"].detail == "taxonomic-profile 1.0.0 · web-of-life 3-rc4 ani95"
+    assert nodes["processing:22"].detail == "taxonomic-profile 1.0.0 · web-of-life 3-rc4 ani99"
     assert nodes["processing:21"].counts == {"completed": 1, "no_data": 1}
     assert nodes["processing:22"].counts == {"completed": 1, "not_started": 1}
     assert nodes["feature_table:21"].counts == {"completed": 1}

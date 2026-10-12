@@ -21,7 +21,9 @@ from qiita_control_plane.runner._processing import (
 )
 from qiita_control_plane.runner._reference import _resolve_sylph_database
 from qiita_control_plane.testing.db_seeds import (
+    cleanup_genome_reference,
     seed_biosample_with_sequenced_prep_sample,
+    seed_genome_reference,
     seed_sequenced_sample_subtype,
     seed_user_principal,
 )
@@ -210,58 +212,67 @@ def test_the_identity_carries_the_database_file_and_threshold():
 
 @pytest.fixture
 async def sylph_reference(postgres_pool, tmp_path):
+    """A sylph index row on a two-genome sequence reference."""
+    seeded = await seed_genome_reference(postgres_pool, label="sylph-resolve", n_genomes=2)
     db = tmp_path / "wol3.syl2db"
     db.write_bytes(b"sylph")
     sha = hashlib.sha256(b"sylph").hexdigest()
-    idx = await postgres_pool.fetchval(
-        "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
-        " VALUES ($1, '1', 'profiling_database', 'active', 1) RETURNING reference_idx",
-        f"sylph-resolve-{uuid.uuid4().hex[:8]}",
-    )
-    await postgres_pool.execute(
+    index_idx = await postgres_pool.fetchval(
         "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params)"
-        " VALUES ($1, 'sylph', $2, $3::jsonb)",
-        idx,
+        " VALUES ($1, 'sylph', $2, $3::jsonb) RETURNING reference_index_idx",
+        seeded["reference_idx"],
         str(db),
         json.dumps({"format": "syl2db", "sha256": sha, "size_bytes": 5}),
     )
-    yield {"reference_idx": idx, "path": db, "sha256": sha}
-    await postgres_pool.execute("DELETE FROM qiita.reference_index WHERE reference_idx = $1", idx)
-    await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
+    yield {**seeded, "index_idx": index_idx, "path": db, "sha256": sha}
+    await cleanup_genome_reference(postgres_pool, seeded)
 
 
-async def test_the_resolver_binds_the_file_and_its_sha256(postgres_pool, sylph_reference):
+async def test_the_resolver_binds_the_file_its_reference_and_genome_map(
+    postgres_pool, sylph_reference, tmp_path
+):
     bound = await _resolve_sylph_database(
-        postgres_pool, action_context={"sylph_reference_idx": sylph_reference["reference_idx"]}
+        postgres_pool,
+        action_context={"sylph_index_idx": sylph_reference["index_idx"]},
+        workspace=tmp_path,
     )
+    genome_map = bound.pop("genome_map")
     assert bound == {
         "sylph_database": sylph_reference["path"],
         "sylph_database_sha256": sylph_reference["sha256"],
+        "sylph_reference_idx": sylph_reference["reference_idx"],
     }
+    with duckdb.connect() as con:
+        rows = con.execute(
+            "SELECT genome_idx, source_id FROM read_parquet(?) ORDER BY 1", [str(genome_map)]
+        ).fetchall()
+    assert rows == sorted(sylph_reference["genomes"])
 
 
-async def test_the_resolver_refuses_a_moved_file(postgres_pool, sylph_reference):
+async def test_the_resolver_refuses_a_moved_file(postgres_pool, sylph_reference, tmp_path):
     sylph_reference["path"].unlink()
     with pytest.raises(Exception, match="no longer a file"):
         await _resolve_sylph_database(
-            postgres_pool, action_context={"sylph_reference_idx": sylph_reference["reference_idx"]}
+            postgres_pool,
+            action_context={"sylph_index_idx": sylph_reference["index_idx"]},
+            workspace=tmp_path,
         )
 
 
-async def test_the_resolver_refuses_another_kind_of_reference(postgres_pool):
-    idx = await postgres_pool.fetchval(
-        "INSERT INTO qiita.reference (name, version, kind, status, created_by_idx)"
-        " VALUES ($1, '1', 'sequence_reference', 'active', 1) RETURNING reference_idx",
-        f"sylph-wrong-kind-{uuid.uuid4().hex[:8]}",
+async def test_the_resolver_refuses_another_index_and_an_inactive_reference(
+    postgres_pool, sylph_reference, tmp_path
+):
+    with pytest.raises(Exception, match="is not a sylph index"):
+        await _resolve_sylph_database(
+            postgres_pool, action_context={"sylph_index_idx": 2**62}, workspace=tmp_path
+        )
+    await postgres_pool.execute(
+        "UPDATE qiita.reference SET status = 'failed' WHERE reference_idx = $1",
+        sylph_reference["reference_idx"],
     )
-    try:
-        with pytest.raises(Exception, match="not a 'profiling_database'"):
-            await _resolve_sylph_database(
-                postgres_pool, action_context={"sylph_reference_idx": idx}
-            )
-        with pytest.raises(Exception, match="does not exist"):
-            await _resolve_sylph_database(
-                postgres_pool, action_context={"sylph_reference_idx": 2**62}
-            )
-    finally:
-        await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", idx)
+    with pytest.raises(Exception, match="not an active sequence_reference"):
+        await _resolve_sylph_database(
+            postgres_pool,
+            action_context={"sylph_index_idx": sylph_reference["index_idx"]},
+            workspace=tmp_path,
+        )

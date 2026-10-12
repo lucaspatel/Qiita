@@ -13,7 +13,6 @@ generic POST /api/v1/library/{name} dispatch (routes/library.py) so
 workflow runners and HTTP callers share one transport.
 """
 
-import asyncio
 import base64
 import json
 from pathlib import Path
@@ -53,7 +52,6 @@ from qiita_common.assembly_constants import (
 )
 from qiita_common.auth_constants import Scope, SystemRole
 from qiita_common.models import (
-    INDEX_TYPE_SYLPH_TAXONOMY,
     DoGetTicketRequest,
     DoGetTicketResponse,
     GenomeMapEntry,
@@ -115,7 +113,6 @@ from ..deps import (
     get_scratch_staging,
     get_tx_conn_factory,
 )
-from ..repositories.profiling_taxonomy import profiling_genome_key
 from ..repositories.reference_exclusion import (
     add_exclusion,
     list_for_reference,
@@ -204,35 +201,6 @@ def _check_staged_file(fs_path: str, size_bytes: int) -> None:
         raise HTTPException(status_code=422, detail=f"{fs_path}: not readable ({exc.strerror})")
 
 
-def _read_taxonomy(fs_path: str) -> list[tuple[str, str]]:
-    """The taxonomy file's (genome, lineage) rows: one `<genome file>\t<lineage>`
-    line each, the genome reduced to its file basename (the key a profile's genome
-    name reduces to, `profiling_genome_key`). 422 on a malformed line or a genome
-    named twice, naming the line."""
-    rows: dict[str, str] = {}
-    with open(fs_path, encoding="utf-8") as fh:
-        for n, line in enumerate(fh, start=1):
-            line = line.rstrip("\n")
-            if not line.strip():
-                continue
-            parts = line.split("\t")
-            if len(parts) != 2 or not parts[0].strip():
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"{fs_path}:{n}: expected '<genome file>\\t<lineage>',"
-                    f" got {line[:120]!r}",
-                )
-            genome = profiling_genome_key(parts[0].strip())
-            if genome in rows:
-                raise HTTPException(
-                    status_code=422, detail=f"{fs_path}:{n}: genome {genome!r} is named twice"
-                )
-            rows[genome] = parts[1].strip()
-    if not rows:
-        raise HTTPException(status_code=422, detail=f"{fs_path}: no taxonomy rows")
-    return list(rows.items())
-
-
 @router.post(PATH_REFERENCE_FILE, status_code=201)
 async def register_reference_file(
     body: ReferenceFileRegisterRequest,
@@ -240,77 +208,48 @@ async def register_reference_file(
     user: HumanUser = Depends(require_human_with_role(SystemRole.SYSTEM_ADMIN)),
     _scope: Principal = Depends(require_scope(Scope.REFERENCE_WRITE)),
 ) -> ReferenceFileRegisterResponse:
-    """Register one file of a prebuilt profiling database where an operator staged
-    it: a new `profiling_database` release (name + version, active at once — there
-    is nothing to ingest) or an existing one (`reference_idx`), and the file's index
-    row recording its path, format, sha256 and size. A `sylph_taxonomy` file's rows
-    are loaded too, replacing the release's. System admin only, because it records
-    an arbitrary server path."""
+    """Register a prebuilt index file of a sequence reference where an operator
+    staged it — a sylph database sketched from the reference's genomes — as one more
+    index row recording its path, format, sha256 and size. The reference must be an
+    active sequence reference with genomes, which are what a profile reports. System
+    admin only, because it records an arbitrary server path."""
     _check_staged_file(body.fs_path, body.size_bytes)
-    taxonomy = (
-        await asyncio.to_thread(_read_taxonomy, body.fs_path)
-        if body.index_type == INDEX_TYPE_SYLPH_TAXONOMY
-        else None
-    )
     params: dict[str, Any] = {
         "format": body.format,
         "sha256": body.sha256,
         "size_bytes": body.size_bytes,
     }
-    if taxonomy is not None:
-        params["genome_count"] = len(taxonomy)
-    try:
-        async with pool.acquire() as conn, conn.transaction():
-            if body.reference_idx is None:
-                ref = await conn.fetchrow(
-                    "INSERT INTO qiita.reference"
-                    "  (name, version, kind, status, is_host, created_by_idx)"
-                    " VALUES ($1, $2, 'profiling_database', $3, false, $4)"
-                    f" RETURNING {_REFERENCE_RETURNING}",
-                    body.name,
-                    body.version,
-                    ReferenceStatus.ACTIVE.value,
-                    user.principal_idx,
-                )
-            else:
-                ref = await conn.fetchrow(
-                    f"SELECT {_REFERENCE_RETURNING} FROM qiita.reference"
-                    " WHERE reference_idx = $1 FOR UPDATE",
-                    body.reference_idx,
-                )
-                if ref is None:
-                    raise HTTPException(status_code=404, detail=REFERENCE_NOT_FOUND_DETAIL)
-                if ref["kind"] != "profiling_database":
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"reference {body.reference_idx} is a {ref['kind']!r},"
-                        " not a 'profiling_database'",
-                    )
-            idx = await conn.fetchrow(
-                "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params)"
-                " VALUES ($1, $2, $3, $4::jsonb)"
-                " RETURNING reference_index_idx, reference_idx, index_type, fs_path, params,"
-                "           created_at, shard_id",
-                ref["reference_idx"],
-                body.index_type,
-                body.fs_path,
-                json.dumps(params),
+    if body.label is not None:
+        params["label"] = body.label
+    async with pool.acquire() as conn, conn.transaction():
+        ref = await conn.fetchrow(
+            f"SELECT {_REFERENCE_RETURNING} FROM qiita.reference"
+            " WHERE reference_idx = $1 FOR UPDATE",
+            body.reference_idx,
+        )
+        if ref is None:
+            raise HTTPException(status_code=404, detail=REFERENCE_NOT_FOUND_DETAIL)
+        if ref["kind"] != "sequence_reference" or ref["status"] != ReferenceStatus.ACTIVE.value:
+            raise HTTPException(
+                status_code=409,
+                detail=f"reference {body.reference_idx} is a {ref['status']}"
+                f" {ref['kind']!r}, not an active 'sequence_reference'",
             )
-            if taxonomy is not None:
-                await conn.execute(
-                    "DELETE FROM qiita.profiling_taxonomy WHERE reference_idx = $1",
-                    ref["reference_idx"],
-                )
-                await conn.copy_records_to_table(
-                    "profiling_taxonomy",
-                    schema_name="qiita",
-                    columns=["reference_idx", "genome", "lineage"],
-                    records=[(ref["reference_idx"], g, lin) for g, lin in taxonomy],
-                )
-    except asyncpg.UniqueViolationError:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Reference ({body.name!r}, {body.version!r}) already exists",
+        if await count_genome_map(conn, body.reference_idx) == 0:
+            raise HTTPException(
+                status_code=409,
+                detail=f"reference {body.reference_idx} has no genomes for a"
+                f" {body.index_type} database to report",
+            )
+        idx = await conn.fetchrow(
+            "INSERT INTO qiita.reference_index (reference_idx, index_type, fs_path, params)"
+            " VALUES ($1, $2, $3, $4::jsonb)"
+            " RETURNING reference_index_idx, reference_idx, index_type, fs_path, params,"
+            "           created_at, shard_id",
+            ref["reference_idx"],
+            body.index_type,
+            body.fs_path,
+            json.dumps(params),
         )
     index = dict(idx)
     if isinstance(index["params"], str):

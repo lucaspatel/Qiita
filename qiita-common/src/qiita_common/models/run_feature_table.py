@@ -66,28 +66,3 @@ class FeatureTableSamples(BaseModel):
     method: str
     value_kind: FeatureTableValueKind
     samples: list[FeatureTableSample]
-
-
-class FeatureTableTicketSample(FeatureTableSample):
-    """A column, with the keys its values carry on the data plane, so the client
-    can relabel them. The prep_sample_idx is Qiita's internal identifier: a join
-    key for the caller's own records, never a name to publish."""
-
-    prep_sample_idx: int
-
-
-class FeatureTableTicketResponse(BaseModel):
-    """Signed DoGet tickets for the cohort's values (and, for a method whose
-    features are sequences, their sequence chunks), and the columns to relabel the
-    values to."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    method: str
-    value_kind: FeatureTableValueKind
-    samples: list[FeatureTableTicketSample]
-    # base64 signed tickets, scoped to exactly the cohort's runs and prep_samples.
-    values_ticket: str
-    # The ASV chunks of an amplicon table; None for a profile, whose features are
-    # the database's genome names and carry no sequence.
-    sequences_ticket: str | None

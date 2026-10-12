@@ -69,12 +69,29 @@ def _reads(genomes, tmp_path, mixes):
     return path
 
 
-def _inputs(tmp_path, reads, syl2db, samples, **kw):
+# The reference's genomes, as its genome map names them: G000 -> genome_idx 11, ...
+_GENOME_IDX = {"G000": 11, "G001": 12, "G002": 13}
+
+
+def _genome_map(tmp_path, genomes=_GENOME_IDX):
+    path = tmp_path / "genome_map.parquet"
+    with duckdb.connect() as con:
+        con.execute(
+            "CREATE TABLE m AS SELECT * FROM (VALUES"
+            + ", ".join(f"({i}, {i}, 'genbank', '{g}')" for g, i in genomes.items())
+            + ") t(feature_idx, genome_idx, source, source_id)"
+        )
+        con.execute(f"COPY m TO '{path}' (FORMAT parquet)")
+    return path
+
+
+def _inputs(tmp_path, reads, syl2db, samples, genome_map=None, **kw):
     samples_path = tmp_path / "profile_samples.json"
     samples_path.write_text(json.dumps(samples))
     return Inputs(
         reads=reads,
         sylph_database=syl2db,
+        genome_map=genome_map or _genome_map(tmp_path),
         profile_samples=samples_path,
         processing_idx=77,
         **_SCOPE,
@@ -93,7 +110,7 @@ async def test_profiles_only_the_bound_samples_in_percent(genomes, syl2db, tmp_p
     staged = out["staging_dir"] / "taxonomic_profile.parquet"
     with duckdb.connect() as con:
         rows = con.execute(
-            "SELECT prep_sample_idx, processing_idx, genome_name, taxonomic_abundance,"
+            "SELECT prep_sample_idx, processing_idx, genome_idx, taxonomic_abundance,"
             " adjusted_ani FROM read_parquet(?) ORDER BY 1, 3",
             [str(staged)],
         ).fetchall()
@@ -101,9 +118,9 @@ async def test_profiles_only_the_bound_samples_in_percent(genomes, syl2db, tmp_p
             "SELECT * FROM read_parquet(?) ORDER BY 1", [str(out["profile_counts"])]
         ).fetchall()
     assert [(r[0], r[1], r[2]) for r in rows] == [
-        (101, 77, "G000"),
-        (101, 77, "G001"),
-        (102, 77, "G002"),
+        (101, 77, 11),
+        (101, 77, 12),
+        (102, 77, 13),
     ]
     totals: dict[int, float] = {}
     for r in rows:
@@ -143,3 +160,12 @@ def test_min_ani_is_a_fraction(tmp_path):
 async def test_refuses_an_empty_sample_list(syl2db, tmp_path):
     with pytest.raises(ValueError, match="non-empty"):
         await execute(_inputs(tmp_path, None, syl2db, []), tmp_path / "ws")
+
+
+async def test_a_genome_the_reference_lacks_fails(genomes, syl2db, tmp_path):
+    """A database not sketched from the bound reference would lose a genome's
+    abundance if its rows were dropped."""
+    reads = _reads(genomes, tmp_path, {101: {"G000": 0.5, "G002": 0.5}})
+    genome_map = _genome_map(tmp_path, {"G000": 11})
+    with pytest.raises(ValueError, match=r"not genomes of the database's reference: G002"):
+        await execute(_inputs(tmp_path, reads, syl2db, [101], genome_map), tmp_path / "ws")

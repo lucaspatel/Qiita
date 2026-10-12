@@ -9,19 +9,19 @@ produce such runs, each a `Source`:
     feature space, so the same sequence found by two runs is one feature, named by
     the md5 of its sequence, which the table carries.
   * taxonomic-profile: `taxonomic_profile`, a profiler's relative abundance per
-    genome of its database, named by the database's own genome identifier. No
-    sequence.
+    genome of the sequence reference its database was sketched from. A genome is
+    named as an alignment-based table names one — its `exported_feature` handle,
+    the accession wherever one is free — and carries the reference's taxonomy, by
+    the same reduction and sidecar SQL (`qiita_common.analytic`). No sequence.
 
 Merging runs is that selection, nothing more, provided they are runs of one method
 whose features compare (`Source.merge_keys`). Three steps, each testable alone:
   * `resolve_cohort` picks the processed samples (one run's view of one
     prep_sample) the request names and gives each a public column name;
   * `cohort_tickets` signs the reads of their values (and an amplicon table's ASV
-    bytes), which `fetch_runs` performs for the REST answer and a client performs
-    itself;
+    bytes), which `fetch_runs` performs;
   * `stage_values` turns those into the features `(feature, sequence, length)` and
-    the values `(sample, feature, value)`, public handles only, on whichever DuckDB
-    connection holds them.
+    the values `(sample, feature, value)`, public handles only.
 
 Nothing is made dense: a rapid-16S pool is ~8% dense, and density falls as runs
 and samples are added. Internal idxs are join keys and never reach the output.
@@ -37,6 +37,7 @@ import asyncpg
 import duckdb
 import pyarrow as pa
 import pyarrow.flight as flight
+from qiita_common import analytic as ft
 from qiita_common.actions import AMPLICON_ACTION_ID, TAXONOMIC_PROFILE_ACTION_ID
 from qiita_common.amplicon_constants import (
     AMPLICON_MEMBERSHIP_TABLE,
@@ -48,8 +49,11 @@ from qiita_common.models.run_feature_table import (
     FeatureTableValueKind,
 )
 from qiita_common.taxonomic_profile_constants import TAXONOMIC_PROFILE_TABLE
+from qiita_common.taxonomy import RANK_COLUMNS, TAXONOMY_SOURCE_TABLE, quote_rank
 
 from .auth.tickets import sign_ticket
+from .repositories.exported_feature import mint_exported_features
+from .repositories.reference_membership import GENOME_MAP_PAIRS_SQL
 from .sample_names import BIOSAMPLE_NAME_JOIN, BIOSAMPLE_NAME_SQL
 
 ARROW_STREAM_MEDIA_TYPE = "application/vnd.apache.arrow.stream"
@@ -62,12 +66,20 @@ class Source:
     method: str
     value_kind: FeatureTableValueKind
     values_table: str
+    # The values table's column holding a cell's value.
+    value_column: str
+    # What a value row's feature is: a content-deduped `feature_idx` (an ASV), or a
+    # `genome_idx` of the reference the run read (`reference_key`).
+    feature_key: str
     # The ASV-bytes table of a method whose features are sequences; None otherwise.
     sequences_table: str | None
     # The run params whose difference makes two runs' features incomparable.
     merge_keys: tuple[str, ...]
     # What a run counts, for refusals ("these runs' ASVs ...").
     noun: str
+    # The run param naming the reference a genome-keyed run's genomes belong to,
+    # whose taxonomy labels them; None for a method without one.
+    reference_key: str | None = None
 
 
 SOURCES: dict[str, Source] = {
@@ -80,20 +92,26 @@ SOURCES: dict[str, Source] = {
         method=AMPLICON_ACTION_ID,
         value_kind="count",
         values_table=AMPLICON_MEMBERSHIP_TABLE,
+        value_column="count",
+        feature_key="feature_idx",
         sequences_table=AMPLICON_SEQUENCE_CHUNKS_TABLE,
         merge_keys=("trim", "orient_primer"),
         noun="ASVs",
     ),
-    # Genomes are named by the database, so only profiles against one file share a
-    # feature space; the threshold changes which genomes a sample reports, so two
+    # A database file decides which of its reference's genomes a profile can
+    # report, and relative abundance is relative to those, so only profiles against
+    # one file compare; the threshold changes which genomes a sample reports, so two
     # thresholds' abundances are not one table's either.
     TAXONOMIC_PROFILE_ACTION_ID: Source(
         method=TAXONOMIC_PROFILE_ACTION_ID,
         value_kind="relative_abundance",
         values_table=TAXONOMIC_PROFILE_TABLE,
+        value_column="taxonomic_abundance",
+        feature_key="genome_idx",
         sequences_table=None,
         merge_keys=("sylph_reference_idx", "sylph_database_sha256", "min_ani"),
         noun="profiles",
+        reference_key="sylph_reference_idx",
     ),
 }
 
@@ -103,16 +121,18 @@ SOURCES: dict[str, Source] = {
 _NAME = pa.dictionary(pa.int32(), pa.string())
 VALUES_SCHEMA = pa.schema([("sample", _NAME), ("feature", _NAME), ("value", pa.float64())])
 # `sequence` and `length` are null for a method whose features are not sequences;
-# `taxonomy` is a profiled genome's lineage from its database's taxonomy file, null
-# for an ASV and for a genome the file does not name.
+# the eight ranks are a genome's, from its reference's taxonomy with the source
+# prefixes restored (the alignment taxonomy sidecar's columns), and null for an ASV
+# and for an unclassified genome.
 FEATURES_SCHEMA = pa.schema(
     [
         ("feature", pa.string()),
         ("sequence", pa.string()),
         ("length", pa.int32()),
-        ("taxonomy", pa.string()),
+        *((rank, pa.string()) for rank in RANK_COLUMNS),
     ]
 )
+_NULL_RANKS = ", ".join(f"NULL::VARCHAR AS {quote_rank(r)}" for r in RANK_COLUMNS)
 
 
 class CohortError(Exception):
@@ -136,8 +156,8 @@ class Cohort:
     source: Source
     runs: list[int]
     samples: list[ProcessedSample]
-    # The profiling database the runs read (one, by the merge keys); None for
-    # amplicon runs.
+    # The reference whose genomes a genome-keyed table's features are (one, by the
+    # merge keys); None for amplicon runs.
     reference_idx: int | None = None
 
     @property
@@ -255,7 +275,7 @@ async def resolve_cohort(pool: asyncpg.Pool, request: FeatureTableRequest) -> Co
         source=source,
         runs=runs,
         samples=samples,
-        reference_idx=params.get("sylph_reference_idx"),
+        reference_idx=params.get(source.reference_key) if source.reference_key else None,
     )
 
 
@@ -308,7 +328,7 @@ def stage_features(con, *, chunks: str) -> None:
     con.execute(
         f"CREATE TEMP TABLE {FEATURE_RELATION} AS"
         " SELECT feature_idx, md5(seq) AS feature, seq AS sequence,"
-        "        length(seq)::INTEGER AS length, NULL::VARCHAR AS taxonomy"
+        "        length(seq)::INTEGER AS length"
         " FROM (SELECT feature_idx, string_agg(chunk_data, '' ORDER BY chunk_index) AS seq"
         f"       FROM {chunks} GROUP BY feature_idx)"
     )
@@ -323,29 +343,46 @@ def _refuse_unnamed(con, *, names: str, values: str) -> None:
 
 
 def stage_values(
-    con, *, source: Source, names: str, values: str, chunks: str | None = None
+    con,
+    *,
+    source: Source,
+    names: str,
+    values: str,
+    chunks: str | None = None,
+    genome_labels: str | None = None,
 ) -> None:
     """Create `FEATURE_RELATION` (feature, sequence, length) and `VALUE_RELATION`
     (sample, feature, value): the values in `values` relabelled to public names,
     one row per nonzero cell. `names` maps (processing_idx, prep_sample_idx) to a
-    column name; `chunks` is the ASV chunk relation of an amplicon table. Refuses
-    rather than guesses: a value of a processed sample `names` lacks, or of an ASV
-    with no sequence, would need an internal idx as its name. Shared by the control
-    plane's REST answer and the client-side build, so the two cannot disagree."""
+    column name; `chunks` is the ASV chunk relation of an amplicon table, and
+    `genome_labels` the `exported_feature` handles `(genome_idx, export_feature_id)`
+    of a genome-keyed one. Refuses rather than guesses: a value of a processed
+    sample `names` lacks, or of a feature with no name, would need an internal idx
+    as its name."""
     _refuse_unnamed(con, names=names, values=values)
-    if source.sequences_table is None:
-        # A profile's feature is the database's genome name: the values carry it.
+    if source.feature_key == "genome_idx":
+        if genome_labels is None:
+            raise RuntimeError(f"a {source.method} table needs its genomes' labels")
+        con.execute(ft.genome_label_table_sql(genome_labels))
+        unlabelled = con.execute(
+            f"SELECT count(*) FROM {values} v"
+            f" ANTI JOIN {ft.GENOME_LABEL_TABLE} g USING (genome_idx)"
+        ).fetchone()[0]
+        if unlabelled:
+            raise RuntimeError(f"{unlabelled} value(s) of a genome with no label")
         con.execute(
             f"CREATE TEMP TABLE {FEATURE_RELATION} AS"
-            " SELECT DISTINCT genome_name AS feature, NULL::VARCHAR AS sequence,"
-            f"        NULL::INTEGER AS length, NULL::VARCHAR AS taxonomy FROM {values}"
+            " SELECT DISTINCT g.feature_id AS feature, NULL::VARCHAR AS sequence,"
+            "        NULL::INTEGER AS length"
+            f" FROM {values} v JOIN {ft.GENOME_LABEL_TABLE} g USING (genome_idx)"
         )
         con.execute(
             f"CREATE TEMP TABLE {VALUE_RELATION} AS"
-            " SELECT n.sample, v.genome_name AS feature,"
-            "        sum(v.taxonomic_abundance)::DOUBLE AS value"
+            f" SELECT n.sample, g.feature_id AS feature,"
+            f"        sum(v.{source.value_column})::DOUBLE AS value"
             f" FROM {values} v JOIN {names} n USING (processing_idx, prep_sample_idx)"
-            " GROUP BY n.sample, v.genome_name"
+            f" JOIN {ft.GENOME_LABEL_TABLE} g USING (genome_idx)"
+            " GROUP BY n.sample, g.feature_id"
         )
         return
     if chunks is None:
@@ -359,7 +396,7 @@ def stage_values(
         raise RuntimeError(f"{missing} observed ASV(s) have no sequence in the lake")
     con.execute(
         f"CREATE TEMP TABLE {VALUE_RELATION} AS"
-        " SELECT n.sample, f.feature, sum(m.count)::DOUBLE AS value"
+        f" SELECT n.sample, f.feature, sum(m.{source.value_column})::DOUBLE AS value"
         f" FROM {values} m"
         f" JOIN {names} n USING (processing_idx, prep_sample_idx)"
         f" JOIN {FEATURE_RELATION} f USING (feature_idx)"
@@ -378,65 +415,164 @@ def names_table(cohort: Cohort) -> pa.Table:
     )
 
 
-def _staged(cohort: Cohort, values: pa.Table, chunks: pa.Table | None, query: str) -> pa.Table:
+@dataclass(frozen=True)
+class Genomes:
+    """What a genome-keyed table names its features with: each observed genome's
+    `exported_feature` handle, and for its taxonomy, the reference's member features
+    of those genomes `(feature_idx, genome_idx)` and their taxonomy rows (None when
+    only the values are wanted)."""
+
+    labels: pa.Table
+    members: pa.Table | None = None
+    taxonomy: pa.Table | None = None
+
+
+def _staged(
+    cohort: Cohort,
+    values: pa.Table,
+    chunks: pa.Table | None,
+    genomes: Genomes | None,
+    query: str,
+) -> pa.Table:
     with duckdb.connect() as duck:
         duck.register("run_values", values)
         duck.register("names", names_table(cohort))
         if chunks is not None:
             duck.register("chunks", chunks)
+        if genomes is not None:
+            duck.register("genome_labels", genomes.labels)
         stage_values(
             duck,
             source=cohort.source,
             names="names",
             values="run_values",
             chunks="chunks" if chunks is not None else None,
+            genome_labels="genome_labels" if genomes is not None else None,
         )
+        if genomes is not None and genomes.members is not None:
+            duck.register("genome_members", genomes.members)
+            duck.register("genome_taxonomy", genomes.taxonomy)
+            duck.execute(ft.map_table_sql("genome_members"))
+            duck.execute(ft.taxonomy_table_sql("genome_taxonomy"))
+            duck.execute(ft.taxonomy_sidecar_sql())
         return duck.execute(query).to_arrow_table()
 
 
-def build_values(cohort: Cohort, values: pa.Table, chunks: pa.Table | None) -> pa.Table:
+def build_values(
+    cohort: Cohort, values: pa.Table, chunks: pa.Table | None, genomes: Genomes | None = None
+) -> pa.Table:
     """The values `(sample, feature, value)` as Arrow, for the REST answer."""
     table = _staged(
         cohort,
         values,
         chunks,
+        genomes,
         f"SELECT sample, feature, value FROM {VALUE_RELATION} ORDER BY sample, feature",
     )
     return table.cast(VALUES_SCHEMA)
 
 
-def profiled_genomes(values: pa.Table) -> list[str]:
-    """The distinct genome names a profile's values carry, for the lineage lookup."""
-    return sorted(set(values.column("genome_name").to_pylist()))
+def observed_genomes(values: pa.Table) -> list[int]:
+    """The distinct genomes a genome-keyed table's values name. A NULL is a row
+    written before profiles resolved their genomes, whose run no table can name."""
+    genomes = set(values.column("genome_idx").to_pylist())
+    if None in genomes:
+        raise RuntimeError("a value names no genome: its run predates genome resolution")
+    return sorted(genomes)
+
+
+async def genome_labels(pool: asyncpg.Pool, genome_idx: list[int], created_by_idx: int) -> pa.Table:
+    """Each genome's `exported_feature` handle, minted where it has none yet: the
+    name an alignment-based table gives the same genome."""
+    rows = await mint_exported_features(
+        pool,
+        genome_idx=genome_idx,
+        reference_idx=None,
+        feature_idx=[],
+        created_by_idx=created_by_idx,
+    )
+    rows = [r for r in rows if r["genome_idx"] is not None]
+    return pa.table(
+        {
+            "genome_idx": pa.array([r["genome_idx"] for r in rows], pa.int64()),
+            "export_feature_id": pa.array([r["export_feature_id"] for r in rows], pa.string()),
+        }
+    )
+
+
+async def genome_members(pool: asyncpg.Pool, reference_idx: int, genome_idx: list[int]) -> pa.Table:
+    """The reference's member features of `genome_idx`, `(feature_idx, genome_idx)`:
+    what a genome's taxonomy is reduced from."""
+    rows = await pool.fetch(
+        "SELECT rm.feature_idx, fg.genome_idx"
+        + GENOME_MAP_PAIRS_SQL
+        + " AND fg.genome_idx = ANY($2::bigint[])",
+        reference_idx,
+        genome_idx,
+    )
+    return pa.table(
+        {
+            "feature_idx": pa.array([r["feature_idx"] for r in rows], pa.int64()),
+            "genome_idx": pa.array([r["genome_idx"] for r in rows], pa.int64()),
+        }
+    )
+
+
+def fetch_taxonomy(
+    *, data_plane_url: str, signing_key: bytes, reference_idx: int, feature_idx: list[int]
+) -> pa.Table:
+    """The reference's taxonomy rows of `feature_idx`, from the exclusion-aware
+    view. Blocking (Flight is synchronous); callers run it off the event loop."""
+    ticket = sign_ticket(
+        table=TAXONOMY_SOURCE_TABLE,
+        filter={"reference_idx": [reference_idx], "feature_idx": feature_idx},
+        secret=signing_key,
+    )
+    with flight.FlightClient(data_plane_url) as client:
+        return client.do_get(flight.Ticket(ticket)).read_all()
 
 
 def build_features(
     cohort: Cohort,
     values: pa.Table | None,
     chunks: pa.Table | None,
-    lineages: dict[str, str] | None = None,
+    genomes: Genomes | None = None,
 ) -> pa.Table:
-    """The features `(feature, sequence, length, taxonomy)` as Arrow, for the REST
+    """The features `(feature, sequence, length, <ranks>)` as Arrow, for the REST
     answer. An amplicon table's needs only the chunks (the ticket already scopes
-    them to the ASVs the cohort observed); a profile's are read from its values and
-    labelled from `lineages` (genome name -> lineage, `fetch_lineages`)."""
-    query = f"SELECT feature, sequence, length, taxonomy FROM {FEATURE_RELATION} ORDER BY feature"
+    them to the ASVs the cohort observed); a genome-keyed one's are read from its
+    values, named by `genomes.labels` and ranked from `genomes.taxonomy`."""
     if cohort.source.sequences_table is not None:
         if chunks is None:
             raise RuntimeError(f"a {cohort.source.method} table needs its ASV chunks")
         with duckdb.connect() as duck:
             duck.register("chunks", chunks)
             stage_features(duck, chunks="chunks")
-            table = duck.execute(query).to_arrow_table()
+            table = duck.execute(
+                f"SELECT feature, sequence, length, {_NULL_RANKS}"
+                f" FROM {FEATURE_RELATION} ORDER BY feature"
+            ).to_arrow_table()
         return table.cast(FEATURES_SCHEMA)
-    if values is None:
+    if values is None or genomes is None:
         raise RuntimeError(f"a {cohort.source.method} table's features come from its values")
-    table = _staged(cohort, values, None, query)
-    if lineages:
-        named = [lineages.get(f) for f in table.column("feature").to_pylist()]
-        table = table.set_column(
-            table.schema.get_field_index("taxonomy"), "taxonomy", pa.array(named, pa.string())
-        )
+    ranks = (
+        ", ".join(f"t.{quote_rank(r)}" for r in RANK_COLUMNS)
+        if genomes.members is not None
+        else _NULL_RANKS
+    )
+    taxonomy_join = (
+        f" LEFT JOIN {ft.TAXONOMY_SIDECAR_RELATION} t ON t.feature_id = f.feature"
+        if genomes.members is not None
+        else ""
+    )
+    table = _staged(
+        cohort,
+        values,
+        None,
+        genomes,
+        f"SELECT f.feature, f.sequence, f.length, {ranks}"
+        f" FROM {FEATURE_RELATION} f{taxonomy_join} ORDER BY f.feature",
+    )
     return table.cast(FEATURES_SCHEMA)
 
 
