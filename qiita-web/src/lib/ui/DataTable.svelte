@@ -1,7 +1,8 @@
 <script lang="ts">
   // Generic filter / sort / paginate table. Columns + plain row objects; the first
-  // column is treated as the sticky index. An optional `actions` snippet renders a
-  // trailing cell per row (e.g. a state chip + button). Modeled on SampleGrid's
+  // column is treated as the sticky index. Columns pack to the left at their content
+  // width, and an optional `actions` snippet renders a trailing cell per row (e.g. a
+  // state chip, a checkbox) pinned to the right edge. Modeled on SampleGrid's
   // sort/filter/paginate logic — a candidate to back SampleGrid itself later.
   import type { Snippet } from 'svelte';
 
@@ -14,6 +15,8 @@
     pageSize = 25,
     filterPlaceholder = 'Filter...',
     actions,
+    actionsLabel = '',
+    actionsHeader,
     visibleRows = $bindable([])
   }: {
     columns: Col[];
@@ -21,6 +24,9 @@
     pageSize?: number;
     filterPlaceholder?: string;
     actions?: Snippet<[Row]>;
+    /** The trailing column's heading, unless `actionsHeader` renders one. */
+    actionsLabel?: string;
+    actionsHeader?: Snippet;
     /** Out: the rows passing the filter, in display order, for a companion view. */
     visibleRows?: Row[];
   } = $props();
@@ -84,11 +90,15 @@
     />
   </div>
   <div class="overflow-x-auto border-t border-gray-200">
-    <table class="min-w-full divide-y divide-gray-200 text-sm">
+    <table class="w-full divide-y divide-gray-200 text-sm">
       <thead class="bg-gray-50">
         <tr>
           {#each columns as c, i (c.key)}
-            <th class="{i === 0 ? 'sticky left-0 z-10 bg-gray-50 ' : ''}px-3 py-2 text-left">
+            <th
+              class="{i === 0
+                ? 'sticky left-0 z-10 bg-gray-50 '
+                : ''}w-px border-r border-gray-200 px-3 py-2 text-left whitespace-nowrap"
+            >
               <button
                 class="inline-flex items-center gap-1 text-xs font-semibold tracking-wide text-gray-500 uppercase hover:text-gray-700"
                 onclick={() => toggleSort(c.key)}
@@ -100,7 +110,15 @@
               </button>
             </th>
           {/each}
-          {#if actions}<th class="px-3 py-2"></th>{/if}
+          <!-- Takes the slack, so the columns stay packed to the left. -->
+          <th></th>
+          {#if actions}
+            <th
+              class="sticky right-0 z-10 w-px border-l border-gray-200 bg-gray-50 px-3 py-2 text-left text-xs font-semibold tracking-wide whitespace-nowrap text-gray-500 uppercase"
+            >
+              {#if actionsHeader}{@render actionsHeader()}{:else}{actionsLabel}{/if}
+            </th>
+          {/if}
         </tr>
       </thead>
       <tbody class="divide-y divide-gray-100">
@@ -110,11 +128,16 @@
               <td
                 class="{j === 0
                   ? 'sticky left-0 z-10 bg-white font-mono text-xs text-gray-800 '
-                  : 'text-gray-700 '}px-3 py-2 whitespace-nowrap">{display(r[c.key])}</td
+                  : 'text-gray-700 '}border-r border-gray-100 px-3 py-2 whitespace-nowrap"
+                >{display(r[c.key])}</td
               >
             {/each}
-            {#if actions}<td class="px-3 py-2 text-right whitespace-nowrap">{@render actions(r)}</td
-              >{/if}
+            <td></td>
+            {#if actions}
+              <td class="sticky right-0 z-10 border-l border-gray-200 bg-white px-3 py-2 whitespace-nowrap"
+                >{@render actions(r)}</td
+              >
+            {/if}
           </tr>
         {/each}
       </tbody>
