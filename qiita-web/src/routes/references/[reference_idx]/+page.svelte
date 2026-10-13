@@ -57,7 +57,7 @@
 </script>
 
 <div class="mb-3">
-  <a href="/" class="text-sm text-teal-700 hover:underline">← References</a>
+  <a href="/references" class="text-sm text-teal-700 hover:underline">← References</a>
 </div>
 
 {#if !auth.isSet}
