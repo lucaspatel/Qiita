@@ -19,7 +19,8 @@
   import Spinner from './Spinner.svelte';
   import { pyworker, type Pcoa, type Permanova } from '$lib/pyodide/pyodide.svelte';
   import FeatureTableGrid from './FeatureTableGrid.svelte';
-  import ProfileSubmit from './ProfileSubmit.svelte';
+  import Select from './Select.svelte';
+  import { workflowsFor } from '$lib/nodeWorkflows';
   import { loadFeatureTable, type FeatureTable } from '$lib/featureTable';
   import ColorPanel from './ColorPanel.svelte';
   import { colorBy, fieldValue, natural, shapeBy } from '$lib/colorBy';
@@ -36,6 +37,9 @@
   let unsupported = $state(false);
   // Selected node per group (keyed by prep protocol).
   let selected = $state<Record<string, string | null>>({});
+  // The open "Run workflow" launcher per group: the node it runs from, and the
+  // workflow picked for it.
+  let launch = $state<Record<string, { from: string; workflow: string } | null>>({});
   let loadedFor = -1;
 
   $effect(() => {
@@ -74,17 +78,18 @@
     continuousFor = cont;
   }
 
-  // The prep protocols a shotgun profiler reads; their Reads node offers a profile.
-  const METAGENOMIC_PROTOCOLS = ['short_read_metagenomics', 'long_read_metagenomics'];
-
   const NODE_W = 170;
   const NODE_H = 76;
   const COL_GAP = 56;
   const ROW_GAP = 20;
 
   type Placed = { node: LineageNode; c: number; r: number };
+  /** A "Run workflow" launcher, one column right of the node it runs from. */
+  type Launcher = { from: Placed; c: number; r: number };
 
-  /** Column = longest path from a root; rows stack within a column. */
+  /** Column = longest path from a root; rows stack within a column. A node some
+   *  workflow can run from gets a launcher in the next column, below that column's
+   *  nodes. */
   function layout(g: LineageGroup) {
     const incoming = new Map<string, string[]>();
     for (const e of g.edges) incoming.set(e.target, [...(incoming.get(e.target) ?? []), e.source]);
@@ -106,11 +111,19 @@
       return { node, c, r };
     });
     const at = new Map(placed.map((p) => [p.node.id, p]));
-    const cols = Math.max(0, ...placed.map((p) => p.c)) + 1;
+    const launchers: Launcher[] = placed
+      .filter((p) => workflowsFor(p.node, g).length)
+      .map((from) => ({ from, c: from.c + 1, r: 0 }));
+    for (const l of launchers) {
+      l.r = rows.get(l.c) ?? 0;
+      rows.set(l.c, l.r + 1);
+    }
+    const cols = Math.max(0, ...placed.map((p) => p.c), ...launchers.map((l) => l.c)) + 1;
     const maxRows = Math.max(1, ...rows.values());
     return {
       placed,
       at,
+      launchers,
       width: cols * NODE_W + (cols - 1) * COL_GAP,
       height: maxRows * NODE_H + (maxRows - 1) * ROW_GAP
     };
@@ -487,6 +500,18 @@
                   {/if}
                 {/if}
               {/each}
+              {#each L.launchers as l (l.from.node.id)}
+                <line
+                  x1={x(l.from.c) + NODE_W}
+                  y1={y(l.from.r) + NODE_H / 2}
+                  x2={x(l.c)}
+                  y2={y(l.r) + NODE_H / 2}
+                  stroke={launch[g.prep_protocol]?.from === l.from.node.id ? '#0f766e' : '#cbd5e1'}
+                  stroke-width="1.5"
+                  stroke-dasharray="4 3"
+                  marker-end="url(#lin-arrow-{g.prep_protocol})"
+                />
+              {/each}
             </svg>
 
             {#each L.placed as p (p.node.id)}
@@ -518,6 +543,30 @@
                 </div>
               </button>
             {/each}
+            {#each L.launchers as l (l.from.node.id)}
+              {@const open = launch[g.prep_protocol]?.from === l.from.node.id}
+              <button
+                class="absolute flex items-center justify-center gap-1.5 rounded-lg border border-dashed text-sm font-medium transition {open
+                  ? 'border-teal-500 bg-teal-50 text-teal-800 ring-1 ring-teal-500'
+                  : 'border-gray-300 bg-white/60 text-gray-500 hover:border-teal-400 hover:text-teal-700'}"
+                style="left:{x(l.c)}px;top:{y(l.r)}px;width:{NODE_W}px;height:{NODE_H}px"
+                aria-expanded={open}
+                onclick={() => {
+                  const ws = workflowsFor(l.from.node, g);
+                  launch = {
+                    ...launch,
+                    [g.prep_protocol]: open
+                      ? null
+                      : { from: l.from.node.id, workflow: (ws.find((w) => w.form) ?? ws[0]).id }
+                  };
+                }}
+              >
+                <svg viewBox="0 0 20 20" fill="currentColor" class="size-4" aria-hidden="true">
+                  <path d="M6.3 2.84A1.5 1.5 0 0 0 4 4.11v11.78a1.5 1.5 0 0 0 2.3 1.27l9.34-5.89a1.5 1.5 0 0 0 0-2.54L6.3 2.84Z" />
+                </svg>
+                Run workflow
+              </button>
+            {/each}
             {#if edgeHover?.key.startsWith(`${g.prep_protocol}:`)}
               <div
                 class="pointer-events-none absolute z-10 -translate-x-1/2 -translate-y-full rounded bg-gray-900 px-2 py-1 font-mono text-[11px] whitespace-nowrap text-white shadow"
@@ -529,15 +578,49 @@
           </div>
         </div>
 
+        {#if launch[g.prep_protocol]}
+          {@const ln = launch[g.prep_protocol]!}
+          {@const fromNode = g.nodes.find((n) => n.id === ln.from)}
+          {@const choices = fromNode ? workflowsFor(fromNode, g) : []}
+          {@const wf = choices.find((w) => w.id === ln.workflow)}
+          <div class="flex flex-wrap items-end gap-3 border-t border-gray-200 bg-gray-50 px-4 py-3 sm:px-6">
+            <p class="flex w-full items-center justify-between text-xs font-medium text-gray-500">
+              Run a workflow on {fromNode?.label ?? 'this node'}
+              <button
+                type="button"
+                class="text-gray-400 hover:text-gray-600"
+                aria-label="Close"
+                onclick={() => (launch = { ...launch, [g.prep_protocol]: null })}>✕</button
+              >
+            </p>
+            <label class="flex flex-col gap-1 text-xs text-gray-600">
+              Workflow
+              <Select
+                class="w-64"
+                bind:value={
+                  () => ln.workflow,
+                  (v) => (launch = { ...launch, [g.prep_protocol]: { from: ln.from, workflow: v } })
+                }
+              >
+                {#each choices as w (w.id)}
+                  <option value={w.id} disabled={!w.form}>{w.label}{w.note ? ` — ${w.note}` : ''}</option>
+                {/each}
+              </Select>
+            </label>
+            {#if wf?.form}
+              {#key wf.id}
+                <wf.form samples={g.samples} onSubmitted={() => load(studyIdx)} />
+              {/key}
+            {/if}
+          </div>
+        {/if}
+
         {#if selNode}
           {@const sc = scatter(g, selNode, visible[g.prep_protocol] ?? [])}
           {@const ftIdx = selNode.kind === 'product' ? selNode.processing_idx : null}
           {@const pc = ftIdx != null ? pcoaFor[ftIdx] : undefined}
           {@const shown = new Set((visible[g.prep_protocol] ?? []).map((r) => String(r.sample)))}
           <div class="border-t border-gray-200">
-            {#if selNode.kind === 'reads' && METAGENOMIC_PROTOCOLS.includes(g.prep_protocol)}
-              <ProfileSubmit samples={g.samples} onSubmitted={() => load(studyIdx)} />
-            {/if}
             {#if ftIdx != null}
               {@const meta = metaFor[g.prep_protocol]}
               {@const bio = pc?.state === 'ok' ? (k: string) => pc.table.biosampleOf[k] : same}
