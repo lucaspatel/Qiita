@@ -32,6 +32,10 @@ class FeatureTableRequest(BaseModel):
     ]
     study_idx: PositiveIdx | None = None
     prep_sample_idx: Annotated[list[PositiveIdx], Field(min_length=1)] | None = None
+    # Keep only the ASVs that are members of this sequence reference, ranked by its
+    # taxonomy (e.g. an amplicon table filtered to Greengenes2's ASVs). Read-time:
+    # nothing is stored, and the unfiltered table is unchanged.
+    filter_reference_idx: PositiveIdx | None = None
 
     @model_validator(mode="after")
     def _one_cohort(self) -> Self:

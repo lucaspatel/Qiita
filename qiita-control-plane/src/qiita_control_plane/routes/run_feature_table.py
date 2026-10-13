@@ -11,6 +11,9 @@
     values name, as an Arrow IPC stream: an ASV's sequence, or a genome's taxonomy
     from its reference.
 
+A request naming `filter_reference_idx` gets an amplicon table cut to the ASVs that
+are members of that reference, ranked by its taxonomy: a view, computed per read.
+
 What a feature table is, which runs it can merge, and why COO, is in
 `run_feature_table`. Arrow IPC keeps the same columnar rows a Flight reader gets,
 for the web UI and the CLI alike.
@@ -45,6 +48,7 @@ from ..run_feature_table import (
     Cohort,
     CohortError,
     Genomes,
+    Kept,
     arrow_stream_bytes,
     build_features,
     build_values,
@@ -53,6 +57,7 @@ from ..run_feature_table import (
     genome_labels,
     genome_members,
     observed_genomes,
+    reference_members,
     resolve_cohort,
 )
 from ._helpers import authorize_prep_sample_cohort
@@ -145,6 +150,46 @@ async def _genomes(
     return Genomes(labels=labels, members=members, taxonomy=ranks)
 
 
+async def _kept(
+    pool: asyncpg.Pool,
+    cohort: Cohort,
+    observed: pa.Table,
+    *,
+    taxonomy: bool,
+    data_plane_url: str,
+    signing_key: bytes,
+) -> Kept | None:
+    """The ASVs of `observed` (any relation with `feature_idx`) the cohort's filter
+    reference keeps, with their taxonomy for `taxonomy`; None when unfiltered."""
+    if cohort.filter_reference_idx is None:
+        return None
+    features = await reference_members(
+        pool,
+        cohort.filter_reference_idx,
+        sorted(set(observed.column("feature_idx").to_pylist())),
+    )
+    if not taxonomy:
+        return Kept(features=features)
+    kept_idx = features.column("feature_idx").to_pylist()
+    if not kept_idx:
+        # An empty filter would sign a ticket for the reference's whole taxonomy.
+        return Kept(features=features)
+    try:
+        ranks = await asyncio.to_thread(
+            lambda: fetch_taxonomy(
+                data_plane_url=data_plane_url,
+                signing_key=signing_key,
+                reference_idx=cohort.filter_reference_idx,
+                feature_idx=kept_idx,
+            )
+        )
+    except flight.FlightError as exc:
+        raise HTTPException(
+            status_code=502, detail=f"data plane read of the filter's taxonomy failed: {exc}"
+        ) from exc
+    return Kept(features=features, taxonomy=ranks)
+
+
 @router.post(PATH_FEATURE_TABLE_VALUES, response_class=Response)
 async def feature_table_values(
     request: FeatureTableRequest,
@@ -166,7 +211,15 @@ async def feature_table_values(
         data_plane_url=data_plane_url,
         signing_key=signing_key,
     )
-    table = build_values(cohort, values, chunks, genomes)
+    kept = await _kept(
+        pool,
+        cohort,
+        values,
+        taxonomy=False,
+        data_plane_url=data_plane_url,
+        signing_key=signing_key,
+    )
+    table = build_values(cohort, values, chunks, genomes, kept)
     return Response(arrow_stream_bytes(table), media_type=ARROW_STREAM_MEDIA_TYPE)
 
 
@@ -199,5 +252,17 @@ async def feature_table_features(
         if values is not None
         else None
     )
-    table = build_features(cohort, values, chunks, genomes)
+    kept = (
+        await _kept(
+            pool,
+            cohort,
+            chunks,
+            taxonomy=True,
+            data_plane_url=data_plane_url,
+            signing_key=signing_key,
+        )
+        if chunks is not None
+        else None
+    )
+    table = build_features(cohort, values, chunks, genomes, kept)
     return Response(arrow_stream_bytes(table), media_type=ARROW_STREAM_MEDIA_TYPE)

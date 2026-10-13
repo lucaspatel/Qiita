@@ -522,3 +522,123 @@ async def test_refuses_profiles_against_different_databases(role_keyed_clients, 
     )
     assert resp.status_code == 409, resp.text
     assert "sylph_database_sha256" in resp.json()["detail"]
+
+
+# --- an amplicon table filtered to a reference's ASVs -------------------------------
+
+KEPT_ASV = "TTTTGGGG"
+
+
+@pytest.fixture
+async def filtered_run(role_keyed_clients, amplicon_run, monkeypatch):
+    """amplicon_run's ASV plus one that is a member of a reference (one feature),
+    and that reference's taxonomy stubbed to classify its member."""
+    run, db = amplicon_run, role_keyed_clients["pool"]
+    reference = await seed_genome_reference(db, label="asv-filter", n_genomes=1)
+    member = reference["feature_idxs"][0]
+    taxonomy_reads: list[list[int]] = []
+
+    def _fetch(*, data_plane_url, signing_key, cohort, values=True):
+        rows = [
+            (r, p, f) for r in cohort.runs for p in cohort.prep_sample_idxs for f in (77, member)
+        ]
+        observed = pa.table(
+            {
+                "prep_sample_idx": pa.array([x[1] for x in rows], pa.int64()),
+                "processing_idx": pa.array([x[0] for x in rows], pa.int64()),
+                "feature_idx": pa.array([x[2] for x in rows], pa.int64()),
+                "count": pa.array([5] * len(rows), pa.int64()),
+            }
+        )
+        chunks = pa.table(
+            {
+                "feature_idx": pa.array([77, member], pa.int64()),
+                "chunk_index": pa.array([0, 0], pa.int32()),
+                "chunk_data": pa.array([ASV, KEPT_ASV], pa.string()),
+            }
+        )
+        return (observed if values else None), chunks
+
+    def _taxonomy(*, data_plane_url, signing_key, reference_idx, feature_idx):
+        assert reference_idx == reference["reference_idx"]
+        taxonomy_reads.append(sorted(feature_idx))
+        ranks = {r: [None] for r in RANK_COLUMNS}
+        ranks["domain"], ranks["genus"] = ["Bacteria"], ["Bacteroides"]
+        return pa.table(
+            {
+                "feature_idx": pa.array([member], pa.int64()),
+                **{r: pa.array(v, pa.string()) for r, v in ranks.items()},
+            }
+        )
+
+    monkeypatch.setattr("qiita_control_plane.routes.run_feature_table.fetch_runs", _fetch)
+    monkeypatch.setattr("qiita_control_plane.routes.run_feature_table.fetch_taxonomy", _taxonomy)
+    yield {**run, "reference": reference, "taxonomy_reads": taxonomy_reads}
+    await cleanup_genome_reference(db, reference)
+
+
+def _filtered(run, reference_idx=None):
+    return {
+        **_body([run["processing_idx"]], prep_sample_idx=[run["ps_a"]]),
+        "filter_reference_idx": reference_idx or run["reference"]["reference_idx"],
+    }
+
+
+async def test_a_filtered_table_keeps_only_the_references_asvs(role_keyed_clients, filtered_run):
+    run = filtered_run
+    resp = await role_keyed_clients["wet"].post(URL_FEATURE_TABLE_VALUES, json=_filtered(run))
+    assert resp.status_code == 200, resp.text
+    assert {r["feature"] for r in _arrow(resp).to_pylist()} == {
+        hashlib.md5(KEPT_ASV.encode()).hexdigest()
+    }
+    # The same request without the filter still has both.
+    unfiltered = await role_keyed_clients["wet"].post(
+        URL_FEATURE_TABLE_VALUES, json=_body([run["processing_idx"]], prep_sample_idx=[run["ps_a"]])
+    )
+    assert len({r["feature"] for r in _arrow(unfiltered).to_pylist()}) == 2
+
+
+async def test_a_filtered_tables_asvs_carry_the_references_taxonomy(
+    role_keyed_clients, filtered_run
+):
+    run = filtered_run
+    resp = await role_keyed_clients["wet"].post(URL_FEATURE_TABLE_FEATURES, json=_filtered(run))
+    assert resp.status_code == 200, resp.text
+    (row,) = _arrow(resp).to_pylist()
+    assert (row["sequence"], row["domain"], row["genus"], row["species"]) == (
+        KEPT_ASV,
+        "d__Bacteria",
+        "g__Bacteroides",
+        None,
+    )
+    # Taxonomy is read only for the kept ASVs.
+    assert run["taxonomy_reads"] == [run["reference"]["feature_idxs"]]
+
+
+async def test_refuses_a_filter_reference_that_is_missing_or_inactive(
+    role_keyed_clients, filtered_run
+):
+    run, db = filtered_run, role_keyed_clients["pool"]
+    missing = await role_keyed_clients["wet"].post(
+        URL_FEATURE_TABLE_SAMPLES, json=_filtered(run, reference_idx=2**40)
+    )
+    assert missing.status_code == 404, missing.text
+    await db.execute(
+        "UPDATE qiita.reference SET status = 'loading' WHERE reference_idx = $1",
+        run["reference"]["reference_idx"],
+    )
+    loading = await role_keyed_clients["wet"].post(URL_FEATURE_TABLE_SAMPLES, json=_filtered(run))
+    assert loading.status_code == 409, loading.text
+
+
+async def test_refuses_to_filter_a_genome_keyed_table(role_keyed_clients, profile_run):
+    run = profile_run
+    resp = await role_keyed_clients["wet"].post(
+        URL_FEATURE_TABLE_SAMPLES,
+        json={
+            **_body([run["processing_idx"]], prep_sample_idx=[run["ps_a"]]),
+            "filter_reference_idx": run["reference"]["reference_idx"],
+        },
+    )
+    assert resp.status_code == 409, resp.text
+    assert "genomes" in resp.json()["detail"]

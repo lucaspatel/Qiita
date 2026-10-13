@@ -41,7 +41,7 @@ def _answers(method, values, features):
     return call, fetch_binary
 
 
-def _run(monkeypatch, tmp_path, method, values, features):
+def _run(monkeypatch, tmp_path, method, values, features, extra=()):
     from qiita_control_plane.cli import _common
     from qiita_control_plane.cli.user._parser import _build_parser
 
@@ -65,6 +65,7 @@ def _run(monkeypatch, tmp_path, method, values, features):
             "parquet",
             "--output",
             str(out),
+            *extra,
         ]
     )
     assert args.handler(args, parser) == 0
@@ -148,3 +149,23 @@ def test_an_amplicon_bundle_carries_each_asvs_sequence(monkeypatch, tmp_path):
     # Only the features the table names.
     assert sequences == [("md5a", "ACGT")]
     assert not out.with_name("table.taxonomy.parquet").exists()
+
+
+def test_a_filtered_amplicon_bundle_carries_sequences_and_taxonomy(monkeypatch, tmp_path):
+    out = _run(
+        monkeypatch,
+        tmp_path,
+        "amplicon",
+        _values([("QM1", "md5a", 5.0)]),
+        _features([("md5a", "ACGT", {"domain": "d__Bacteria", "genus": "g__Bacteroides"})]),
+        extra=("--filter-reference-idx", "12"),
+    )
+    with duckdb.connect() as con:
+        taxonomy = con.execute(
+            "SELECT feature_id, domain, genus FROM read_parquet(?)",
+            [str(out.with_name("table.taxonomy.parquet"))],
+        ).fetchall()
+    assert taxonomy == [("md5a", "d__Bacteria", "g__Bacteroides")]
+    assert out.with_name("table.sequences.parquet").exists()
+    manifest = json.loads(out.with_name("table.manifest.json").read_text())
+    assert manifest["request"]["filter_reference_idx"] == 12

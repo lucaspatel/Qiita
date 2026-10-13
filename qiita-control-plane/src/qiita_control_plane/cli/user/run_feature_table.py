@@ -10,8 +10,9 @@ A run is an amplicon run (ASV counts, features named by sequence md5) or a
 taxonomic profile (relative abundances over its reference's genomes, named by
 their `exported_feature` handles). The table is written straight from its COO rows
 — BIOM and Parquet both take `(feature_id, sample_id, value)` — so it is never made
-dense on the way to disk. An amplicon table's bundle carries each ASV's sequence; a
-profile's carries each genome's taxonomy.
+dense on the way to disk. An amplicon table's bundle carries each ASV's sequence,
+and its taxonomy when the table is filtered to a reference's ASVs; a profile's
+carries each genome's taxonomy.
 """
 
 from __future__ import annotations
@@ -62,6 +63,7 @@ def _request(args: argparse.Namespace) -> FeatureTableRequest:
         processing_idx=args.processing_idx,
         study_idx=args.study_idx,
         prep_sample_idx=args.prep_sample_idx,
+        filter_reference_idx=args.filter_reference_idx,
     )
 
 
@@ -127,9 +129,10 @@ def _build(args: argparse.Namespace, token: str, con) -> tuple[list[Path], dict[
     clearances: dict[str, Any] = {}
     if source.sequences_table is not None:
         clearances["sequences"] = SequencesClearance(features=sizes["features"])
-    else:
-        # A genome's ranks, as the alignment table's sidecar carries them; checked
-        # above to name every feature of the table.
+    if source.sequences_table is None or args.filter_reference_idx is not None:
+        # A genome's ranks, or a filtered ASV's from the filter reference, as the
+        # alignment table's sidecar carries them; checked above to name every
+        # feature of the table.
         con.execute(
             f"CREATE VIEW {ft.TAXONOMY_SIDECAR_RELATION} AS"
             f" SELECT feature AS feature_id, {', '.join(QUOTED_RANK_COLUMNS)}"

@@ -1400,6 +1400,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Exactly these prep_samples; one the runs did not process is refused.",
     )
     p_ft_runs.add_argument(
+        "--filter-reference-idx",
+        type=int,
+        help=(
+            "Keep only the ASVs that are members of this sequence reference (e.g."
+            " Greengenes2's ASVs), ranked by its taxonomy; writes <stem>.taxonomy.parquet"
+            " too. Amplicon runs only."
+        ),
+    )
+    p_ft_runs.add_argument(
         "--format",
         choices=TABLE_FORMATS,
         default=DEFAULT_TABLE_FORMAT,
