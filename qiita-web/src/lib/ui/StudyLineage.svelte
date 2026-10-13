@@ -159,6 +159,11 @@
     not_started: 'bg-gray-50 text-gray-400 ring-gray-400/10'
   };
   const stateLabel = (s: string) => s.replace('_', ' ');
+  // `short_read_metagenomics` → "Short read metagenomics".
+  const protocolLabel = (p: string) => {
+    const t = p.replaceAll('_', ' ');
+    return t.charAt(0).toUpperCase() + t.slice(1);
+  };
 
   function segments(n: LineageNode) {
     const total = Object.values(n.counts).reduce((a, b) => a + (b ?? 0), 0) || 1;
@@ -442,14 +447,20 @@
     <p class="text-sm text-gray-500">No samples linked to this study yet.</p>
   </Card>
 {:else if data}
-  <div class="space-y-4">
+  <!-- One card, a row per prep protocol. The graphs are left-aligned so the same
+       stage sits in the same column on every row. -->
+  <Card bodyClass="divide-y divide-gray-200" title="Processing lineage">
     {#each data.groups as g (g.prep_protocol)}
       {@const L = layout(g)}
       {@const sel = selected[g.prep_protocol] ?? null}
       {@const selNode = sel ? (g.nodes.find((n) => n.id === sel) ?? null) : null}
-      <Card bodyClass="" title={`Processing lineage — ${g.prep_protocol.replaceAll('_', ' ')} (${g.samples.length} samples)`}>
+      <section aria-label={g.prep_protocol.replaceAll('_', ' ')}>
         <div class="overflow-x-auto px-4 py-4 sm:px-6">
-          <div class="relative mx-auto" style="width:{L.width}px;height:{L.height}px">
+          <p class="mb-3 text-xs font-medium text-gray-500">
+            <span class="text-gray-900">{protocolLabel(g.prep_protocol)}</span>
+            · {g.samples.length} sample{g.samples.length === 1 ? '' : 's'}
+          </p>
+          <div class="relative" style="width:{L.width}px;height:{L.height}px">
             <svg class="pointer-events-none absolute inset-0" width={L.width} height={L.height}>
               <defs>
                 <marker id="lin-arrow-{g.prep_protocol}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
@@ -758,7 +769,7 @@
             {/if}
           </div>
         {/if}
-      </Card>
+      </section>
     {/each}
-  </div>
+  </Card>
 {/if}
