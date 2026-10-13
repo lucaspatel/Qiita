@@ -127,3 +127,22 @@ export function genomeLabel(table: FeatureTable, feature: string): string {
   if (!last) return feature;
   return last[1] === 's' ? last[2] : `${last[2]} (${ranks[last[1]] ?? last[1]})`;
 }
+
+/** `table` without the samples that have no observation, and their names. A table
+ *  filtered to a reference's ASVs can leave a sample with none of them, which an
+ *  ordination cannot place. */
+export function dropEmptySamples(table: FeatureTable): { table: FeatureTable; dropped: string[] } {
+  const seen = new Uint8Array(table.samples.length);
+  for (const k of table.s) seen[k] = 1;
+  if (seen.every(Boolean)) return { table, dropped: [] };
+  const remap = new Int32Array(table.samples.length).fill(-1);
+  const samples: string[] = [];
+  const dropped: string[] = [];
+  table.samples.forEach((name, i) => {
+    if (seen[i]) {
+      remap[i] = samples.length;
+      samples.push(name);
+    } else dropped.push(name);
+  });
+  return { table: { ...table, samples, s: table.s.map((k) => remap[k]) }, dropped };
+}

@@ -21,13 +21,22 @@
   import FeatureTableGrid from './FeatureTableGrid.svelte';
   import Select from './Select.svelte';
   import { workflowsFor } from '$lib/nodeWorkflows';
-  import { loadFeatureTable, type FeatureTable } from '$lib/featureTable';
+  import { dropEmptySamples, loadFeatureTable, type FeatureTable } from '$lib/featureTable';
   import ColorPanel from './ColorPanel.svelte';
   import { colorBy, fieldValue, natural, shapeBy } from '$lib/colorBy';
   import { metadataFields } from '$lib/samples';
   import type { MetaField } from '$lib/api';
   import { studyMetadata } from '$lib/studyMetadata.svelte';
   import { loadPlotPrefs, savePlotPrefs } from '$lib/plotPrefs';
+  import {
+    isViewId,
+    loadViews,
+    saveViews,
+    viewId,
+    withViews,
+    type TableView
+  } from '$lib/tableViews';
+  import type { FeatureTableRequest } from '$lib/api';
 
   let { studyIdx }: { studyIdx: number } = $props();
 
@@ -56,12 +65,64 @@
     const ws = workflowsFor(node, g);
     const wf = ws.find((w) => w.form) ?? ws[0];
     launch = { ...launch, [g.prep_protocol]: { from: node.id, workflow: wf.id } };
-    // The launch works on the node's table, ticked for every sample it can take.
+    // A per-sample launch works on the node's table, ticked for every sample it can
+    // take.
+    if (!wf.takes) return;
+    const takes = wf.takes;
     selected = { ...selected, [g.prep_protocol]: node.id };
     chosen = {
       ...chosen,
-      [g.prep_protocol]: g.samples.filter((s) => wf.takes(s, node)).map((s) => s.prep_sample_idx)
+      [g.prep_protocol]: g.samples.filter((s) => takes(s, node)).map((s) => s.prep_sample_idx)
     };
+  }
+
+  // Each group's feature-table views (see tableViews.ts), and the groups with them
+  // drawn in: everything that reads the graph reads `groups`, not `data.groups`.
+  let viewsFor = $state<Record<string, TableView[]>>({});
+  const groups = $derived(
+    (data?.groups ?? []).map((g) => withViews(g, viewsFor[g.prep_protocol] ?? []))
+  );
+
+  function setViews(protocol: string, views: TableView[]) {
+    viewsFor = { ...viewsFor, [protocol]: views };
+    saveViews(studyIdx, protocol, views);
+  }
+
+  /** Add a view of `from`'s table, select it, and start reading it. */
+  function addView(g: LineageGroup, from: LineageNode, v: Omit<TableView, 'from'>) {
+    const key = g.prep_protocol;
+    const view: TableView = { ...v, from: from.id };
+    const id = viewId(view);
+    setViews(key, [...(viewsFor[key] ?? []).filter((x) => viewId(x) !== id), view]);
+    launch = { ...launch, [key]: null };
+    selected = { ...selected, [key]: id };
+    if (!colorVar[key]) colorVar = { ...colorVar, [key]: 'qiita_sample_type' };
+    if (from.processing_idx != null && !pcoaFor[id])
+      loadPcoa(
+        id,
+        {
+          processing_idx: [from.processing_idx],
+          study_idx: studyIdx,
+          filter_reference_idx: view.filterReferenceIdx
+        },
+        key
+      );
+  }
+
+  function removeView(g: LineageGroup, id: string) {
+    const key = g.prep_protocol;
+    setViews(key, (viewsFor[key] ?? []).filter((x) => viewId(x) !== id));
+    if (selected[key] === id) selected = { ...selected, [key]: null };
+  }
+
+  /** The feature table a product node reads, as its cache key and request; null
+   *  for any other node. A view's is its source run's, filtered. */
+  function tableOf(g: LineageGroup, n: LineageNode): { key: string; request: FeatureTableRequest } | null {
+    if (n.kind !== 'product' || n.processing_idx == null) return null;
+    const request: FeatureTableRequest = { processing_idx: [n.processing_idx], study_idx: studyIdx };
+    if (!isViewId(n.id)) return { key: String(n.processing_idx), request };
+    const v = (viewsFor[g.prep_protocol] ?? []).find((x) => viewId(x) === n.id);
+    return v ? { key: n.id, request: { ...request, filter_reference_idx: v.filterReferenceIdx } } : null;
   }
 
   function toggleChosen(g: LineageGroup, idxs: number[], on: boolean) {
@@ -141,13 +202,16 @@
     const color: Record<string, string> = {};
     const shape: Record<string, string> = {};
     const cont: Record<string, boolean> = {};
+    const views: Record<string, TableView[]> = {};
     for (const g of r.data.groups) {
+      views[g.prep_protocol] = loadViews(idx, g.prep_protocol);
       const pr = loadPlotPrefs(idx, g.prep_protocol);
       if (pr.colorVar) color[g.prep_protocol] = pr.colorVar;
       if (pr.shapeVar) shape[g.prep_protocol] = pr.shapeVar;
       if (pr.continuous) cont[g.prep_protocol] = pr.continuous;
     }
     colorVar = color;
+    viewsFor = views;
     shapeVar = shape;
     continuousFor = cont;
   }
@@ -310,24 +374,30 @@
     };
   }
 
-  // A feature table's PCoA, by processing_idx: fetched and computed (in the
+  // A feature table's PCoA, by its `tableOf` key: fetched and computed (in the
   // Pyodide worker) the first time its node is selected, then kept; a new depth
   // recomputes from the kept table.
   type PcoaState =
     | { state: 'loading' }
-    | { state: 'ok'; table: FeatureTable; pcoa: Pcoa; busy: boolean }
+    // `dropped`: a filtered view's samples left with no ASV, left out of the plot.
+    | { state: 'ok'; table: FeatureTable; pcoa: Pcoa; busy: boolean; dropped: string[] }
     | { state: 'error'; message: string };
   // Raw: entries are only ever replaced, and the feature table inside is posted to
   // the worker, which cannot clone a reactive proxy.
-  let pcoaFor = $state.raw<Record<number, PcoaState>>({});
+  let pcoaFor = $state.raw<Record<string, PcoaState>>({});
 
-  async function loadPcoa(processingIdx: number, protocol: string) {
+  async function loadPcoa(processingIdx: string, request: FeatureTableRequest, protocol: string) {
     pcoaFor = { ...pcoaFor, [processingIdx]: { state: 'loading' } };
-    const table = await loadFeatureTable({ processing_idx: [processingIdx], study_idx: studyIdx });
-    if (!table.ok) {
-      pcoaFor = { ...pcoaFor, [processingIdx]: { state: 'error', message: `feature table: ${table.detail}` } };
+    const loaded = await loadFeatureTable(request);
+    if (!loaded.ok) {
+      pcoaFor = { ...pcoaFor, [processingIdx]: { state: 'error', message: `feature table: ${loaded.detail}` } };
       return;
     }
+    // Only a filtered view drops empty samples; an unfiltered table with one is a
+    // fault the worker reports.
+    const { table: data, dropped } =
+      request.filter_reference_idx != null ? dropEmptySamples(loaded.data) : { table: loaded.data, dropped: [] };
+    const table = { ok: true as const, data };
     try {
       let pcoa = await pyworker.pcoa(table.data);
       // Restore the last depth, if a sample still has exactly that depth, before
@@ -342,13 +412,13 @@
           console.warn(`Saved PCoA depth ${saved} not restored:`, e);
         }
       }
-      pcoaFor = { ...pcoaFor, [processingIdx]: { state: 'ok', table: table.data, pcoa, busy: false } };
+      pcoaFor = { ...pcoaFor, [processingIdx]: { state: 'ok', table: table.data, pcoa, busy: false, dropped } };
     } catch (e) {
       pcoaFor = { ...pcoaFor, [processingIdx]: { state: 'error', message: `PCoA: ${String(e)}` } };
     }
   }
 
-  async function rarefy(processingIdx: number, depth: number | null, protocol: string) {
+  async function rarefy(processingIdx: string, depth: number | null, protocol: string) {
     const cur = pcoaFor[processingIdx];
     if (cur?.state !== 'ok') return;
     pcoaFor = { ...pcoaFor, [processingIdx]: { ...cur, busy: true } };
@@ -372,7 +442,7 @@
     const out: Record<string, MetaState> = {};
     if (!data) return out;
     const ready = studyMetadata.ready(studyIdx);
-    for (const g of data.groups) {
+    for (const g of groups) {
       if (!ready) {
         out[g.prep_protocol] = { state: 'loading' };
         continue;
@@ -432,7 +502,7 @@
   // Settings restored from storage are checked once the metadata is in: a saved
   // variable the study no longer has falls back to the default.
   $effect(() => {
-    for (const g of data?.groups ?? []) {
+    for (const g of groups) {
       const m = metaFor[g.prep_protocol];
       if (m?.state !== 'ok') continue;
       const vars = variablesOf(m.byLabel);
@@ -447,7 +517,7 @@
 
   // And saved whenever they change.
   $effect(() => {
-    for (const g of data?.groups ?? []) {
+    for (const g of groups) {
       const key = g.prep_protocol;
       savePlotPrefs(studyIdx, key, {
         colorVar: colorVar[key],
@@ -462,11 +532,11 @@
   let permFor = $state<Record<string, Permanova | string | null>>({});
   let permSeq = 0;
   $effect(() => {
-    for (const g of data?.groups ?? []) {
+    for (const g of groups) {
       const sel = selected[g.prep_protocol];
       const node = sel ? g.nodes.find((n) => n.id === sel) : null;
-      const ft = node?.kind === 'product' ? node.processing_idx : null;
-      const pc = ft != null ? pcoaFor[ft] : undefined;
+      const t = node ? tableOf(g, node) : null;
+      const pc = t ? pcoaFor[t.key] : undefined;
       if (pc?.state !== 'ok' || pc.busy) continue;
       const coloring = coloringFor(g, pc.pcoa.samples, (k) => pc.table.biosampleOf[k]);
       if (!coloring) continue;
@@ -502,7 +572,8 @@
 
   // The action that produced a node, shown on hover over the arrow into it rather
   // than on the node: the node says what the data is, the arrow how it got there.
-  const producedBy = (n: LineageNode) => (n.kind === 'product' ? '' : (n.detail ?? ''));
+  const producedBy = (n: LineageNode) =>
+    isViewId(n.id) || n.kind !== 'product' ? (n.detail ?? '') : '';
   let edgeHover = $state<{ key: string; x: number; y: number; text: string } | null>(null);
 </script>
 
@@ -525,7 +596,7 @@
   <!-- One card, a row per prep protocol. The graphs are left-aligned so the same
        stage sits in the same column on every row. -->
   <Card bodyClass="divide-y divide-gray-200" title="Processing lineage">
-    {#each data.groups as g (g.prep_protocol)}
+    {#each groups as g (g.prep_protocol)}
       {@const L = layout(g)}
       {@const sel = selected[g.prep_protocol] ?? null}
       {@const selNode = sel ? (g.nodes.find((n) => n.id === sel) ?? null) : null}
@@ -602,19 +673,22 @@
 
             {#each L.placed as p (p.node.id)}
               {@const isProduct = p.node.kind === 'product'}
+              {@const isView = isViewId(p.node.id)}
               <button
-                class="absolute flex flex-col overflow-hidden rounded-lg border text-center transition {sel === p.node.id
-                  ? 'border-teal-500 ring-1 ring-teal-500'
-                  : isProduct
-                    ? 'border-dashed border-teal-300 bg-teal-50/40 hover:border-teal-400'
-                    : 'border-gray-200 bg-white hover:border-gray-300'}"
+                class="absolute flex flex-col overflow-hidden rounded-lg border text-center transition {isView
+                  ? `border-dashed bg-white/50 opacity-80 hover:opacity-100 ${sel === p.node.id ? 'border-violet-500 ring-1 ring-violet-400' : 'border-violet-300 hover:border-violet-400'}`
+                  : sel === p.node.id
+                    ? 'border-teal-500 ring-1 ring-teal-500'
+                    : isProduct
+                      ? 'border-dashed border-teal-300 bg-teal-50/40 hover:border-teal-400'
+                      : 'border-gray-200 bg-white hover:border-gray-300'}"
                 style="left:{x(p.c)}px;top:{y(p.r)}px;width:{NODE_W}px;height:{NODE_H}px"
                 onclick={() => {
                   selected = { ...selected, [g.prep_protocol]: sel === p.node.id ? null : p.node.id };
-                  const ft = p.node.kind === 'product' ? p.node.processing_idx : null;
-                  if (ft != null && !pcoaFor[ft]) loadPcoa(ft, g.prep_protocol);
+                  const t = tableOf(g, p.node);
+                  if (t && !pcoaFor[t.key]) loadPcoa(t.key, t.request, g.prep_protocol);
                   // A node with a plot (a feature table, or two counts) colours by metadata.
-                  if (ft != null || valueChain(g, p.node).length >= 2) {
+                  if (t || valueChain(g, p.node).length >= 2) {
                     if (!colorVar[g.prep_protocol])
                       colorVar = { ...colorVar, [g.prep_protocol]: 'qiita_sample_type' };
                   }
@@ -622,7 +696,9 @@
               >
                 <span class="flex flex-1 flex-col items-center justify-center gap-0.5 px-2">
                   <span class="text-sm leading-tight font-medium text-gray-900">{p.node.label}</span>
-                  <span class="text-[11px] leading-tight text-gray-500">{summary(p.node)}</span>
+                  <span class="text-[11px] leading-tight text-gray-500"
+                    >{isView ? (p.node.detail ?? '') : summary(p.node)}</span
+                  >
                 </span>
                 <div class="flex h-1.5 w-full bg-gray-100">
                   {#each segments(p.node) as seg}<div class={seg.cls} style="width:{seg.pct}%"></div>{/each}
@@ -647,6 +723,18 @@
                 </svg>
                 Run workflow
               </button>
+            {/each}
+            <!-- A view's remove control sits on its corner, beside (not inside) the
+                 node's button. -->
+            {#each L.placed.filter((p) => isViewId(p.node.id)) as p (p.node.id)}
+              <button
+                type="button"
+                class="absolute z-10 flex size-5 items-center justify-center rounded-full text-xs text-violet-400 hover:bg-violet-100 hover:text-violet-700"
+                style="left:{x(p.c) + NODE_W - 22}px;top:{y(p.r) + 2}px"
+                aria-label="Remove this view"
+                title="Remove this view"
+                onclick={() => removeView(g, p.node.id)}>✕</button
+              >
             {/each}
             {#if edgeHover?.key.startsWith(`${g.prep_protocol}:`)}
               <div
@@ -691,7 +779,9 @@
                 <wf.form
                   samples={g.samples}
                   chosen={chosen[g.prep_protocol] ?? []}
+                  node={fromNode}
                   onSubmitted={() => load(studyIdx)}
+                  onView={(v) => addView(g, fromNode, v)}
                 />
               {/key}
             {/if}
@@ -700,11 +790,11 @@
 
         {#if selNode}
           {@const sc = scatter(g, selNode, visible[g.prep_protocol] ?? [])}
-          {@const ftIdx = selNode.kind === 'product' ? selNode.processing_idx : null}
-          {@const pc = ftIdx != null ? pcoaFor[ftIdx] : undefined}
+          {@const tbl = tableOf(g, selNode)}
+          {@const pc = tbl ? pcoaFor[tbl.key] : undefined}
           {@const shown = new Set((visible[g.prep_protocol] ?? []).map((r) => String(r.sample)))}
           <div class="border-t border-gray-200">
-            {#if ftIdx != null}
+            {#if tbl}
               {@const meta = metaFor[g.prep_protocol]}
               {@const bio = pc?.state === 'ok' ? (k: string) => pc.table.biosampleOf[k] : same}
               {@const coloring = pc?.state === 'ok' ? coloringFor(g, pc.pcoa.samples, bio) : null}
@@ -714,6 +804,12 @@
                   <!-- Held until the metadata is in too, so the restored colours and
                        shapes are on the first draw rather than repainted over it. -->
                   {#if pc?.state === 'ok' && meta?.state === 'ok'}
+                    {#if pc.dropped.length}
+                      <p class="px-4 pt-1 text-xs text-gray-500 sm:px-6">
+                        {pc.dropped.length} sample{pc.dropped.length === 1 ? ' has' : 's have'} none of
+                        the reference's ASVs and {pc.dropped.length === 1 ? 'is' : 'are'} left out of the plot.
+                      </p>
+                    {/if}
                     <PcoaPlot
                       pcoa={pc.pcoa}
                       busy={pc.busy}
@@ -724,7 +820,7 @@
                       }}
                       colorOf={coloring?.colorOf ?? null}
                       symbolOf={shaping?.symbolOf ?? null}
-                      onDepth={(d) => rarefy(ftIdx, d, g.prep_protocol)}
+                      onDepth={(d) => rarefy(tbl.key, d, g.prep_protocol)}
                     />
                   {:else if pc?.state === 'error'}
                     <p class="px-4 py-12 text-center text-sm text-amber-800 sm:px-6">{pc.message}</p>
@@ -813,7 +909,7 @@
                 </div>
               </div>
             {/if}
-            {#if ftIdx != null && pc?.state === 'ok'}
+            {#if tbl && pc?.state === 'ok'}
               <FeatureTableGrid
                 table={pc.table}
                 idHeader={labelHeader(g.samples.map((s) => s.label_source))}
@@ -823,7 +919,10 @@
                 }
               />
             {:else}
-            {@const picking = launched(g)?.node.id === selNode.id ? launched(g)!.workflow : null}
+            {@const picking =
+              launched(g)?.node.id === selNode.id && launched(g)!.workflow?.takes
+                ? { takes: launched(g)!.workflow!.takes! }
+                : null}
             {@const failedReads =
               selNode.kind === 'reads' && !picking
                 ? g.samples.filter((s) => s.cells[selNode.id]?.state === 'failed').length

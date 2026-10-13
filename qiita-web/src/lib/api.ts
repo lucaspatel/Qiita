@@ -129,6 +129,8 @@ export type FeatureTableRequest = {
   processing_idx: number[];
   study_idx?: number;
   prep_sample_idx?: number[];
+  /** Keep only the ASVs that are members of this reference, ranked by its taxonomy. */
+  filter_reference_idx?: number;
 };
 
 /** What a table's values are: reads counted per feature, or a percent of the sample. */
