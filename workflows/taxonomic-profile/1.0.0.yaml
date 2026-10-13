@@ -52,6 +52,12 @@ context_schema:
       type: number
       minimum: 0
       maximum: 1
+    # Profile only these of the pool's metagenomic samples; all of them when absent.
+    prep_sample_idxs:
+      type: array
+      minItems: 1
+      uniqueItems: true
+      items: {type: integer, minimum: 1}
 
 steps:
   # profile the pool's metagenomic samples. no reads input — the pool's reads

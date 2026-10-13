@@ -12,7 +12,9 @@
   genome it reports to its reference's `genome_idx` (a genome the reference lacks fails
   the step), and writes DuckLake `taxonomic_profile` (relative abundances in percent, ANI
   as a fraction, effective coverage, per sample and genome). Only the pool's short- and long-read metagenomic
-  samples with stored reads are profiled; a pool with none is refused. A read stream that
+  samples with stored reads are profiled, or the `prep_sample_idxs` the submitter chose
+  from them (a chosen sample outside that set is refused by name); a pool with none is
+  refused. A read stream that
   returns none of those samples fails the step instead of ending as no data, and the step
   log records what was requested, what streamed, and per-stage timings. The run identity
   hashes the database's reference, its file's sha256 and the threshold, so each method and

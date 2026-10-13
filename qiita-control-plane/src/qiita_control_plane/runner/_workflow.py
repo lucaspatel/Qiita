@@ -148,6 +148,36 @@ from ._upload import (
     _submission_bad_input,
 )
 
+# action_context key: the pool's samples a taxonomic-profile run is limited to.
+PROFILE_PREP_SAMPLE_IDXS_KEY = "prep_sample_idxs"
+
+
+async def _resolve_profile_samples(
+    pool: asyncpg.Pool, *, sequenced_pool_idx: int, action_context: dict[str, Any]
+) -> list[int]:
+    """The prep_samples a taxonomic-profile run covers: the pool's live metagenomic
+    samples with stored reads, or the `prep_sample_idxs` the submitter chose from
+    them. A chosen sample outside that set is refused by name rather than dropped,
+    and so is a pool left with nothing to profile."""
+    eligible = await list_pool_metagenomic_prep_sample_idxs(pool, sequenced_pool_idx)
+    chosen = action_context.get(PROFILE_PREP_SAMPLE_IDXS_KEY)
+    if chosen is None:
+        samples = eligible
+    else:
+        outside = sorted(set(chosen) - set(eligible))
+        if outside:
+            raise _submission_bad_input(
+                f"prep_sample(s) {outside} are not live metagenomic samples of"
+                f" sequenced_pool {sequenced_pool_idx} with stored reads"
+            )
+        samples = sorted(set(chosen))
+    if not samples:
+        raise _submission_bad_input(
+            f"sequenced_pool {sequenced_pool_idx} has no live"
+            " metagenomic sample with stored reads to profile"
+        )
+    return samples
+
 
 def _require_sequenced_pool_scope(scope_target: dict[str, Any]) -> None:
     """golay-demux's `barcode_map` is a sequenced_pool's roster — its resolver
@@ -420,14 +450,11 @@ async def run_workflow(
                     f"{LibraryPrimitive.FINALIZE_TAXONOMIC_PROFILE_SAMPLE}) must be "
                     f"sequenced_pool-scoped; got {scope_target['kind']!r}"
                 )
-            profile_samples = await list_pool_metagenomic_prep_sample_idxs(
-                pool, scope_target["sequenced_pool_idx"]
+            profile_samples = await _resolve_profile_samples(
+                pool,
+                sequenced_pool_idx=scope_target["sequenced_pool_idx"],
+                action_context=bound,
             )
-            if not profile_samples:
-                raise _submission_bad_input(
-                    f"sequenced_pool {scope_target['sequenced_pool_idx']} has no live"
-                    " metagenomic sample with stored reads to profile"
-                )
             samples_path = workspace / f"{PROFILE_SAMPLES_BINDING}.json"
             samples_path.write_text(json.dumps(profile_samples))
             bound[PROFILE_SAMPLES_BINDING] = str(samples_path)

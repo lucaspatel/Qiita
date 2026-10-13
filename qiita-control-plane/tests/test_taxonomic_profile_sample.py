@@ -8,6 +8,7 @@ import uuid
 
 import duckdb
 import pytest
+from qiita_common.backend_failure import BackendFailure
 
 from qiita_control_plane.actions.library import finalize_taxonomic_profile_sample
 from qiita_control_plane.repositories.processing import mint_processing
@@ -20,6 +21,7 @@ from qiita_control_plane.runner._processing import (
     _record_taxonomic_profile_gate_no_data,
 )
 from qiita_control_plane.runner._reference import _resolve_sylph_database
+from qiita_control_plane.runner._workflow import _resolve_profile_samples
 from qiita_control_plane.testing.db_seeds import (
     cleanup_genome_reference,
     seed_biosample_with_sequenced_prep_sample,
@@ -119,6 +121,26 @@ async def test_the_pool_population_is_its_metagenomic_samples_with_reads(postgre
     assert await list_pool_metagenomic_prep_sample_idxs(postgres_pool, run["pool_idx"]) == sorted(
         run["metagenomic"]
     )
+
+
+async def test_a_run_covers_the_pool_or_the_samples_chosen_from_it(postgres_pool, run):
+    pool_idx, chosen = run["pool_idx"], run["metagenomic"][1]
+    assert await _resolve_profile_samples(
+        postgres_pool, sequenced_pool_idx=pool_idx, action_context={}
+    ) == sorted(run["metagenomic"])
+    assert await _resolve_profile_samples(
+        postgres_pool, sequenced_pool_idx=pool_idx, action_context={"prep_sample_idxs": [chosen]}
+    ) == [chosen]
+
+
+@pytest.mark.parametrize("which", ["amplicon", "unread"])
+async def test_a_chosen_sample_the_pool_cannot_profile_is_refused(postgres_pool, run, which):
+    with pytest.raises(BackendFailure, match=str(run[which])):
+        await _resolve_profile_samples(
+            postgres_pool,
+            sequenced_pool_idx=run["pool_idx"],
+            action_context={"prep_sample_idxs": [run["metagenomic"][0], run[which]]},
+        )
 
 
 async def test_finalize_closes_the_gate_and_mints_identifiers(postgres_pool, run, tmp_path):
