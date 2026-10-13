@@ -1,7 +1,7 @@
 <script lang="ts">
   // Profile a group's reads with sylph: pick a database (a sylph file registered on
   // an active sequence reference, which a reference may carry several of) and
-  // submit one ticket per pool the group's samples sit on. Each database is its own
+  // submit one ticket per pool the chosen samples sit on, limited to them. Each database is its own
   // run, so its own branch of the lineage once submitted. sylph's own default
   // minimum ANI applies; the job takes `min_ani` already, for when the form offers
   // it again.
@@ -9,7 +9,7 @@
   import type { WorkflowFormProps } from '$lib/nodeWorkflows';
   import Select from './Select.svelte';
 
-  let { samples, onSubmitted }: WorkflowFormProps = $props();
+  let { samples, chosen, onSubmitted }: WorkflowFormProps = $props();
 
   const ACTION = { id: 'taxonomic-profile', version: '1.0.0', indexType: 'sylph' };
 
@@ -23,14 +23,25 @@
   let submitting = $state(false);
   let result = $state<{ ok: boolean; text: string } | null>(null);
 
-  // The pools the group's samples sit on: one ticket each.
+  // The pools the chosen samples sit on, each with its chosen samples: one ticket
+  // each.
   const pools = $derived.by(() => {
-    const seen = new Map<number, number>();
-    for (const s of samples)
-      if (s.sequenced_pool_idx != null && s.sequencing_run_idx != null)
-        seen.set(s.sequenced_pool_idx, s.sequencing_run_idx);
-    return [...seen].map(([pool, run]) => ({ pool, run }));
+    const picked = new Set(chosen);
+    const seen = new Map<number, { pool: number; run: number; samples: number[] }>();
+    for (const s of samples) {
+      if (!picked.has(s.prep_sample_idx)) continue;
+      if (s.sequenced_pool_idx == null || s.sequencing_run_idx == null) continue;
+      const p = seen.get(s.sequenced_pool_idx) ?? {
+        pool: s.sequenced_pool_idx,
+        run: s.sequencing_run_idx,
+        samples: []
+      };
+      p.samples.push(s.prep_sample_idx);
+      seen.set(s.sequenced_pool_idx, p);
+    }
+    return [...seen.values()];
   });
+  const sampleCount = $derived(pools.reduce((n, p) => n + p.samples.length, 0));
 
   // The sylph files on active, non-host sequence references.
   $effect(() => {
@@ -67,12 +78,12 @@
     result = null;
     const done: string[] = [];
     const failed: string[] = [];
-    for (const { pool, run } of pools) {
+    for (const { pool, run, samples: picked } of pools) {
       const r = await api.submitWorkTicket({
         action_id: ACTION.id,
         action_version: ACTION.version,
         scope_target: { kind: 'sequenced_pool', sequenced_pool_idx: pool, sequencing_run_idx: run },
-        action_context: { sylph_index_idx: indexIdx }
+        action_context: { sylph_index_idx: indexIdx, prep_sample_idxs: picked }
       });
       if (r.ok) done.push(`#${r.data.work_ticket_idx}`);
       else failed.push(`pool ${pool}: ${r.detail}`);
@@ -108,7 +119,10 @@
   disabled={!canSubmit}
   onclick={submit}
 >
-  {submitting ? 'Submitting…' : `Profile ${pools.length} pool${pools.length === 1 ? '' : 's'}`}
+  {submitting
+    ? 'Submitting…'
+    : `Profile ${sampleCount} sample${sampleCount === 1 ? '' : 's'}` +
+      (pools.length > 1 ? ` (${pools.length} pools)` : '')}
 </button>
 {#if result}
   <p class="w-full text-xs {result.ok ? 'text-teal-700' : 'text-amber-800'}">{result.text}</p>

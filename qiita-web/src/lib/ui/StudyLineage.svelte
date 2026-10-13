@@ -40,6 +40,80 @@
   // The open "Run workflow" launcher per group: the node it runs from, and the
   // workflow picked for it.
   let launch = $state<Record<string, { from: string; workflow: string } | null>>({});
+  // The prep_samples ticked in the launched-from node's table, per group.
+  let chosen = $state<Record<string, number[]>>({});
+
+  /** The open launcher's node and workflow in `g`, when one is open. */
+  function launched(g: LineageGroup) {
+    const ln = launch[g.prep_protocol];
+    const node = ln ? g.nodes.find((n) => n.id === ln.from) : undefined;
+    if (!ln || !node) return null;
+    const choices = workflowsFor(node, g);
+    return { node, choices, workflow: choices.find((w) => w.id === ln.workflow) ?? null };
+  }
+
+  function openLauncher(g: LineageGroup, node: LineageNode) {
+    const ws = workflowsFor(node, g);
+    const wf = ws.find((w) => w.form) ?? ws[0];
+    launch = { ...launch, [g.prep_protocol]: { from: node.id, workflow: wf.id } };
+    // The launch works on the node's table, ticked for every sample it can take.
+    selected = { ...selected, [g.prep_protocol]: node.id };
+    chosen = {
+      ...chosen,
+      [g.prep_protocol]: g.samples.filter((s) => wf.takes(s, node)).map((s) => s.prep_sample_idx)
+    };
+  }
+
+  function toggleChosen(g: LineageGroup, idxs: number[], on: boolean) {
+    const cur = new Set(chosen[g.prep_protocol] ?? []);
+    for (const i of idxs) on ? cur.add(i) : cur.delete(i);
+    chosen = { ...chosen, [g.prep_protocol]: [...cur] };
+  }
+
+  // The actions that land a pool's reads; a sample whose pool's one failed shows
+  // `failed` at Reads, and re-running that ticket re-fetches what is missing.
+  const INGEST_ACTIONS = ['bcl-convert', 'golay-demux', 'download-ena-study'];
+  let retryFor = $state<Record<string, { busy: boolean; text: string; ok: boolean } | null>>({});
+
+  async function retryFailedReads(g: LineageGroup, node: LineageNode) {
+    const key = g.prep_protocol;
+    const pools = [
+      ...new Set(
+        g.samples
+          .filter((s) => s.cells[node.id]?.state === 'failed' && s.sequenced_pool_idx != null)
+          .map((s) => s.sequenced_pool_idx!)
+      )
+    ];
+    retryFor = { ...retryFor, [key]: { busy: true, text: '', ok: true } };
+    const done: string[] = [];
+    const failed: string[] = [];
+    for (const pool of pools) {
+      const list = await api.tickets({ all: true, state: 'failed', sequenced_pool_idx: pool, limit: 50 });
+      if (!list.ok) {
+        failed.push(`pool ${pool}: ${list.detail}`);
+        continue;
+      }
+      const ticket = list.data.tickets
+        .filter((t) => INGEST_ACTIONS.includes(t.action_id))
+        .sort((a, b) => b.work_ticket_idx - a.work_ticket_idx)[0];
+      if (!ticket) {
+        failed.push(`pool ${pool}: no failed ingest ticket`);
+        continue;
+      }
+      const r = await api.runWorkTicket(ticket.work_ticket_idx);
+      if (r.ok) done.push(`#${ticket.work_ticket_idx}`);
+      else failed.push(`#${ticket.work_ticket_idx}: ${r.detail}`);
+    }
+    retryFor = {
+      ...retryFor,
+      [key]: {
+        busy: false,
+        ok: failed.length === 0,
+        text: [done.length ? `restarted ${done.join(', ')}` : '', ...failed].filter(Boolean).join('; ')
+      }
+    };
+    if (done.length) load(studyIdx);
+  }
   let loadedFor = -1;
 
   $effect(() => {
@@ -419,6 +493,7 @@
     return g.samples
       .filter((s) => n.kind !== 'product' || s.cells[n.id])
       .map((s) => ({
+        __idx: s.prep_sample_idx,
         sample: s.label,
         ...Object.fromEntries(chain.map((v) => [`v:${v.id}`, s.cells[v.id]?.value ?? '—'])),
         __state: s.cells[n.id]?.state ?? 'not_started'
@@ -562,15 +637,10 @@
                   : 'border-gray-300 bg-white/60 text-gray-500 hover:border-teal-400 hover:text-teal-700'}"
                 style="left:{x(l.c)}px;top:{y(l.r)}px;width:{NODE_W}px;height:{NODE_H}px"
                 aria-expanded={open}
-                onclick={() => {
-                  const ws = workflowsFor(l.from.node, g);
-                  launch = {
-                    ...launch,
-                    [g.prep_protocol]: open
-                      ? null
-                      : { from: l.from.node.id, workflow: (ws.find((w) => w.form) ?? ws[0]).id }
-                  };
-                }}
+                onclick={() =>
+                  open
+                    ? (launch = { ...launch, [g.prep_protocol]: null })
+                    : openLauncher(g, l.from.node)}
               >
                 <svg viewBox="0 0 20 20" fill="currentColor" class="size-4" aria-hidden="true">
                   <path d="M6.3 2.84A1.5 1.5 0 0 0 4 4.11v11.78a1.5 1.5 0 0 0 2.3 1.27l9.34-5.89a1.5 1.5 0 0 0 0-2.54L6.3 2.84Z" />
@@ -589,11 +659,9 @@
           </div>
         </div>
 
-        {#if launch[g.prep_protocol]}
+        {#if launched(g)}
           {@const ln = launch[g.prep_protocol]!}
-          {@const fromNode = g.nodes.find((n) => n.id === ln.from)}
-          {@const choices = fromNode ? workflowsFor(fromNode, g) : []}
-          {@const wf = choices.find((w) => w.id === ln.workflow)}
+          {@const { node: fromNode, choices, workflow: wf } = launched(g)!}
           <div class="flex flex-wrap items-end gap-3 border-t border-gray-200 bg-gray-50 px-4 py-3 sm:px-6">
             <p class="flex w-full items-center justify-between text-xs font-medium text-gray-500">
               Run a workflow on {fromNode?.label ?? 'this node'}
@@ -620,7 +688,11 @@
             </label>
             {#if wf?.form}
               {#key wf.id}
-                <wf.form samples={g.samples} onSubmitted={() => load(studyIdx)} />
+                <wf.form
+                  samples={g.samples}
+                  chosen={chosen[g.prep_protocol] ?? []}
+                  onSubmitted={() => load(studyIdx)}
+                />
               {/key}
             {/if}
           </div>
@@ -751,6 +823,31 @@
                 }
               />
             {:else}
+            {@const picking = launched(g)?.node.id === selNode.id ? launched(g)!.workflow : null}
+            {@const failedReads =
+              selNode.kind === 'reads' && !picking
+                ? g.samples.filter((s) => s.cells[selNode.id]?.state === 'failed').length
+                : 0}
+            {@const retry = retryFor[g.prep_protocol]}
+            {#if failedReads || retry?.text}
+              <div class="flex flex-wrap items-center gap-3 border-t border-gray-200 bg-red-50/40 px-4 py-2 text-sm sm:px-6">
+                {#if failedReads}
+                  <span class="text-gray-700"
+                    >{failedReads} sample{failedReads === 1 ? '' : 's'} failed to produce reads.</span
+                  >
+                  <button
+                    type="button"
+                    class="rounded-md bg-white px-2.5 py-1 text-xs font-medium text-gray-700 shadow-sm ring-1 ring-gray-300 ring-inset hover:bg-gray-50 disabled:opacity-50"
+                    disabled={retry?.busy}
+                    onclick={() => retryFailedReads(g, selNode)}
+                    >{retry?.busy ? 'Retrying…' : 'Retry failed'}</button
+                  >
+                {/if}
+                {#if retry?.text}
+                  <span class="text-xs {retry.ok ? 'text-teal-700' : 'text-amber-800'}">{retry.text}</span>
+                {/if}
+              </div>
+            {/if}
             <DataTable
               columns={detailColumns(g, selNode)}
               rows={detailRows(g, selNode)}
@@ -761,9 +858,46 @@
                 (v) => untrack(() => (visible = { ...visible, [g.prep_protocol]: v }))
               }
             >
+              {#snippet actionsHeader()}
+                {#if picking}
+                  {@const pick = new Set(chosen[g.prep_protocol] ?? [])}
+                  {@const takeable = (visible[g.prep_protocol] ?? [])
+                    .map((r) => g.samples.find((s) => s.prep_sample_idx === r.__idx))
+                    .filter((s) => s && picking.takes(s, selNode))
+                    .map((s) => s!.prep_sample_idx)}
+                  <label class="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      class="rounded border-gray-300 text-teal-600"
+                      checked={takeable.length > 0 && takeable.every((i) => pick.has(i))}
+                      indeterminate={takeable.some((i) => pick.has(i)) && !takeable.every((i) => pick.has(i))}
+                      disabled={takeable.length === 0}
+                      onchange={(e) => toggleChosen(g, takeable, e.currentTarget.checked)}
+                    />
+                    Run
+                  </label>
+                {:else}
+                  Status
+                {/if}
+              {/snippet}
               {#snippet actions(r)}
                 {@const st = String(r.__state) as LineageState}
-                <span class="inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium capitalize ring-1 ring-inset {STATE_CHIP[st] ?? STATE_CHIP.not_started}">{stateLabel(st)}</span>
+                {#if picking}
+                  {@const sample = g.samples.find((s) => s.prep_sample_idx === r.__idx)}
+                  {@const can = !!sample && picking.takes(sample, selNode)}
+                  <label class="flex items-center gap-2" title={can ? '' : `Can't run: ${stateLabel(st)}`}>
+                    <input
+                      type="checkbox"
+                      class="rounded border-gray-300 text-teal-600 disabled:opacity-40"
+                      disabled={!can}
+                      checked={can && (chosen[g.prep_protocol] ?? []).includes(Number(r.__idx))}
+                      onchange={(e) => toggleChosen(g, [Number(r.__idx)], e.currentTarget.checked)}
+                    />
+                    {#if !can}<span class="text-xs text-gray-400 capitalize">{stateLabel(st)}</span>{/if}
+                  </label>
+                {:else}
+                  <span class="inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium capitalize ring-1 ring-inset {STATE_CHIP[st] ?? STATE_CHIP.not_started}">{stateLabel(st)}</span>
+                {/if}
               {/snippet}
             </DataTable>
             {/if}

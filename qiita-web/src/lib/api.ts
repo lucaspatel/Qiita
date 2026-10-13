@@ -672,6 +672,9 @@ export const api = {
     const qs = p.toString();
     return get<WorkTicketStepLogs>(`/work-ticket/${idx}/step/${step}/logs${qs ? `?${qs}` : ''}`);
   },
+  /** Restart a FAILED ticket in place (202); 409 when it isn't redrivable. */
+  runWorkTicket: (idx: number) =>
+    send<{ work_ticket_idx: number; state: WorkTicketState }>('POST', `/work-ticket/${idx}/run`),
   /** Submit a single workflow → mints a work ticket (202) or errors (4xx) immediately. */
   submitWorkTicket: (body: WorkTicketCreateRequest) =>
     send<{ work_ticket_idx: number; state: WorkTicketState }>('POST', '/work-ticket', body),
