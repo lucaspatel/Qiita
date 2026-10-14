@@ -420,6 +420,12 @@
   /** Tailwind UI: forms / select menus / simple native (the chevron is `chevron`). */
   const select =
     'col-start-1 row-start-1 w-full appearance-none rounded-md bg-white py-1.5 pr-8 pl-3 text-base text-gray-900 outline-1 -outline-offset-1 outline-gray-300 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-teal-600 sm:text-sm/6';
+  /** Tailwind UI: forms / input groups / simple, the same size as `select`. */
+  const field =
+    'block w-full rounded-md bg-white px-3 py-1.5 text-base text-gray-900 outline-1 -outline-offset-1 outline-gray-300 focus:outline-2 focus:-outline-offset-2 focus:outline-teal-600 sm:text-sm/6';
+  /** The sheet writes the plate map date as the scanner does (YYYYMMDD); a date
+   *  input reads and writes YYYY-MM-DD. */
+  const isoDate = (d: string) => d.replace(/^(\d{4})(\d{2})(\d{2})$/, '$1-$2-$3');
   const input = 'block w-full rounded-md bg-white px-2 py-1 text-sm text-gray-900 outline-1 -outline-offset-1 focus:outline-2 focus:-outline-offset-2 focus:outline-teal-600';
 </script>
 
@@ -833,18 +839,30 @@
     </div>
 
     <h3 class="mt-8 text-sm font-semibold text-gray-900">Run</h3>
-    <div class="mt-2 grid max-w-2xl grid-cols-3 gap-3">
-      <label class="text-xs text-gray-600">Run date<input class="{input} mt-0.5 outline-gray-300" bind:value={run.run_date} /></label>
-      <label class="text-xs text-gray-600">Instrument
-        <span class="mt-0.5 grid grid-cols-1">
-          <select class={select} bind:value={run.instrument_model}>
+    <div class="mt-2 grid max-w-3xl grid-cols-1 gap-4 sm:grid-cols-3">
+      <div>
+        <label for="run-date" class="block text-sm/6 font-medium text-gray-900">Run date</label>
+        <input id="run-date" type="date" class="{field} mt-2" bind:value={run.run_date} />
+      </div>
+      <div>
+        <label for="instrument" class="block text-sm/6 font-medium text-gray-900">Instrument</label>
+        <div class="mt-2 grid grid-cols-1">
+          <select id="instrument" class={select} bind:value={run.instrument_model}>
             <option value="" disabled>Choose…</option>
             {#each instruments as m}<option value={m}>{m}</option>{/each}
           </select>
           {@render chevron()}
-        </span>
-      </label>
-      <label class="text-xs text-gray-600">Plate map date<input class="{input} mt-0.5 outline-gray-300" bind:value={run.platemap_generation_date} /></label>
+        </div>
+      </div>
+      <div>
+        <label for="platemap-date" class="block text-sm/6 font-medium text-gray-900">Plate map date</label>
+        <input
+          id="platemap-date"
+          type="date"
+          class="{field} mt-2"
+          bind:value={() => isoDate(run.platemap_generation_date), (v) => (run.platemap_generation_date = v.replaceAll('-', ''))}
+        />
+      </div>
     </div>
 
     {#if errors.length || studyErrors.length || warnings.length}
