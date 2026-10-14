@@ -5,7 +5,7 @@
   // racks is enough to know which samples and studies are in the box, and anything
   // Qiita can't place is fixed before the plates are laid out. One task per screen;
   // each screen shows only what that task needs. Local, mocked data
-  // (lib/libraryPrep/mock.ts); each step notes what runs where.
+  // (lib/libraryPrep/mock.ts).
   import { untrack } from 'svelte';
   import { api, type PrepProtocol } from '$lib/api';
   import PlateMap, { type Well } from '$lib/ui/PlateMap.svelte';
@@ -26,31 +26,6 @@
   } from '$lib/libraryPrep/mock';
 
   const STEPS = ['Protocol', 'Scan', 'Fix', 'Plates', 'Details', 'Register', 'Sequence'];
-  const WHERE: { client: string; server: string }[] = [
-    { client: 'Show the choices.', server: 'GET /prep-protocol; which protocols this flow supports.' },
-    {
-      client: 'Read the VisionMate files and normalise tube codes.',
-      server: 'POST /biosample/resolve-roster with every tube: sample, QB and study for each, every problem at once.'
-    },
-    {
-      client: 'Group the problems and offer the fixes.',
-      server: 'Re-check after metadata is added; keep the decisions (blanks, exclusions, chosen study) on the prep draft.'
-    },
-    {
-      client: 'Draw the quadrants, take clicks on wells.',
-      server: 'The EMP primer plates and the compression rule, so barcodes have one implementation (golay-demux checks them later).'
-    },
-    { client: 'Validate as you type, for feedback.', server: 'The same checks on save; they gate the pre-flight.' },
-    {
-      client: 'Show what will be written; offer the legacy pre-prep file.',
-      server: 'Register blanks as samples, write the pre-flight, link each sample to its study.'
-    },
-    {
-      client: 'Pick the run; show progress.',
-      server: 'Inspect the run folder, create run + pool from the stored pre-flight, submit golay-demux → amplicon.'
-    }
-  ];
-
   let step = $state(0);
   let reached = $state(0);
   const go = (i: number) => {
@@ -312,11 +287,11 @@
 </script>
 
 <div class="mb-6">
-  <h1 class="text-2xl/7 font-bold text-gray-900">Library prep</h1>
+  <div class="flex items-center justify-between gap-3">
+    <h1 class="text-2xl/7 font-bold text-gray-900">Library prep</h1>
+    <span class="inline-flex rounded-md bg-amber-50 px-2 py-1 text-xs font-medium text-amber-800 ring-1 ring-amber-600/20 ring-inset">Mockup</span>
+  </div>
   <p class="mt-1 text-sm text-gray-500">From a box of tubes to a running amplicon workflow.</p>
-  <p class="mt-2 inline-flex rounded-md bg-amber-50 px-2 py-1 text-xs font-medium text-amber-800 ring-1 ring-amber-600/20 ring-inset">
-    Mockup — local made-up data, nothing is sent to Qiita
-  </p>
 </div>
 
 <!-- Steps (Tailwind UI: navigation / progress bars / panels) -->
@@ -358,23 +333,23 @@
 
 <div class="rounded-lg bg-white px-4 py-5 shadow-sm ring-1 ring-gray-900/5 sm:p-6">
   {#if step === 0}
-    <!-- Tailwind UI: forms / radio groups / cards -->
-    <fieldset>
-      <legend class="text-sm/6 font-semibold text-gray-900">What is being prepared?</legend>
-      <div class="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+    <!-- Tailwind UI: forms / select menus / simple native -->
+    <label for="protocol" class="block text-sm/6 font-semibold text-gray-900">Prep protocol</label>
+    <div class="mt-2 grid max-w-md grid-cols-1">
+      <select
+        id="protocol"
+        bind:value={protocol}
+        class="col-start-1 row-start-1 w-full appearance-none rounded-md bg-white py-1.5 pr-8 pl-3 text-base text-gray-900 outline-1 -outline-offset-1 outline-gray-300 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-teal-600 sm:text-sm/6"
+      >
+        <option value={null} disabled>Choose a prep protocol…</option>
         {#each protocols as p (p.name)}
-          {@const enabled = p.name === SUPPORTED_PROTOCOL}
-          <label class="group relative flex rounded-lg border border-gray-300 bg-white p-4 has-checked:outline-2 has-checked:-outline-offset-2 has-checked:outline-teal-600 has-disabled:bg-gray-50 has-disabled:opacity-50">
-            <input type="radio" name="protocol" value={p.name} disabled={!enabled} bind:group={protocol} class="absolute inset-0 appearance-none focus:outline-none" />
-            <span class="flex-1">
-              <span class="block text-sm font-medium text-gray-900">{pretty(p.name)}</span>
-              <span class="mt-1 block text-xs text-gray-500">{enabled ? 'Rapid 16S, Golay-barcoded' : 'not in this flow yet'}</span>
-            </span>
-            <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" class="invisible size-5 text-teal-600 group-has-checked:visible"><path d="M10 18a8 8 0 1 0 0-16 8 8 0 0 0 0 16Zm3.857-9.809a.75.75 0 0 0-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 1 0-1.06 1.061l2.5 2.5a.75.75 0 0 0 1.137-.089l4-5.5Z" clip-rule="evenodd" fill-rule="evenodd" /></svg>
-          </label>
+          <option value={p.name} disabled={p.name !== SUPPORTED_PROTOCOL}>
+            {pretty(p.name)}{p.name !== SUPPORTED_PROTOCOL ? ' — not in this flow yet' : ''}
+          </option>
         {/each}
-      </div>
-    </fieldset>
+      </select>
+      <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" class="pointer-events-none col-start-1 row-start-1 mr-2 size-5 self-center justify-self-end text-gray-500 sm:size-4"><path d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" fill-rule="evenodd" /></svg>
+    </div>
     {#if protocol}
       <fieldset class="mt-8">
         <legend class="text-sm/6 font-semibold text-gray-900">Target</legend>
@@ -656,9 +631,3 @@
     {/if}
   </div>
 </div>
-
-<details class="mt-4 text-xs text-gray-500">
-  <summary class="cursor-pointer">Where this step runs</summary>
-  <p class="mt-2"><span class="font-medium text-gray-700">Browser:</span> {WHERE[step].client}</p>
-  <p class="mt-1"><span class="font-medium text-gray-700">Server:</span> {WHERE[step].server}</p>
-</details>
