@@ -4,8 +4,8 @@ A row carrying a matrix tube resolves by the tube: tubes are unique across
 Qiita (`qiita.biosample.matrix_tube_id` is UNIQUE), so the tube alone names the
 biosample, and its study comes from the biosample's active study links. A
 project accession on such a row is a cross-check, not the key. A row without a
-tube resolves by biosample and project accession, as the accession lookup
-routes always have.
+tube resolves by biosample and project accession, through the same repository
+reads the accession lookup routes use.
 
 Every problem across the roster is collected before anything is refused, so
 one response names them all. `classify_roster` holds the rules and is pure;
@@ -18,7 +18,6 @@ from dataclasses import dataclass
 import asyncpg
 from qiita_common.models import (
     RosterProblem,
-    RosterProblemCode,
     RosterResolvedRow,
     RosterResolveRow,
     normalize_matrix_tube_id,
@@ -57,6 +56,84 @@ def _normalized_tube(row: RosterResolveRow) -> str | None:
         return None
 
 
+def _resolve_biosample(
+    row: RosterResolveRow, facts: RosterFacts, tube_counts: Counter[str], problems: list[str]
+) -> int | None:
+    """The row's biosample_idx, or None after appending why to `problems`."""
+    if row.matrix_tube_id is None:
+        if row.biosample_accession is None:
+            problems.append("row carries neither a matrix tube nor a biosample accession")
+            return None
+        biosample_idx = facts.by_biosample_accession.get(row.biosample_accession)
+        if biosample_idx is None:
+            problems.append(f"no biosample has accession {row.biosample_accession!r}")
+        return biosample_idx
+
+    try:
+        tube = normalize_matrix_tube_id(row.matrix_tube_id)
+    except ValueError as exc:
+        problems.append(str(exc))
+        return None
+    if tube_counts[tube] > 1:
+        # A technical replicate is a second prep_sample of one biosample, and so
+        # repeats its tube. A tube-keyed roster does not support replicates yet.
+        problems.append(
+            f"matrix tube {tube} appears on {tube_counts[tube]} rows of this roster;"
+            " technical replicates are not supported in a tube-keyed roster"
+        )
+        return None
+    if tube not in facts.by_tube:
+        problems.append(f"no biosample has matrix tube {tube}; register it before submitting")
+        return None
+    biosample_idx, registered = facts.by_tube[tube]
+    if row.biosample_accession is not None and row.biosample_accession != registered:
+        held = "no accession" if registered is None else f"accession {registered!r}"
+        problems.append(
+            f"matrix tube {tube} belongs to a biosample with {held},"
+            f" not {row.biosample_accession!r}"
+        )
+        return None
+    return biosample_idx
+
+
+def _resolve_primary_study(
+    row: RosterResolveRow, biosample_idx: int | None, facts: RosterFacts, problems: list[str]
+) -> int | None:
+    """The row's primary study_idx, or None after appending why to `problems`.
+
+    A named project accession must exist, and on a tube row must name one of the
+    biosample's studies. With none named, the biosample's one active study is used.
+    """
+    biosample = (
+        f"the biosample with matrix tube {_normalized_tube(row)}"
+        if row.matrix_tube_id is not None
+        else f"biosample {row.biosample_accession}"
+    )
+    links = facts.study_links.get(biosample_idx, []) if biosample_idx is not None else []
+    accession = row.primary_project_accession
+    if accession is not None:
+        study_idx = facts.by_study_accession.get(accession)
+        if study_idx is None:
+            problems.append(f"no study has accession {accession!r}")
+            return None
+        if row.matrix_tube_id is not None and biosample_idx is not None and study_idx not in links:
+            problems.append(f"{biosample} is not in study {accession}")
+            return None
+        return study_idx
+    if biosample_idx is None:
+        return None
+    if len(links) == 1:
+        return links[0]
+    if not links:
+        problems.append(f"{biosample} belongs to no active study")
+    else:
+        problems.append(
+            f"{biosample} belongs to {len(links)} studies; name the project's bioproject"
+            " accession to choose one"
+        )
+    return None
+
+
 def classify_roster(
     rows: list[RosterResolveRow], facts: RosterFacts
 ) -> tuple[list[RosterResolvedRow], list[RosterProblem]]:
@@ -69,116 +146,25 @@ def classify_roster(
     tube_counts = Counter(t for t in map(_normalized_tube, rows) if t is not None)
     resolved: list[RosterResolvedRow] = []
     problems: list[RosterProblem] = []
-
     for row in rows:
-        row_problems: list[RosterProblem] = []
-
-        def problem(code: RosterProblemCode, message: str, value: str | None = None) -> None:
-            row_problems.append(
-                RosterProblem(item_id=row.item_id, code=code, value=value, message=message)
-            )
-
-        biosample_idx: int | None = None
-        by_tube = row.matrix_tube_id is not None
-        if by_tube:
-            tube = _normalized_tube(row)
-            if tube is None:
-                problem(
-                    RosterProblemCode.MALFORMED_TUBE,
-                    f"{row.matrix_tube_id!r} is not a matrix tube id (1 to 10 digits)",
-                    row.matrix_tube_id,
-                )
-            elif tube_counts[tube] > 1:
-                problem(
-                    RosterProblemCode.DUPLICATE_TUBE,
-                    f"matrix tube {tube} appears on {tube_counts[tube]} rows of this roster",
-                    tube,
-                )
-            elif tube not in facts.by_tube:
-                problem(
-                    RosterProblemCode.UNKNOWN_TUBE,
-                    f"no biosample has matrix tube {tube}; register it before submitting",
-                    tube,
-                )
-            else:
-                biosample_idx, registered_accession = facts.by_tube[tube]
-                if (
-                    row.biosample_accession is not None
-                    and row.biosample_accession != registered_accession
-                ):
-                    problem(
-                        RosterProblemCode.IDENTITY_CONFLICT,
-                        f"matrix tube {tube} is biosample {biosample_idx}, whose accession is"
-                        f" {registered_accession!r}, not {row.biosample_accession!r}",
-                        row.biosample_accession,
-                    )
-                    biosample_idx = None
-        elif row.biosample_accession is not None:
-            biosample_idx = facts.by_biosample_accession.get(row.biosample_accession)
-            if biosample_idx is None:
-                problem(
-                    RosterProblemCode.UNKNOWN_BIOSAMPLE_ACCESSION,
-                    f"no biosample has accession {row.biosample_accession!r}",
-                    row.biosample_accession,
-                )
-        else:
-            problem(
-                RosterProblemCode.NO_IDENTITY,
-                "row carries neither a matrix tube nor a biosample accession",
-            )
-
-        primary_study_idx: int | None = None
-        if row.primary_project_accession is not None:
-            primary_study_idx = facts.by_study_accession.get(row.primary_project_accession)
-            if primary_study_idx is None:
-                problem(
-                    RosterProblemCode.UNKNOWN_STUDY_ACCESSION,
-                    f"no study has accession {row.primary_project_accession!r}",
-                    row.primary_project_accession,
-                )
-            elif (
-                by_tube
-                and biosample_idx is not None
-                and primary_study_idx not in facts.study_links.get(biosample_idx, [])
-            ):
-                problem(
-                    RosterProblemCode.STUDY_MISMATCH,
-                    f"biosample {biosample_idx} is not in study {primary_study_idx}"
-                    f" ({row.primary_project_accession})",
-                    row.primary_project_accession,
-                )
-                primary_study_idx = None
-        elif biosample_idx is not None:
-            links = facts.study_links.get(biosample_idx, [])
-            if not links:
-                problem(
-                    RosterProblemCode.NO_STUDY,
-                    f"biosample {biosample_idx} belongs to no active study",
-                )
-            elif len(links) > 1:
-                problem(
-                    RosterProblemCode.AMBIGUOUS_STUDY,
-                    f"biosample {biosample_idx} belongs to studies {links}; name the"
-                    " project's bioproject accession to choose one",
-                )
-            else:
-                primary_study_idx = links[0]
-
-        secondary_study_idxs: list[int] = []
+        row_problems: list[str] = []
+        biosample_idx = _resolve_biosample(row, facts, tube_counts, row_problems)
+        primary_study_idx = _resolve_primary_study(row, biosample_idx, facts, row_problems)
+        # Secondary studies are not checked against the biosample's links, on a
+        # tube row as on an accession row: they name the other projects sharing a
+        # control's plate, which the control need not belong to.
+        secondary_study_idxs = []
         for accession in row.secondary_project_accessions:
             study_idx = facts.by_study_accession.get(accession)
             if study_idx is None:
-                problem(
-                    RosterProblemCode.UNKNOWN_STUDY_ACCESSION,
-                    f"no study has accession {accession!r}",
-                    accession,
-                )
+                row_problems.append(f"no study has accession {accession!r}")
             else:
                 secondary_study_idxs.append(study_idx)
 
         if row_problems:
-            problems.extend(row_problems)
-        elif biosample_idx is not None and primary_study_idx is not None:
+            problems.extend(RosterProblem(item_id=row.item_id, message=m) for m in row_problems)
+        else:
+            assert biosample_idx is not None and primary_study_idx is not None
             resolved.append(
                 RosterResolvedRow(
                     item_id=row.item_id,

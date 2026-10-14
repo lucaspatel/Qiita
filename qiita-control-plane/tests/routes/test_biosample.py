@@ -3021,9 +3021,8 @@ async def test_lookup_by_matrix_tube_id_rejects_bad_format_422(ctx):
 # ---------------------------------------------------------------------------
 # POST /biosample/resolve-roster — tube- or accession-keyed roster resolution
 # ---------------------------------------------------------------------------
-# The rules themselves are unit-tested in tests/test_roster_resolution.py; these
-# cover the route: the facts it gathers from Postgres, the 200 shape, the 422
-# detail that names every problem, and the retired-row exclusions.
+# The route: the facts it gathers from Postgres, the 200 shape, the 422 detail
+# that names every problem, the retired-row exclusions, and its scopes.
 
 
 async def _seed_tube_in_study(ctx, *, study_idx: int, tube: str) -> int:
@@ -3086,11 +3085,11 @@ async def test_resolve_roster_422_names_every_problem(ctx):
     assert resp.status_code == 422, resp.text
     detail = resp.json()["detail"]
     assert detail["message"] == "4 of 5 roster rows did not resolve"
-    assert [(p["item_id"], p["code"]) for p in detail["problems"]] == [
-        ("nolink", "no_study"),
-        ("gone", "unknown_tube"),
-        ("plasma", "malformed_tube"),
-        ("blank", "no_identity"),
+    assert [(p["item_id"], p["message"]) for p in detail["problems"]] == [
+        ("nolink", f"the biosample with matrix tube {unlinked} belongs to no active study"),
+        ("gone", f"no biosample has matrix tube {unknown}; register it before submitting"),
+        ("plasma", "'800805.001.V1.Plasma' is not a matrix tube id (1 to 10 digits)"),
+        ("blank", "row carries neither a matrix tube nor a biosample accession"),
     ]
 
 
@@ -3116,9 +3115,9 @@ async def test_resolve_roster_skips_retired_biosample_and_link(ctx):
         },
     )
     assert resp.status_code == 422, resp.text
-    assert [(p["item_id"], p["code"]) for p in resp.json()["detail"]["problems"]] == [
-        ("r", "unknown_tube"),
-        ("u", "no_study"),
+    assert [(p["item_id"], p["message"]) for p in resp.json()["detail"]["problems"]] == [
+        ("r", f"no biosample has matrix tube {retired_tube}; register it before submitting"),
+        ("u", f"the biosample with matrix tube {unlinked_tube} belongs to no active study"),
     ]
 
 
@@ -3153,6 +3152,20 @@ async def test_resolve_roster_by_accession(ctx):
     assert resp.status_code == 200, resp.text
     assert resp.json()["rows"][0]["biosample_idx"] == biosample_idx
     assert resp.json()["rows"][0]["primary_study_idx"] == study_idx
+
+
+@pytest.mark.parametrize(
+    "scopes",
+    [[Scope.BIOSAMPLE_READ], [Scope.STUDY_READ]],
+    ids=["no-study-read", "no-biosample-read"],
+)
+async def test_resolve_roster_needs_both_read_scopes(make_pat_client, scopes):
+    client = await make_pat_client(label="roster-scope", scopes=scopes)
+    resp = await client.post(
+        URL_BIOSAMPLE_RESOLVE_ROSTER,
+        json={"rows": [{"item_id": "1", "matrix_tube_id": "1"}]},
+    )
+    assert resp.status_code == 403, resp.text
 
 
 async def test_resolve_roster_anonymous_401(ctx):

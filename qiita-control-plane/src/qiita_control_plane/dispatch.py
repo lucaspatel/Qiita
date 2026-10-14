@@ -149,9 +149,9 @@ async def _run_and_log(app: FastAPI, work_ticket_idx: int, *, resume: bool = Fal
 async def _submit_follow_on(app: FastAPI, work_ticket_idx: int) -> None:
     """Submit the follow-on of a ticket that just COMPLETED (no-op otherwise).
 
-    `follow_on` records every refusal on the parent row itself; what reaches
-    here is a failure to reach the database at all, which the startup reconcile
-    re-drives — so log it and keep the dispatch task clean."""
+    `follow_on` records refusals on the parent row itself; anything else reaches
+    here having recorded nothing, and the startup reconcile retries it — so log
+    it and keep the dispatch task clean."""
     try:
         await submit_follow_on(app, work_ticket_idx)
     except Exception:

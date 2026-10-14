@@ -227,19 +227,50 @@ LIVE_STEP_PROGRESS_STATES: tuple[StepProgressState, ...] = tuple(
 )
 
 
-class WorkTicketFollowOn(BaseModel):
-    """A ticket the control plane submits once its parent COMPLETES.
+# The longest chain of follow-ons one submission may arm. A follow-on carries
+# the next link in its own `on_success`, so a chain of stages is expressed by
+# nesting; this bounds that nesting (and the JSONB it is stored as).
+MAX_FOLLOW_ON_CHAIN_DEPTH = 8
 
-    It runs on the parent's scope target, as the parent's originator, so it
-    names only the action and its context. The submit route gates it as if it
-    were submitted alongside the parent; the completion hook submits it through
-    the same gate again (see `qiita_control_plane.follow_on`)."""
+
+class WorkTicketFollowOn(BaseModel):
+    """A ticket the control plane submits once its parent COMPLETES, on the
+    parent's scope target, as the parent's originator — so it names only the
+    action and its context. A follow-on may carry its own `on_success`: the
+    control plane arms that next link when this one completes, so a chain of
+    stages runs in order (see `qiita_control_plane.follow_on` for the protocol).
+    Each ticket still has exactly one immediate follow-on; the chain is at most
+    `MAX_FOLLOW_ON_CHAIN_DEPTH` deep."""
 
     model_config = ConfigDict(extra="forbid")
 
     action_id: str = Field(min_length=1, max_length=MAX_NAME_LENGTH)
     action_version: str = Field(min_length=1, max_length=MAX_VERSION_LENGTH)
     action_context: dict[str, Any] = Field(default_factory=dict)
+    on_success: WorkTicketFollowOn | None = None
+
+    @model_validator(mode="after")
+    def _bound_chain_depth(self) -> WorkTicketFollowOn:
+        depth, node = 1, self.on_success
+        while node is not None:
+            depth += 1
+            if depth > MAX_FOLLOW_ON_CHAIN_DEPTH:
+                raise ValueError(
+                    f"a follow-on chain may be at most {MAX_FOLLOW_ON_CHAIN_DEPTH} deep"
+                )
+            node = node.on_success
+        return self
+
+    def as_request(self, scope_target: ScopeTarget) -> WorkTicketCreateRequest:
+        """The submission this follow-on makes on `scope_target`, carrying the
+        next link so the ticket it creates arms it in turn."""
+        return WorkTicketCreateRequest(
+            action_id=self.action_id,
+            action_version=self.action_version,
+            scope_target=scope_target,
+            action_context=self.action_context,
+            on_success=self.on_success,
+        )
 
 
 class WorkTicket(BaseModel):
@@ -361,8 +392,8 @@ class WorkTicketCreateRequest(BaseModel):
     scope_target: ScopeTarget
     action_context: dict[str, Any] = Field(default_factory=dict)
     resource_override: ResourceOverride | None = None
-    # Submitted on this ticket's scope target once it COMPLETES. Human callers
-    # only: the control plane re-loads the originator at completion time.
+    # Submitted on this ticket's scope target once it COMPLETES; human callers
+    # only (see `qiita_control_plane.follow_on`).
     on_success: WorkTicketFollowOn | None = None
     force: bool = Field(
         default=False,

@@ -36,14 +36,17 @@ from qiita_common.models.sample_field import (
 )
 
 # matrix_tube_id values are digit-only (per local convention) and may carry
-# leading zeros; the {10} quantifier fixes the length at exactly ten digits
-# and rejects the empty string.
+# leading zeros; the width fixes the length at exactly ten digits and rejects
+# the empty string.
 #
 # Deliberately duplicated with the column-level CHECK on
 # qiita.biosample.matrix_tube_id: the Pydantic side fails at the wire
 # boundary with a per-field 422; the DB side is the last line of defense.
 # Change one and you must change the other in the same PR.
-MATRIX_TUBE_ID_PATTERN = r"^[0-9]{10}$"  # same-pattern-ok: DB CHECK parity (see above)
+MATRIX_TUBE_ID_WIDTH = 10
+MATRIX_TUBE_ID_PATTERN = (
+    rf"^[0-9]{{{MATRIX_TUBE_ID_WIDTH}}}$"  # same-pattern-ok: DB CHECK parity (see above)
+)
 
 # The wire spellings of the idx fields the biosample field shapes re-declare
 # with an entity-qualified alias. Named so a caller writing or reading one of
@@ -281,9 +284,7 @@ TERMINOLOGY_TERM_VALUE_COLUMN = "value_terminology_term_idx"
 #   HOST_TAXON_ID — the organism the sample was taken FROM. Absent for an
 #                   environmental sample; a missing-reason for a control.
 #
-# Conflating them is the bug this arc exists to prevent, so they are named side
-# by side. Shared because the resolver reads host_taxon_id and the backfill reads
-# taxon_id to derive it — two consumers, one spelling.
+# Shared so that every reader of either field spells it the same way.
 BIOSAMPLE_FIELD_TAXON_ID = "taxon_id"
 BIOSAMPLE_FIELD_HOST_TAXON_ID = "host_taxon_id"
 
@@ -727,28 +728,31 @@ class StudyLookupByAccessionResponse(BaseModel):
     missing: list[str]
 
 
-_MATRIX_TUBE_ID_WIDTH = 10
-
-
 def normalize_matrix_tube_id(raw: str) -> str:
     """The stored form of a matrix tube id: digits only, left-padded to the
     width MATRIX_TUBE_ID_PATTERN fixes.
 
     Sheets that pass through a spreadsheet lose the leading zero, so a tube
     written with fewer digits is the same tube. RAISES ValueError for anything
-    that is not 1..10 digits once surrounding whitespace is stripped.
+    that is not 1 to MATRIX_TUBE_ID_WIDTH digits once surrounding whitespace is
+    stripped.
     """
     value = raw.strip()
-    if not value.isascii() or not value.isdigit() or len(value) > _MATRIX_TUBE_ID_WIDTH:
-        raise ValueError(f"{raw!r} is not a matrix tube id (1 to 10 digits)")
-    return value.zfill(_MATRIX_TUBE_ID_WIDTH)
+    if not value.isascii() or not value.isdigit() or len(value) > MATRIX_TUBE_ID_WIDTH:
+        raise ValueError(f"{raw!r} is not a matrix tube id (1 to {MATRIX_TUBE_ID_WIDTH} digits)")
+    return value.zfill(MATRIX_TUBE_ID_WIDTH)
+
+
+# A roster's tube arrives as free text so a malformed one is reported per row;
+# this only bounds what a row may carry, well above any real tube.
+MAX_ROSTER_TUBE_TEXT_LENGTH = 50
 
 
 class RosterResolveRow(BaseModel):
     """One pool row to resolve to a biosample and its studies.
 
-    A row with a `matrix_tube_id` resolves by the tube, and its studies come
-    from the biosample's study links (a project accession, when present, must
+    A row with a `matrix_tube_id` resolves by the tube, and its primary study
+    comes from the biosample's study links (a project accession, when present, must
     name one of them). A row without one resolves by `biosample_accession` and
     the project accessions. `matrix_tube_id` is free text on the wire so a
     malformed tube is reported as that row's problem with every other one.
@@ -757,7 +761,9 @@ class RosterResolveRow(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     item_id: NonBlankText
-    matrix_tube_id: Annotated[NonBlankText, Field(max_length=50)] | None = None
+    matrix_tube_id: (
+        Annotated[NonBlankText, Field(max_length=MAX_ROSTER_TUBE_TEXT_LENGTH)] | None
+    ) = None
     biosample_accession: AccessionText | None = None
     primary_project_accession: AccessionText | None = None
     secondary_project_accessions: list[AccessionText] = Field(default_factory=list)
@@ -800,30 +806,12 @@ class RosterResolveResponse(BaseModel):
     rows: list[RosterResolvedRow]
 
 
-class RosterProblemCode(StrEnum):
-    """Why one roster row did not resolve."""
-
-    MALFORMED_TUBE = "malformed_tube"
-    DUPLICATE_TUBE = "duplicate_tube"
-    UNKNOWN_TUBE = "unknown_tube"
-    NO_IDENTITY = "no_identity"
-    UNKNOWN_BIOSAMPLE_ACCESSION = "unknown_biosample_accession"
-    IDENTITY_CONFLICT = "identity_conflict"
-    UNKNOWN_STUDY_ACCESSION = "unknown_study_accession"
-    STUDY_MISMATCH = "study_mismatch"
-    NO_STUDY = "no_study"
-    AMBIGUOUS_STUDY = "ambiguous_study"
-
-
 class RosterProblem(BaseModel):
-    """One row's problem. `value` is the offending input (the tube or
-    accession), when there is one."""
+    """Why one roster row did not resolve, as a message for the submitter."""
 
     model_config = ConfigDict(extra="forbid")
 
     item_id: str
-    code: RosterProblemCode
-    value: str | None = None
     message: str
 
 

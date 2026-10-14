@@ -104,6 +104,8 @@ async def lifespan(app: FastAPI):
     # cleanly from the filesystem) rather than blanket-failed, so a deploy
     # that stops/starts the CP undrained doesn't nuke running work.
     await reconcile_inflight_tickets(app)
+    # After the re-attach: see reconcile_follow_ons.
+    await reconcile_follow_ons(app)
 
     # ena_import_batch's OWN tracked task set (see ena_import.batch's module
     # docstring for why it doesn't share running_dispatches). Re-drive any

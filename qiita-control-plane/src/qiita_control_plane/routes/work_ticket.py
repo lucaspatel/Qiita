@@ -89,6 +89,7 @@ from qiita_common.models import (
     WorkTicketCancelResponse,
     WorkTicketCancelResult,
     WorkTicketCreateRequest,
+    WorkTicketFollowOn,
     WorkTicketListResponse,
     WorkTicketReadOutcome,
     WorkTicketResponse,
@@ -109,7 +110,7 @@ from ..auth.principal import Anonymous, HumanUser, Principal, ServiceAccount, ge
 from ..config import Settings
 from ..deps import get_db_pool
 from ..dispatch import schedule_dispatch
-from ..ena_import.registration import fetch_pool_download_ticket
+from ..ena_import.registration import download_ticket_has_live_job, fetch_pool_download_ticket
 from ..ena_import.submit import DOWNLOAD_ENA_STUDY_ACTION_ID
 from ..fanout_dispatch import (
     COHORT_BUILDERS,
@@ -902,9 +903,11 @@ async def _gate_follow_on(
     principal: Principal,
     parent: WorkTicketCreateRequest,
 ) -> None:
-    """Gate `parent.on_success` as though it were submitted now, on the parent's
-    scope target, so a follow-on that could never run is refused up front
-    instead of at the parent's completion.
+    """Run `_gate_submission` over every link of `parent.on_success` on the
+    parent's scope target, so a follow-on these gates refuse is refused with its
+    parent rather than at a later stage's completion. State that changes in
+    between, and the in-flight dedupe these gates leave out, can still refuse a
+    link when its own stage completes.
 
     Human callers only: the completion hook re-loads the originator with
     `load_human_user`, and there is no equivalent for a service account."""
@@ -914,19 +917,21 @@ async def _gate_follow_on(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail={"reason": "on_success is only accepted from a human caller"},
         )
-    follow_on = WorkTicketCreateRequest(
-        action_id=parent.on_success.action_id,
-        action_version=parent.on_success.action_version,
-        scope_target=parent.scope_target,
-        action_context=parent.on_success.action_context,
-    )
-    try:
-        await _gate_submission(pool=pool, settings=settings, principal=principal, body=follow_on)
-    except HTTPException as exc:
-        raise HTTPException(
-            status_code=exc.status_code,
-            detail={"reason": "on_success was refused", "on_success_detail": exc.detail},
-        ) from exc
+    node: WorkTicketFollowOn | None = parent.on_success
+    while node is not None:
+        link = node.as_request(parent.scope_target)
+        try:
+            await _gate_submission(pool=pool, settings=settings, principal=principal, body=link)
+        except HTTPException as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"reason": "on_success was refused", "on_success_detail": exc.detail},
+            ) from exc
+        node = node.on_success
+
+
+class FollowOnAlreadyRecordedError(Exception):
+    """The parent already records a follow-on outcome; the ticket was not created."""
 
 
 async def submit_work_ticket_core(
@@ -934,11 +939,18 @@ async def submit_work_ticket_core(
     app: FastAPI,
     principal: Principal,
     body: WorkTicketCreateRequest,
+    follow_on_of: int | None = None,
 ) -> WorkTicketResponse:
     """Gate, INSERT, and dispatch one work ticket for `principal`.
 
     Takes `app` rather than a `Request` so in-process callers get the same gates
     as `POST /work-ticket`, including the action's audience check.
+
+    `follow_on_of` names the parent whose follow-on this is. The parent's
+    `follow_on_work_ticket_idx` is written in the INSERT's transaction, and only
+    while the parent records no outcome; otherwise the INSERT rolls back and this
+    raises `FollowOnAlreadyRecordedError`. That is what makes a follow-on created
+    at most once and never left unrecorded.
     """
     require_compute_backend_client(app)
     pool: asyncpg.Pool = app.state.pool
@@ -1008,6 +1020,17 @@ async def submit_work_ticket_core(
                 reference_idx=reference_idx,
                 context="submit",
             )
+            if follow_on_of is not None:
+                recorded = await conn.fetchval(
+                    "UPDATE qiita.work_ticket SET follow_on_work_ticket_idx = $2"
+                    " WHERE work_ticket_idx = $1"
+                    "   AND follow_on_work_ticket_idx IS NULL AND follow_on_error IS NULL"
+                    " RETURNING work_ticket_idx",
+                    follow_on_of,
+                    work_ticket_idx,
+                )
+                if recorded is None:
+                    raise FollowOnAlreadyRecordedError(follow_on_of)
     except asyncpg.exceptions.UniqueViolationError as exc:
         # Unique partial index fired — a concurrent submission won the
         # race past `_check_disallow_without_delete`. Map to the same
@@ -1148,11 +1171,11 @@ def _scope_target_from_columns(
 
 def _shape_work_ticket_columns(data: dict[str, Any]) -> dict[str, Any]:
     """In place, fold a work_ticket row's tagged-union scope columns into a
-    single `scope_target` and decode `action_context` from asyncpg's
-    JSONB-as-string. Every other column maps 1:1 onto a WorkTicket field and
-    flows through unchanged — so a field added to both the model and
-    `_WORK_TICKET_COLUMNS` needs no edit here. Returns the same dict for
-    chaining."""
+    single `scope_target` and decode the JSONB columns (`action_context`,
+    `on_success`) from asyncpg's JSONB-as-string. Every other column maps 1:1
+    onto a WorkTicket field and flows through unchanged — so a scalar field added
+    to both the model and `_WORK_TICKET_COLUMNS` needs no edit here. Returns the
+    same dict for chaining."""
     data["scope_target"] = _scope_target_from_columns(
         data.pop("scope_target_kind"),
         study_idx=data.pop("study_idx"),
@@ -1183,7 +1206,7 @@ def _row_to_work_ticket(row: asyncpg.Record) -> WorkTicket:
 
 async def fetch_work_ticket(pool: asyncpg.Pool, work_ticket_idx: int) -> WorkTicket | None:
     """Read one ticket with no caller gate, for in-process callers that already
-    own it (the follow-on hook). Routes gate before calling this."""
+    own it. Routes gate before calling this."""
     row = await pool.fetchrow(
         f"SELECT {_WORK_TICKET_COLUMNS}{_WORK_TICKET_FROM} WHERE wt.work_ticket_idx = $1",
         work_ticket_idx,
@@ -1753,12 +1776,8 @@ async def _refuse_unsafe_download_redrive(
                 f"{latest['work_ticket_idx']} ({latest['work_ticket_state']}) on the same pool"
             ),
         )
-    if current_state == WorkTicketState.FAILED.value and await conn.fetchval(
-        "SELECT EXISTS (SELECT 1 FROM qiita.work_ticket_step"
-        " WHERE work_ticket_idx = $1 AND state IN ($2, $3) AND slurm_job_id IS NOT NULL)",
-        work_ticket_idx,
-        StepProgressState.SUBMITTED.value,
-        StepProgressState.RUNNING.value,
+    if current_state == WorkTicketState.FAILED.value and await download_ticket_has_live_job(
+        conn, work_ticket_idx=work_ticket_idx
     ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

@@ -1,17 +1,18 @@
 """Submit a completed ticket's follow-on (`qiita.work_ticket.on_success`).
 
 `submit_follow_on` runs from dispatch's completion hook after every terminal
-outcome and is a no-op unless the ticket COMPLETED with an `on_success`. It
-claims the submission with one conditional UPDATE, so a ticket's follow-on is
-submitted at most once however many hooks race, then submits it through
-`submit_work_ticket_core` as the originator, on the parent's scope target. The
-outcome lands on the parent row: the created ticket's idx, or the refusal.
+outcome and is a no-op unless the ticket COMPLETED with an `on_success` that has
+no outcome yet. It submits the follow-on through `submit_work_ticket_core` as the
+originator, on the parent's scope target, and the outcome lands on the parent:
 
-`reconcile_follow_ons` (lifespan startup, before tickets are re-driven) covers
-the gaps a restart leaves: a ticket that completed while no hook ran, and a
-claim whose submission never recorded an outcome. Re-submitting the latter is
-safe: if the first attempt did create the ticket, the submit gate's dedupe
-refuses the second with a 409 that names it, and that refusal is recorded.
+  * created: `follow_on_work_ticket_idx`, written by the core in the same
+    transaction as the new ticket's INSERT and only while the parent records no
+    outcome — so a follow-on is created at most once however many callers race,
+    and a created one is never unrecorded;
+  * refused: `follow_on_error`, for a definitive refusal only (a 4xx from the
+    gates, or an originator who can no longer submit);
+  * anything else (a 5xx, a database error): nothing is recorded, and the next
+    startup's `reconcile_follow_ons` submits it again.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from fastapi import HTTPException
-from qiita_common.models import WorkTicketCreateRequest, WorkTicketState
+from qiita_common.models import WorkTicketState
 
 from .auth.principal import PrincipalUnusableError, load_human_user
 
@@ -32,31 +33,14 @@ if TYPE_CHECKING:
 _log = logging.getLogger(__name__)
 
 
-async def _claim(pool: asyncpg.Pool, work_ticket_idx: int) -> bool:
-    claimed = await pool.fetchval(
-        "UPDATE qiita.work_ticket SET follow_on_claimed_at = now()"
-        " WHERE work_ticket_idx = $1 AND state = $2::qiita.work_ticket_state"
-        "   AND on_success IS NOT NULL AND follow_on_claimed_at IS NULL"
-        " RETURNING work_ticket_idx",
-        work_ticket_idx,
-        WorkTicketState.COMPLETED.value,
-    )
-    return claimed is not None
-
-
-async def _record(
-    pool: asyncpg.Pool,
-    work_ticket_idx: int,
-    *,
-    created_idx: int | None = None,
-    error: str | None = None,
-) -> None:
+async def _record_refusal(pool: asyncpg.Pool, work_ticket_idx: int, error: str) -> None:
+    # Conditional, like the core's success write: whichever outcome lands first
+    # stands (the one-outcome CHECK would refuse a second).
     await pool.execute(
-        "UPDATE qiita.work_ticket"
-        " SET follow_on_work_ticket_idx = $2, follow_on_error = $3"
-        " WHERE work_ticket_idx = $1",
+        "UPDATE qiita.work_ticket SET follow_on_error = $2"
+        " WHERE work_ticket_idx = $1"
+        "   AND follow_on_work_ticket_idx IS NULL AND follow_on_error IS NULL",
         work_ticket_idx,
-        created_idx,
         error,
     )
 
@@ -67,36 +51,46 @@ def _describe_refusal(exc: HTTPException) -> str:
     return f"HTTP {exc.status_code}: {text}"
 
 
-async def _submit_claimed(app: FastAPI, work_ticket_idx: int) -> None:
-    """Submit the follow-on of a ticket this process has claimed, and record
-    the outcome. Every failure is recorded; none propagates."""
+async def submit_follow_on(app: FastAPI, work_ticket_idx: int) -> None:
+    """Submit `work_ticket_idx`'s follow-on if it COMPLETED with one that has no
+    outcome yet. A failure that is not a refusal propagates, recording nothing."""
     # Imported here: routes.work_ticket imports dispatch, which imports this module.
-    from .routes.work_ticket import fetch_work_ticket, submit_work_ticket_core
+    from .routes.work_ticket import (
+        FollowOnAlreadyRecordedError,
+        fetch_work_ticket,
+        submit_work_ticket_core,
+    )
 
     pool: asyncpg.Pool = app.state.pool
     parent = await fetch_work_ticket(pool, work_ticket_idx)
-    if parent is None or parent.on_success is None:
+    if (
+        parent is None
+        or parent.state != WorkTicketState.COMPLETED
+        or parent.on_success is None
+        or parent.follow_on_work_ticket_idx is not None
+        or parent.follow_on_error is not None
+    ):
         return
     try:
         principal = await load_human_user(pool, parent.originator_principal_idx)
-        body = WorkTicketCreateRequest(
-            action_id=parent.on_success.action_id,
-            action_version=parent.on_success.action_version,
-            scope_target=parent.scope_target,
-            action_context=parent.on_success.action_context,
+        created = await submit_work_ticket_core(
+            app=app,
+            principal=principal,
+            body=parent.on_success.as_request(parent.scope_target),
+            follow_on_of=work_ticket_idx,
         )
-        created = await submit_work_ticket_core(app=app, principal=principal, body=body)
+    except FollowOnAlreadyRecordedError:
+        return  # another caller recorded the outcome first
     except PrincipalUnusableError as exc:
-        await _record(pool, work_ticket_idx, error=f"originator cannot submit: {exc}")
+        await _record_refusal(
+            pool, work_ticket_idx, f"the submitting user can no longer submit: {exc}"
+        )
         return
     except HTTPException as exc:
-        await _record(pool, work_ticket_idx, error=_describe_refusal(exc))
+        if exc.status_code >= 500:
+            raise
+        await _record_refusal(pool, work_ticket_idx, _describe_refusal(exc))
         return
-    except Exception as exc:
-        _log.exception("follow-on of work_ticket %d failed to submit", work_ticket_idx)
-        await _record(pool, work_ticket_idx, error=f"{type(exc).__name__}: {exc}")
-        return
-    await _record(pool, work_ticket_idx, created_idx=created.work_ticket_idx)
     _log.info(
         "work_ticket %d completed; submitted follow-on work_ticket %d",
         work_ticket_idx,
@@ -104,24 +98,28 @@ async def _submit_claimed(app: FastAPI, work_ticket_idx: int) -> None:
     )
 
 
-async def submit_follow_on(app: FastAPI, work_ticket_idx: int) -> None:
-    """Submit `work_ticket_idx`'s follow-on if it just COMPLETED with one."""
-    if await _claim(app.state.pool, work_ticket_idx):
-        await _submit_claimed(app, work_ticket_idx)
-
-
 async def reconcile_follow_ons(app: FastAPI) -> None:
-    """Submit every completed ticket's follow-on that has no outcome yet.
+    """Submit every completed ticket's follow-on that has no outcome yet: one that
+    completed with no hook to see it, or whose submission failed transiently.
 
-    Runs once at startup, before any ticket is dispatched, so no live hook can
-    hold a claim this resets."""
+    Runs at startup after `reconcile_inflight_tickets`, so a follow-on created
+    here is dispatched only by its own submission."""
     pool: asyncpg.Pool = app.state.pool
+    # The literal 'completed' (not a bound parameter) matches the partial index
+    # predicate verbatim, so the planner uses work_ticket_follow_on_pending_idx
+    # whichever plan it picks — a parameterized `state = $1` is only provably
+    # index-eligible under a custom plan.
     rows = await pool.fetch(
-        "UPDATE qiita.work_ticket SET follow_on_claimed_at = now()"
-        " WHERE state = $1::qiita.work_ticket_state AND on_success IS NOT NULL"
+        "SELECT work_ticket_idx FROM qiita.work_ticket"
+        " WHERE state = 'completed' AND on_success IS NOT NULL"
         "   AND follow_on_work_ticket_idx IS NULL AND follow_on_error IS NULL"
-        " RETURNING work_ticket_idx",
-        WorkTicketState.COMPLETED.value,
+        " ORDER BY work_ticket_idx",
     )
     for row in rows:
-        await _submit_claimed(app, row["work_ticket_idx"])
+        try:
+            await submit_follow_on(app, row["work_ticket_idx"])
+        except Exception:
+            _log.exception(
+                "follow-on of work_ticket %d was not submitted; the next startup retries it",
+                row["work_ticket_idx"],
+            )

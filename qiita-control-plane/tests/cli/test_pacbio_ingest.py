@@ -246,6 +246,22 @@ def test_read_preflight_rows_fails_on_missing_accession(build_case5_preflight):
         _read_pacbio_preflight_rows(db, _RaisingParser())
 
 
+@pytest.mark.parametrize("bioproject", ["", "  ", " PRJNA99999 "])
+def test_read_preflight_rows_fails_on_blank_or_padded_accession(build_case5_preflight, bioproject):
+    """The library refuses a NULL accession but not a blank or padded one; the
+    reader refuses those, naming the sample."""
+    db = build_case5_preflight()
+    conn = sqlite3.connect(db)
+    conn.execute("UPDATE project SET bioproject_accession = ?", (bioproject,))
+    conn.commit()
+    conn.close()
+    with pytest.raises(
+        _RaisingParser.Error,
+        match=r"pacbio_sample_idx 1 has a blank or padded primary_bioproject_accession",
+    ):
+        _read_pacbio_preflight_rows(db, _RaisingParser())
+
+
 def test__read_pacbio_preflight_rows_rejects_a_non_sqlite_blob(tmp_path, capsys):
     """Tests the case where --preflight-blob names a file that is not a SQLite
     database at all — the operator pointed at the CSV, or at a truncated copy.
@@ -339,16 +355,21 @@ def _stub_submit_flow(
             )
         if url.endswith("/auth/whoami"):
             return resp(200, {"kind": "human", "principal_idx": 7})
-        if url.endswith("/lookup-by-accession") and "biosample" in url:
-            return resp(
-                200,
+        if url.endswith("/biosample/resolve-roster"):
+            biosample_idx = {"BIO_sample.1": 11, "BIO_sample.2": 12, "BIO_sample.3": 13}
+            study_idx = {"PRJNA99999": 900}
+            rows = [
                 {
-                    "resolved": {"BIO_sample.1": 11, "BIO_sample.2": 12, "BIO_sample.3": 13},
-                    "missing": [],
-                },
-            )
-        if url.endswith("/lookup-by-accession"):  # study, keyed on the bioproject accession
-            return resp(200, {"resolved": {"PRJNA99999": 900}, "missing": []})
+                    "item_id": r["item_id"],
+                    "biosample_idx": biosample_idx[r["biosample_accession"]],
+                    "primary_study_idx": study_idx[r["primary_project_accession"]],
+                    "secondary_study_idxs": [
+                        study_idx[a] for a in r["secondary_project_accessions"]
+                    ],
+                }
+                for r in json["rows"]
+            ]
+            return resp(200, {"rows": rows})
         if url.endswith("/sequenced-pool"):
             return resp(201, {"sequenced_pool_idx": 50})
         if url.rstrip("/").endswith("/sequencing-run"):
@@ -539,12 +560,17 @@ def test_submit_pacbio_ingest_names_missing_rows_as_pacbio_sample_rows(
     stubbed = _common.httpx.request
 
     def missing_one(method, url, headers=None, json=None, params=None, timeout=None):
-        if url.endswith("/lookup-by-accession") and "biosample" in url:
+        if url.endswith("/biosample/resolve-roster"):
+            item_id = json["rows"][2]["item_id"]
             return httpx.Response(
-                200,
+                422,
                 json={
-                    "resolved": {"BIO_sample.1": 11, "BIO_sample.2": 12},
-                    "missing": ["BIO_sample.3"],
+                    "detail": {
+                        "message": "1 of 3 roster rows did not resolve",
+                        "problems": [
+                            {"item_id": item_id, "message": "no biosample has accession 'X'"}
+                        ],
+                    }
                 },
                 request=httpx.Request(method, url),
             )
@@ -554,7 +580,7 @@ def test_submit_pacbio_ingest_names_missing_rows_as_pacbio_sample_rows(
     with pytest.raises(SystemExit):
         main(_submit_args(run, db))
     err = capsys.readouterr().err
-    assert "affecting 1 pacbio_sample row" in err
+    assert "  - pacbio_sample_idx 3: no biosample has accession 'X'" in err
 
 
 def test_submit_pacbio_ingest_resilient_to_ticket_failure(

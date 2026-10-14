@@ -51,7 +51,7 @@ from qiita_common.models import (
 
 from ...preflight import SHEET_TYPE_PACBIO_ABSQUANT
 from .. import _common
-from ._helpers import _inspect_run_folder, _load_preflight_conn
+from ._helpers import _inspect_run_folder, _load_preflight_conn, _refuse_malformed_accessions
 from .pool import _provision_run_pool_roster
 
 # action_id + version for the per-sample read loader this command fans out to.
@@ -81,8 +81,8 @@ class _PacbioPreflightRow(NamedTuple):
     LOCATE the sample's BAM on disk — it is NOT unique across all PacBio protocols
     and is never used as an identity/pool-item-id.
 
-    The project accessions are ENA **bioproject** accessions (what the study lookup
-    route resolves), matching the Illumina row; `secondary_project_accessions` is
+    The project accessions are ENA **bioproject** accessions (what resolve-roster
+    resolves), matching the Illumina row; `secondary_project_accessions` is
     populated for controls. The three protocol columns (`sheet_type`,
     `twist_adaptor_id`, `syndna_is_twisted`) feed the read-mask mask-chain
     derivation. `smrt_cell` is the SMRT-cell well (`smrt_cell_well_sample_id`, form
@@ -115,9 +115,9 @@ def _read_pacbio_preflight_rows(
     pool-item-id).
 
     Operator-actionable errors (an unloadable preflight, a non-PacBio sheet, no
-    `pacbio_sample` rows, a missing accession, or an impossible protocol combo) raise
-    via `parser.error` so the CLI surfaces one stderr line and exits 2 before any
-    network call — matching `_read_preflight_rows`.
+    `pacbio_sample` rows, a missing, blank or padded accession, or an impossible
+    protocol combo) raise via `parser.error` so the CLI surfaces one stderr line and
+    exits 2 before any network call — matching `_read_preflight_rows`.
     """
     from run_preflight import get_pacbio_sample_info  # noqa: PLC0415
     from run_preflight.db import get_run_legacy_format, get_single_run_idx  # noqa: PLC0415
@@ -187,6 +187,7 @@ def _read_pacbio_preflight_rows(
                 " is absent from the run_pacbio_sample view — the preflight is"
                 " internally inconsistent"
             )
+        _refuse_malformed_accessions(info, parser, preflight_blob, "pacbio_sample_idx")
         if not pbs.barcode_id:
             parser.error(
                 f"--preflight-blob {preflight_blob}: pacbio_sample_idx {info.sample_idx}"
@@ -400,7 +401,6 @@ def _handle_submit_pacbio_ingest(args: argparse.Namespace, parser: argparse.Argu
             prep_protocol_idx=args.prep_protocol_idx,
             pool_item_id=lambda row: str(row.pacbio_sample_idx),
             row_label=lambda row: f"pacbio_sample_idx {row.pacbio_sample_idx}",
-            row_noun="pacbio_sample",
         )
         sequencing_run_idx = provision.sequencing_run_idx
         sequenced_pool_idx = provision.sequenced_pool_idx

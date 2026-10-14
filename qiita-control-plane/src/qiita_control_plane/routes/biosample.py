@@ -1271,6 +1271,7 @@ async def resolve_biosample_roster(
     pool: asyncpg.Pool = Depends(get_db_pool),
     user: HumanUser = Depends(require_human),
     _scope: Principal = Depends(require_scope(Scope.BIOSAMPLE_READ)),
+    _study_scope: Principal = Depends(require_scope(Scope.STUDY_READ)),
 ) -> RosterResolveResponse:
     """Resolve a pool roster to biosample_idx + study links, by matrix tube or
     accession, in one round trip.
@@ -1280,12 +1281,15 @@ async def resolve_biosample_roster(
     whose `detail` is a `RosterResolveFailure` naming every problem, so a
     submitter fixes the sheet once rather than one miss per attempt.
 
-    Auth matches the lookup routes (see lookup_biosample_by_accession): the
+    Auth: `biosample:read` and `study:read`, since the answer names both. No
+    per-row access predicate runs, as in lookup_biosample_by_accession: the
     response carries only idxs, and creating a prep_sample on a resolved study
-    still passes that route's own study-access check.
+    still passes that route's own study-access check. The facts are read in one
+    read-only snapshot, so a concurrent retire cannot mix two states.
     """
     _ = user
-    facts = await fetch_roster_facts(pool, body.rows)
+    async with pool.acquire() as conn, conn.transaction(isolation="repeatable_read", readonly=True):
+        facts = await fetch_roster_facts(conn, body.rows)
     resolved, problems = classify_roster(body.rows, facts)
     if problems:
         unresolved = len({p.item_id for p in problems})

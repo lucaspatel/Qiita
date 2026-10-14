@@ -979,7 +979,7 @@ PATH_BIOSAMPLE_LOOKUP_BY_ACCESSION = "/lookup-by-accession"
 # Bulk lookup of biosample_idx by matrix_tube_id; same body-vs-querystring
 # rationale as the accession variant.
 PATH_BIOSAMPLE_LOOKUP_BY_MATRIX_TUBE_ID = "/lookup-by-matrix-tube-id"
-# Resolve a pool roster (one row per sample: a matrix tube or accessions) to
+# Resolve a pool roster (one row per pool sample: a matrix tube or accessions) to
 # biosample_idx + study links in one round trip; 422 lists every row's problem.
 PATH_BIOSAMPLE_RESOLVE_ROSTER = "/resolve-roster"
 

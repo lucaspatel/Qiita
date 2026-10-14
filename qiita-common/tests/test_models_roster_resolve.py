@@ -5,7 +5,6 @@ from pydantic import ValidationError
 
 from qiita_common.models import (
     RosterProblem,
-    RosterProblemCode,
     RosterResolveFailure,
     RosterResolveRequest,
     RosterResolveRow,
@@ -73,15 +72,7 @@ def test_request_refuses_empty_and_extra() -> None:
 def test_failure_round_trips() -> None:
     failure = RosterResolveFailure(
         message="1 of 2 rows did not resolve",
-        problems=[
-            RosterProblem(
-                item_id="1",
-                code=RosterProblemCode.UNKNOWN_TUBE,
-                value="0363157924",
-                message="no biosample has matrix tube 0363157924",
-            )
-        ],
+        problems=[RosterProblem(item_id="1", message="no biosample has matrix tube 0363157924")],
     )
     again = RosterResolveFailure.model_validate(failure.model_dump(mode="json"))
     assert again == failure
-    assert again.problems[0].code == "unknown_tube"

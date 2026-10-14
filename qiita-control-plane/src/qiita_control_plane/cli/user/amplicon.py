@@ -32,7 +32,7 @@ from qiita_common.models import (
 
 from ...preflight import AmpliconPreflightError, amplicon_samples
 from .. import _common
-from ._helpers import _resolve_run_folder
+from ._helpers import _follow_on_from_args, _resolve_run_folder
 from .pool import _provision_run_pool_roster
 
 # Pinned to the workflow YAML the operator's deploy syncs into qiita.action; keep
@@ -50,9 +50,9 @@ class _AmpliconPreflightRow(NamedTuple):
     demux job matches each read's index against; `barcodes_are_rc` is per-sample
     provenance (whether the stored barcode is the reverse complement of the read
     index). `matrix_tube_id`, when present, identifies the sample on its own; the
-    accessions are then optional cross-checks. The project accessions are
-    **bioproject** accessions; `secondary_project_accessions` is populated for
-    controls.
+    accessions are then optional cross-checks. The project accessions are ENA
+    **bioproject** accessions that resolve-roster resolves, matching the
+    Illumina/PacBio rows; `secondary_project_accessions` is populated for controls.
     """
 
     prepped_sample_idx: int
@@ -120,7 +120,8 @@ def _handle_submit_golay_demux(args: argparse.Namespace, parser: argparse.Argume
          resolved biosample_idx + study_idx, the operator's prep_protocol_idx, and
          ``sequenced_pool_item_id = str(prepped_sample_idx)``.
     4.   POST /work-ticket — one pool-scoped golay-demux ticket whose
-         action_context carries the multiplexed FASTQ paths and the barcode_map.
+         action_context carries the multiplexed FASTQ paths and the barcode_map,
+         plus an `on_success` follow-on when the `--then-*` flags name one.
 
     Steps 1-3 (accession resolution, create-missing roster, fail-fast on an
     unresolved accession) are the shared `_provision_run_pool_roster` gesture,
@@ -130,6 +131,7 @@ def _handle_submit_golay_demux(args: argparse.Namespace, parser: argparse.Argume
     """
     if not args.preflight_blob.is_file():
         parser.error(f"--preflight-blob {args.preflight_blob} is not a regular file")
+    follow_on = _follow_on_from_args(args, parser)
     blob_bytes = args.preflight_blob.read_bytes()
     if not blob_bytes:
         parser.error(f"--preflight-blob {args.preflight_blob} is empty")
@@ -171,10 +173,6 @@ def _handle_submit_golay_demux(args: argparse.Namespace, parser: argparse.Argume
             prep_protocol_idx=args.prep_protocol_idx,
             pool_item_id=lambda row: str(row.prepped_sample_idx),
             row_label=lambda row: f"prepped_sample_idx={row.prepped_sample_idx}",
-            row_noun="amplicon_sample",
-            # A sheet straight from the pre-prep file carries matrix tubes and no
-            # accessions; the roster route resolves either.
-            resolve_by_roster=True,
         )
         sequencing_run_idx = provision.sequencing_run_idx
         sequenced_pool_idx = provision.sequenced_pool_idx
@@ -224,6 +222,7 @@ def _handle_submit_golay_demux(args: argparse.Namespace, parser: argparse.Argume
             },
             action_context=action_context,
             force=args.force,
+            **({"on_success": follow_on} if follow_on is not None else {}),
         ).model_dump(exclude_unset=True, mode="json")
         ticket_resp, _ticket_status = _common.call_with_status(
             "POST",

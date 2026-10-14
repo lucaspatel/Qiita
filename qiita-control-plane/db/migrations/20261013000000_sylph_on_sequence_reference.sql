@@ -7,6 +7,9 @@
 -- and its own taxonomy store: a genome's lineage is the reference's
 -- `reference_taxonomy`, as it is for an alignment.
 --
+-- Every statement is safe to re-run: a database that recorded this migration
+-- under an earlier version (it moved to keep clear of another's) applies it again.
+--
 -- Releases that never saw the standalone form have nothing to clear here. One
 -- that did loses its profiling_database references and the profile runs read
 -- against them: their lake rows name genomes by file path, which no feature table
@@ -19,7 +22,7 @@ DELETE FROM qiita.taxonomic_profile_sample
         ON r.reference_idx = (p.params ->> 'sylph_reference_idx')::BIGINT
      WHERE r.kind = 'profiling_database');
 
-DROP TABLE qiita.profiling_taxonomy;
+DROP TABLE IF EXISTS qiita.profiling_taxonomy;
 
 DELETE FROM qiita.reference_index
  WHERE index_type = 'sylph_taxonomy'
@@ -35,7 +38,7 @@ ALTER TABLE qiita.reference_index
     CHECK (index_type IN ('rype', 'minimap2', 'bowtie2', 'rype_router', 'sylph'));
 
 ALTER TABLE qiita.reference
-    DROP CONSTRAINT reference_kind_check;
+    DROP CONSTRAINT IF EXISTS reference_kind_check;
 ALTER TABLE qiita.reference
     ADD CONSTRAINT reference_kind_check
     CHECK (kind IN ('sequence_reference', 'taxonomy_authority', 'artifact_sequence_set'));
