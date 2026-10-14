@@ -106,6 +106,10 @@
   const keyOf = (r: number, well: string) => `${r}:${well}`;
   const decide = (r: number, well: string, d: Decision) =>
     (decisions = { ...decisions, [keyOf(r, well)]: { ...(decisions[keyOf(r, well)] ?? {}), ...d } });
+  /** Samples the tech marked as blanks on Plates ("Edit blanks"), kept apart from
+   *  Fix's decisions so a reset undoes only these. */
+  let blankEdits = $state<Record<string, true>>({});
+  let editBlanks = $state(false);
 
   const OTHER = 'other'; // the study key of sheet-only plates
   type Cell =
@@ -129,7 +133,7 @@
   function cellOf(r: number, well: string, tube: string): Cell {
     const d = decisions[keyOf(r, well)] ?? {};
     if (d.exclude) return { state: 'excluded' };
-    if (d.blank) return { state: 'blank' };
+    if (d.blank || blankEdits[keyOf(r, well)]) return { state: 'blank' };
     const places = placesOf.get(tube) ?? [];
     if (places.length > 1) {
       const me = `${racks[r].rackId} ${well}`;
@@ -230,9 +234,17 @@
       'unplaced-tube-codes.tsv',
       ['rack\twell\ttube_code\tproblem', ...[...unknown, ...multi, ...dupes].map((x) => `${racks[x.r].rackId}\t${x.well}\t${x.tube}\t${problemOf(x.cell)}`)].join('\n')
     );
+  /** In "Edit blanks", a click makes a sample a blank or undoes that; a tube the
+   *  scan or Fix made a blank stays one. */
   const toggleBlank = (r: number, well: string) => {
-    if (cells[r]?.[well]) decide(r, well, { blank: !(decisions[keyOf(r, well)]?.blank ?? false) });
+    if (!editBlanks) return;
+    const k = keyOf(r, well);
+    if (blankEdits[k]) {
+      const { [k]: _gone, ...rest } = blankEdits;
+      blankEdits = rest;
+    } else if (cells[r]?.[well]?.cell.state === 'sample') blankEdits = { ...blankEdits, [k]: true };
   };
+  const blanksChanged = $derived(Object.keys(blankEdits).length);
   // rackAt catches up with a removed rack an effect later; until then skip what's gone.
   const placed = $derived(
     rackAt.flatMap((r, i) => (r === null || r >= racks.length ? [] : [{ r, position: String(i + 1) }]))
@@ -308,12 +320,24 @@
     ...(/^\d{4}-\d{2}-\d{2}$/.test(run.run_date) ? [] : ['Run date must be YYYY-MM-DD']),
     ...Object.entries(run).flatMap(([k, v]) => (/[^\x00-\x7f]/.test(v) ? [`Run: ${k} has a non-ASCII character`] : []))
   ]);
-  const fillRight = (col: (typeof PLATE_COLUMNS)[number][0]) => {
-    const first = placed[0];
-    if (!first) return;
-    const v = plateFacts[racks[first.r].rackId][col];
-    for (const { r } of placed) plateFacts[racks[r].rackId][col] = v;
+  type PlateCol = (typeof PLATE_COLUMNS)[number][0];
+  const placedFacts = () => placed.flatMap(({ r }) => (plateFacts[racks[r].rackId] ? [plateFacts[racks[r].rackId]] : []));
+  const differs = (col: PlateCol) => new Set(placedFacts().map((f) => f[col])).size > 1;
+  /** Rows the tech opened per plate although every plate has the same value. */
+  let splitRows = $state<Partial<Record<PlateCol, boolean>>>({});
+  const isSplit = (col: PlateCol) => !!splitRows[col] || differs(col);
+  const setAll = (col: PlateCol, v: string) => {
+    for (const f of placedFacts()) f[col] = v;
   };
+  /** Back to one value: the first plate's, on every plate. */
+  const sameForAll = (col: PlateCol) => {
+    setAll(col, placedFacts()[0]?.[col] ?? '');
+    splitRows = { ...splitRows, [col]: false };
+  };
+  const INSTRUMENTS = ['Illumina MiSeqi100', 'Illumina MiSeq', 'Illumina iSeq 100', 'Illumina NextSeq 2000', 'Illumina NovaSeq X'];
+  const instruments = $derived(
+    run.instrument_model && !INSTRUMENTS.includes(run.instrument_model) ? [run.instrument_model, ...INSTRUMENTS] : INSTRUMENTS
+  );
 
   // --- 6. pre-flight: one sample sheet per study, which kl-run-preflight builds the blob from ---
   const sheetWells = $derived(
@@ -348,8 +372,8 @@
       sheetWells.map((w) => [
         w.well384,
         w.control
-          ? { fill: '#9ca3af', title: `${w.name} · blank`, mark: 'B' }
-          : { fill: colorOf(w.study), title: `${w.name} · ${titleOf(w.study)} · ${w.barcode}` }
+          ? { fill: '#9ca3af', title: `${w.name} · blank · tube ${w.tube} · ${w.barcode}`, mark: 'B' }
+          : { fill: colorOf(w.study), title: `${w.name} · ${titleOf(w.study)} · tube ${w.tube} · ${w.barcode}` }
       ])
     ) as Record<string, Well>
   );
@@ -367,6 +391,11 @@
     })
   );
   let built = $state(false);
+  // A pre-flight is of the sheets it was built from: any later change unbuilds it.
+  $effect(() => {
+    sheets.map((x) => x.text);
+    untrack(() => (built = false));
+  });
   const preflightName = $derived(
     `${run.run_date.replaceAll('-', '') || 'YYYYMMDD'}_IL515fBC_806_${studyKeys.map((k) => studyFacts[k]?.project_abbreviation ?? k).join('_')}.preflight.db`
   );
@@ -388,8 +417,22 @@
   const nextStep = $derived(step === 1 && needFix === 0 ? 3 : step + 1);
 
   const btn = 'rounded-md bg-white px-2.5 py-1 text-xs font-semibold text-gray-900 shadow-xs ring-1 ring-gray-300 ring-inset hover:bg-gray-50';
+  /** Tailwind UI: forms / select menus / simple native (the chevron is `chevron`). */
+  const select =
+    'col-start-1 row-start-1 w-full appearance-none rounded-md bg-white py-1.5 pr-8 pl-3 text-base text-gray-900 outline-1 -outline-offset-1 outline-gray-300 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-teal-600 sm:text-sm/6';
   const input = 'block w-full rounded-md bg-white px-2 py-1 text-sm text-gray-900 outline-1 -outline-offset-1 focus:outline-2 focus:-outline-offset-2 focus:outline-teal-600';
 </script>
+
+{#snippet chevron()}
+  <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" class="pointer-events-none col-start-1 row-start-1 mr-2 size-5 self-center justify-self-end text-gray-500 sm:size-4"><path d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" fill-rule="evenodd" /></svg>
+{/snippet}
+
+{#snippet legend(blanks = true)}
+  <ul class="flex flex-wrap gap-x-4 gap-y-1 text-xs text-gray-600">
+    {#each studyKeys as k}<li><span class="mr-1.5 inline-block size-2.5 rounded-full align-middle" style="background:{colorOf(k)}"></span>{titleOf(k)}</li>{/each}
+    {#if blanks}<li><span class="mr-1.5 inline-block size-2.5 rounded-full bg-gray-400 align-middle"></span>blank</li>{/if}
+  </ul>
+{/snippet}
 
 <div class="mb-6">
   <div class="flex items-center justify-between gap-3">
@@ -441,7 +484,7 @@
       <div>
         <label for="protocol" class="block text-sm/6 font-semibold text-gray-900">Prep protocol</label>
         <div class="mt-2 grid grid-cols-1">
-          <select id="protocol" bind:value={protocol} class="col-start-1 row-start-1 w-full appearance-none rounded-md bg-white py-1.5 pr-8 pl-3 text-base text-gray-900 outline-1 -outline-offset-1 outline-gray-300 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-teal-600 sm:text-sm/6">
+          <select id="protocol" bind:value={protocol} class={select}>
             <option value={null} disabled>Choose a prep protocol…</option>
             {#each protocols as p (p)}
               <option value={p} disabled={p !== SUPPORTED_PROTOCOL}>
@@ -449,20 +492,20 @@
               </option>
             {/each}
           </select>
-          <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" class="pointer-events-none col-start-1 row-start-1 mr-2 size-5 self-center justify-self-end text-gray-500 sm:size-4"><path d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" fill-rule="evenodd" /></svg>
+          {@render chevron()}
         </div>
       </div>
       {#if protocol}
         <div>
           <label for="primers" class="block text-sm/6 font-semibold text-gray-900">Primers</label>
           <div class="mt-2 grid grid-cols-1">
-            <select id="primers" bind:value={target} class="col-start-1 row-start-1 w-full appearance-none rounded-md bg-white py-1.5 pr-8 pl-3 text-base text-gray-900 outline-1 -outline-offset-1 outline-gray-300 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-teal-600 sm:text-sm/6">
+            <select id="primers" bind:value={target} class={select}>
               <option value={null} disabled>Choose primers…</option>
               {#each TARGETS as t (t.id)}
                 <option value={t.id} disabled={!t.enabled}>{t.label}{t.enabled ? '' : ' — not yet'}</option>
               {/each}
             </select>
-            <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" class="pointer-events-none col-start-1 row-start-1 mr-2 size-5 self-center justify-self-end text-gray-500 sm:size-4"><path d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" fill-rule="evenodd" /></svg>
+            {@render chevron()}
           </div>
         </div>
       {/if}
@@ -554,28 +597,39 @@
         </div>
       {/if}
       <div class="mt-4 space-y-6">
-        {#each unknownRacks as u (u.rack.rackId)}
-          <!-- Tailwind UI: feedback / alerts / with actions -->
-          <div class="rounded-md bg-red-50 p-4">
-            <h3 class="text-sm font-medium text-red-800">{u.n} tubes on {u.rack.rackId} aren't in Qiita-miint</h3>
-            <p class="mt-2 text-sm text-red-700">
-              A whole rack like this is another study on the run: one not in Qiita-miint, or whose samples lack tube
-              codes there. Add the study (or its tube codes) and check again, or carry the rack for its sample sheet
-              only.
-            </p>
-            <div class="mt-4 -mx-2 -my-1.5 flex flex-wrap gap-1">
-              <button type="button" class="rounded-md bg-red-50 px-2 py-1.5 text-sm font-medium text-red-800 hover:bg-red-100" onclick={() => download(`${u.rack.rackId}-tube-codes.txt`, unknown.filter((x) => x.r === u.r).map((x) => `${x.well}\t${x.tube}`).join('\n'))}>Download the tube codes</button>
-              <a href="/studies" class="rounded-md bg-red-50 px-2 py-1.5 text-sm font-medium text-red-800 hover:bg-red-100">Open studies →</a>
-              <button type="button" class="rounded-md bg-red-50 px-2 py-1.5 text-sm font-medium text-red-800 hover:bg-red-100" onclick={() => { sheetOnly = { ...sheetOnly, [u.rack.rackId]: true }; studyFacts[OTHER] ??= { ...(demo?.otherStudy ?? { project_name: '', project_abbreviation: '', center_project_name: '', experiment_design_description: '' }) }; }}>Sample sheet only</button>
+        {#if unknownRacks.length}
+          <!-- Tailwind UI: lists / stacked lists, in a card -->
+          <section class="rounded-lg border border-gray-200">
+            <div class="border-b border-gray-200 px-4 py-3">
+              <h3 class="text-sm font-medium text-gray-900">
+                {unknownRacks.length === 1 ? '1 rack belongs' : `${unknownRacks.length} racks belong`} to studies not in Qiita-miint
+              </h3>
+              <p class="mt-1 text-sm text-gray-500">
+                Usual on a run shared with another study. Add the study (or its tube codes) to Qiita-miint and scan
+                again, or carry the rack for its sample sheet only.
+              </p>
             </div>
-          </div>
-        {/each}
+            <ul role="list" class="divide-y divide-gray-100 text-sm">
+              {#each unknownRacks as u (u.rack.rackId)}
+                <li class="flex flex-wrap items-center gap-3 px-4 py-2">
+                  <span class="font-medium text-gray-900">{u.rack.rackId}</span>
+                  <span class="text-gray-500">{u.n} tubes</span>
+                  <span class="ml-auto flex flex-wrap items-center gap-2">
+                    <button type="button" class={btn} onclick={() => download(`${u.rack.rackId}-tube-codes.txt`, unknown.filter((x) => x.r === u.r).map((x) => `${x.well}\t${x.tube}`).join('\n'))}>Download the tube codes</button>
+                    <a href="/studies" class={btn}>Open studies →</a>
+                    <button type="button" class="rounded-md bg-teal-600 px-2.5 py-1 text-xs font-semibold text-white shadow-xs hover:bg-teal-500" onclick={() => { sheetOnly = { ...sheetOnly, [u.rack.rackId]: true }; studyFacts[OTHER] ??= { ...(demo?.otherStudy ?? { project_name: '', project_abbreviation: '', center_project_name: '', experiment_design_description: '' }) }; }}>Sample sheet only</button>
+                  </span>
+                </li>
+              {/each}
+            </ul>
+          </section>
+        {/if}
 
         {#if looseUnknown.length}
-          <section>
-            <h3 class="text-sm font-medium text-gray-900">{looseUnknown.length} stray tubes not in Qiita-miint</h3>
-            <p class="mt-1 text-sm text-gray-500">A mislabelled tube, a sample not yet registered, or a blank.</p>
-            <ul role="list" class="mt-2 divide-y divide-gray-100 rounded-md border border-gray-200 text-sm">
+          <section class="rounded-md bg-red-50 p-4">
+            <h3 class="text-sm font-medium text-red-800">{looseUnknown.length} stray tubes not in Qiita-miint</h3>
+            <p class="mt-1 text-sm text-red-700">A mislabelled tube, a sample not yet registered, or a blank.</p>
+            <ul role="list" class="mt-2 divide-y divide-gray-100 rounded-md border border-red-200 bg-white text-sm">
               {#each looseUnknown as x (x.r + x.well)}
                 <li class="flex flex-wrap items-center gap-3 px-4 py-2">
                   <span class="font-mono text-xs text-gray-700">{racks[x.r].rackId} {x.well}</span>
@@ -591,10 +645,10 @@
         {/if}
 
         {#if multi.length}
-          <section>
-            <h3 class="text-sm font-medium text-gray-900">{multi.length} in more than one study</h3>
-            <p class="mt-1 text-sm text-gray-500">Which study is this prep for?</p>
-            <ul role="list" class="mt-2 divide-y divide-gray-100 rounded-md border border-gray-200 text-sm">
+          <section class="rounded-md bg-red-50 p-4">
+            <h3 class="text-sm font-medium text-red-800">{multi.length} in more than one study</h3>
+            <p class="mt-1 text-sm text-red-700">Which study is this prep for?</p>
+            <ul role="list" class="mt-2 divide-y divide-gray-100 rounded-md border border-red-200 bg-white text-sm">
               {#each multi as x (x.r + x.well)}
                 {@const c = x.cell as { studies: number[] }}
                 <li class="flex flex-wrap items-center gap-3 px-4 py-2">
@@ -609,10 +663,10 @@
         {/if}
 
         {#if dupes.length}
-          <section>
-            <h3 class="text-sm font-medium text-gray-900">Tubes scanned twice</h3>
-            <p class="mt-1 text-sm text-gray-500">A tube can only be in one well. Keep one, leave the other out.</p>
-            <ul role="list" class="mt-2 divide-y divide-gray-100 rounded-md border border-gray-200 text-sm">
+          <section class="rounded-md bg-red-50 p-4">
+            <h3 class="text-sm font-medium text-red-800">Tubes scanned twice</h3>
+            <p class="mt-1 text-sm text-red-700">A tube can only be in one well. Keep one, leave the other out.</p>
+            <ul role="list" class="mt-2 divide-y divide-gray-100 rounded-md border border-red-200 bg-white text-sm">
               {#each dupes as x (x.r + x.well)}
                 <li class="flex flex-wrap items-center gap-3 px-4 py-2">
                   <span class="font-mono text-xs text-gray-700">{racks[x.r].rackId} {x.well}</span>
@@ -627,24 +681,56 @@
       </div>
     {/if}
   {:else if step === 3}
-    <h2 class="text-sm/6 font-semibold text-gray-900">Lay out the plates</h2>
-    <p class="mt-1 text-sm text-gray-500">The four positions of the 384-well plate. Click a well to mark or unmark it as a blank.</p>
+    <div class="flex flex-wrap items-start justify-between gap-3">
+      <div>
+        <h2 class="text-sm/6 font-semibold text-gray-900">Lay out the plates</h2>
+        <p class="mt-1 text-sm text-gray-500">The four positions of the 384-well plate.</p>
+      </div>
+      <!-- Tailwind UI: forms / toggles / with right label -->
+      <label class="flex cursor-pointer items-center gap-3 text-sm">
+        <span class="group relative inline-flex w-11 shrink-0 rounded-full bg-gray-200 p-0.5 inset-ring inset-ring-gray-900/5 outline-offset-2 outline-teal-600 transition-colors duration-200 ease-in-out has-checked:bg-teal-600 has-focus-visible:outline-2">
+          <span class="size-5 rounded-full bg-white shadow-xs ring-1 ring-gray-900/5 transition-transform duration-200 ease-in-out group-has-checked:translate-x-5"></span>
+          <input type="checkbox" bind:checked={editBlanks} aria-label="Edit blanks" class="absolute inset-0 size-full appearance-none focus:outline-hidden" />
+        </span>
+        <span class="font-medium text-gray-900">Edit blanks</span>
+      </label>
+    </div>
+    <div class="mt-3 flex flex-wrap items-center justify-between gap-3">
+      {@render legend()}
+      {#if editBlanks}
+        <p class="text-xs text-teal-700">Click a sample to make it a blank, or a changed well to undo.</p>
+      {/if}
+    </div>
+    {#if blanksChanged}
+      <p class="mt-2 text-xs text-amber-700">
+        {blanksChanged} {blanksChanged === 1 ? 'blank' : 'blanks'} changed from the scan ·
+        <button type="button" class="font-medium underline hover:text-amber-900" onclick={() => (blankEdits = {})}>reset</button>
+      </p>
+    {/if}
     <div class="mt-4 grid grid-cols-1 gap-6 xl:grid-cols-2">
       {#each [0, 1, 2, 3] as i}
         <div class="rounded-lg border border-gray-200 p-3">
           <div class="mb-2 flex flex-wrap items-center gap-3 text-sm">
             <span class="font-semibold text-gray-900">Position {i + 1}</span>
-            <select aria-label="Rack at position {i + 1}" class="rounded-md border-0 py-1 pr-8 pl-2 text-sm ring-1 ring-gray-300 ring-inset" bind:value={rackAt[i]}>
-              <option value={null}>— empty —</option>
-              {#each racks as rack, r}<option value={r}>{rack.rackId}</option>{/each}
-            </select>
-            <label class="ml-auto flex items-center gap-2 text-xs text-gray-600">Primer plate
-              <select class="rounded-md border-0 py-1 pr-8 pl-2 text-sm ring-1 ring-gray-300 ring-inset" bind:value={primerAt[i]}>
-                {#each Array.from({ length: 10 }, (_, k) => String(k + 1)) as n}<option>{n}</option>{/each}
+            <div class="grid w-32 grid-cols-1">
+              <select aria-label="Rack at position {i + 1}" class={select} bind:value={rackAt[i]}>
+                <option value={null}>— empty —</option>
+                {#each racks as rack, r}<option value={r}>{rack.rackId}</option>{/each}
               </select>
+              {@render chevron()}
+            </div>
+            <label class="ml-auto flex items-center gap-2 text-xs text-gray-600">Primer plate
+              <span class="grid w-20 grid-cols-1">
+                <select class={select} bind:value={primerAt[i]}>
+                  {#each Array.from({ length: 10 }, (_, k) => String(k + 1)) as n}<option>{n}</option>{/each}
+                </select>
+                {@render chevron()}
+              </span>
             </label>
           </div>
-          <PlateMap wells={wellsOf(rackAt[i])} onpick={(w) => rackAt[i] !== null && toggleBlank(rackAt[i]!, w)} />
+          <div class="inline-block rounded-xl {editBlanks ? 'ring-2 ring-teal-500 ring-offset-2' : ''}">
+            <PlateMap wells={wellsOf(rackAt[i])} onpick={editBlanks ? (w) => rackAt[i] !== null && toggleBlank(rackAt[i]!, w) : undefined} />
+          </div>
           {#if rackAt[i] !== null}
             {@const r = rackAt[i]!}
             {@const studies = studiesOfRack(r)}
@@ -654,11 +740,14 @@
             {#if studies.length > 1 && blanksOn(r)}
               <label class="mt-2 flex flex-wrap items-center gap-2 text-xs {blanksTo[racks[r].rackId] ? 'text-gray-600' : 'text-red-700'}">
                 This plate mixes studies. Its blanks go to
-                <select aria-label="Blanks of {racks[r].rackId} go to" class="rounded-md border-0 py-1 pr-8 pl-2 text-xs ring-1 ring-inset {blanksTo[racks[r].rackId] ? 'ring-gray-300' : 'ring-red-400'}" bind:value={blanksTo[racks[r].rackId]}>
-                  <option value={undefined} disabled>choose…</option>
-                  {#each studies as k}<option value={k}>{titleOf(k)}</option>{/each}
-                  <option value={EACH}>each study's sheet</option>
-                </select>
+                <span class="grid min-w-48 grid-cols-1">
+                  <select aria-label="Blanks of {racks[r].rackId} go to" class="{select} {blanksTo[racks[r].rackId] ? '' : 'outline-red-400'}" bind:value={blanksTo[racks[r].rackId]}>
+                    <option value={undefined} disabled>choose…</option>
+                    {#each studies as k}<option value={k}>{titleOf(k)}</option>{/each}
+                    <option value={EACH}>each study's sheet</option>
+                  </select>
+                  {@render chevron()}
+                </span>
               </label>
             {/if}
           {/if}
@@ -679,24 +768,36 @@
       <table class="min-w-full text-sm">
         <thead>
           <tr class="text-left text-xs text-gray-500">
-            <th class="py-2 pr-3 font-medium"></th>
-            {#each placed as { r, position }}<th class="px-2 py-2 font-medium">Position {position} · {racks[r].rackId}</th>{/each}
-            <th></th>
+            <th class="w-40 py-2 pr-3 font-medium"></th>
+            {#each placed as { r, position }}<th class="px-2 py-2 font-medium whitespace-nowrap">Position {position} · {racks[r].rackId}</th>{/each}
+            <th class="w-28"></th>
           </tr>
         </thead>
         <tbody class="divide-y divide-gray-100">
           {#each PLATE_COLUMNS.filter(([k]) => k !== 'primer_plate') as [col, label]}
+            {@const firstFacts = placedFacts()[0]}
             <tr>
               <th scope="row" class="py-1.5 pr-3 text-left text-xs font-medium whitespace-nowrap text-gray-700">{label}</th>
-              {#each placed as { r }}
-                {@const id = racks[r].rackId}
-                <td class="px-2 py-1.5">
-                  {#if plateFacts[id]}
-                    <input aria-label="{label} for {id}" class="{input} {plateFacts[id][col].trim() ? 'outline-gray-300' : 'outline-red-300'}" bind:value={plateFacts[id][col]} />
+              {#if isSplit(col)}
+                {#each placed as { r }}
+                  {@const id = racks[r].rackId}
+                  <td class="px-2 py-1.5">
+                    {#if plateFacts[id]}
+                      <input aria-label="{label} for {id}" class="{input} {plateFacts[id][col].trim() ? 'outline-gray-300' : 'outline-red-300'}" bind:value={plateFacts[id][col]} />
+                    {/if}
+                  </td>
+                {/each}
+                <td class="pl-1 text-right"><button type="button" class="text-xs whitespace-nowrap text-teal-700 hover:underline" title="Use the first plate's value on every plate" onclick={() => sameForAll(col)}>same for all</button></td>
+              {:else}
+                <td class="px-2 py-1.5" colspan={placed.length}>
+                  {#if firstFacts}
+                    <input aria-label="{label} for every plate" class="{input} {firstFacts[col].trim() ? 'outline-gray-300' : 'outline-red-300'}" value={firstFacts[col]} oninput={(e) => setAll(col, e.currentTarget.value)} />
                   {/if}
                 </td>
-              {/each}
-              <td class="pl-1"><button type="button" class="text-xs text-teal-700 hover:underline" title="Use the first plate's value on every plate" onclick={() => fillRight(col)}>same for all</button></td>
+                <td class="pl-1 text-right">
+                  {#if placed.length > 1}<button type="button" class="text-xs whitespace-nowrap text-gray-500 hover:text-teal-700 hover:underline" onclick={() => (splitRows = { ...splitRows, [col]: true })}>differs by plate</button>{/if}
+                </td>
+              {/if}
             </tr>
           {/each}
         </tbody>
@@ -708,7 +809,17 @@
       {#each studyKeys as k}
         <div class="rounded-lg border border-gray-200 p-3">
           <p class="mb-2 text-sm font-medium text-gray-900"><span class="mr-2 inline-block size-3 rounded-full align-middle" style="background:{colorOf(k)}"></span>{titleOf(k)}</p>
-          {#if studyFacts[k]}
+          {#if studyFacts[k] && k !== OTHER}
+            <dl class="grid grid-cols-2 gap-x-3 gap-y-2 text-sm">
+              {#each STUDY_COLUMNS as [col, label]}
+                <div class={col === 'experiment_design_description' ? 'col-span-2' : ''}>
+                  <dt class="text-xs text-gray-500">{label}</dt>
+                  <dd class="text-gray-900">{studyFacts[k][col] || '—'}</dd>
+                </div>
+              {/each}
+            </dl>
+            <p class="mt-2 text-xs text-gray-400">From Qiita-miint; change it on the study.</p>
+          {:else if studyFacts[k]}
             <div class="grid grid-cols-2 gap-2">
               {#each STUDY_COLUMNS as [col, label]}
                 <label class="text-xs text-gray-600 {col === 'experiment_design_description' ? 'col-span-2' : ''}">{label}
@@ -724,7 +835,15 @@
     <h3 class="mt-8 text-sm font-semibold text-gray-900">Run</h3>
     <div class="mt-2 grid max-w-2xl grid-cols-3 gap-3">
       <label class="text-xs text-gray-600">Run date<input class="{input} mt-0.5 outline-gray-300" bind:value={run.run_date} /></label>
-      <label class="text-xs text-gray-600">Instrument<input class="{input} mt-0.5 outline-gray-300" bind:value={run.instrument_model} /></label>
+      <label class="text-xs text-gray-600">Instrument
+        <span class="mt-0.5 grid grid-cols-1">
+          <select class={select} bind:value={run.instrument_model}>
+            <option value="" disabled>Choose…</option>
+            {#each instruments as m}<option value={m}>{m}</option>{/each}
+          </select>
+          {@render chevron()}
+        </span>
+      </label>
       <label class="text-xs text-gray-600">Plate map date<input class="{input} mt-0.5 outline-gray-300" bind:value={run.platemap_generation_date} /></label>
     </div>
 
@@ -758,24 +877,23 @@
     </ul>
     <div class="mt-6 flex flex-wrap items-start gap-6">
       <PlateMap format={384} wells={plate384} />
-      <ul class="space-y-1 text-xs text-gray-600">
-        {#each studyKeys as k}<li><span class="mr-1.5 inline-block size-2.5 rounded-full align-middle" style="background:{colorOf(k)}"></span>{titleOf(k)}</li>{/each}
-        <li><span class="mr-1.5 inline-block size-2.5 rounded-full bg-gray-400 align-middle"></span>blank</li>
-      </ul>
+      <div class="max-w-48">{@render legend()}<p class="mt-3 text-xs text-gray-400">Hover a well for its sample, tube code and barcode.</p></div>
     </div>
     {#if barcodeIssues.length}
       <ul class="mt-4 space-y-1 text-sm text-red-700">{#each barcodeIssues as t}<li>{t}</li>{/each}</ul>
     {:else}
       <p class="mt-4 text-sm text-gray-600">{Object.keys(plate384).length} wells, each with its own Golay barcode.</p>
     {/if}
-    <div class="mt-4 flex flex-wrap items-center gap-3">
-      <button type="button" class="rounded-md bg-teal-600 px-3 py-2 text-sm font-semibold text-white shadow-xs hover:bg-teal-500 disabled:opacity-50" disabled={built || barcodeIssues.length > 0} onclick={() => ((built = true), saveLast())}>
-        {built ? 'Pre-flight built' : 'Build pre-flight'}
-      </button>
-      {#if built}
-        <button type="button" class="rounded-md bg-white px-3 py-2 text-sm font-semibold text-gray-900 shadow-xs ring-1 ring-gray-300 ring-inset hover:bg-gray-50 disabled:opacity-50" disabled title="Built by kl-run-preflight on the server in the real flow">Download {preflightName}</button>
-      {/if}
-    </div>
+    {#if built}
+      <!-- Tailwind UI: feedback / alerts / with actions -->
+      <div class="mt-4 rounded-md bg-green-50 p-4">
+        <h3 class="text-sm font-medium text-green-800">Pre-flight ready</h3>
+        <p class="mt-2 text-sm text-green-700">kl-run-preflight built <span class="font-mono text-xs">{preflightName}</span> from the {sheets.length} sheets. The sequencing step submits with it.</p>
+        <div class="mt-3 -mx-2 -my-1.5 flex">
+          <button type="button" class="rounded-md bg-green-50 px-2 py-1.5 text-sm font-medium text-green-800 hover:bg-green-100 disabled:opacity-50" disabled title="Built by kl-run-preflight on the server in the real flow">Download {preflightName}</button>
+        </div>
+      </div>
+    {/if}
   {:else if step === 6}
     <h2 class="text-sm/6 font-semibold text-gray-900">Sequence</h2>
     <p class="mt-1 text-sm text-gray-500">When the run has finished, pick its folder.</p>
@@ -805,7 +923,11 @@
   <div class="mt-8 flex items-center justify-between border-t border-gray-100 pt-4">
     <button type="button" class="rounded-md bg-white px-3 py-2 text-sm font-semibold text-gray-900 shadow-xs ring-1 ring-gray-300 ring-inset hover:bg-gray-50 disabled:invisible" disabled={step === 0} onclick={() => go(step - 1)}>Back</button>
     {#if step < STEPS.length - 1}
-      <button type="button" class="rounded-md bg-teal-600 px-3 py-2 text-sm font-semibold text-white shadow-xs hover:bg-teal-500 disabled:opacity-40" disabled={!canLeave[step]} onclick={() => go(nextStep)}>Next: {STEPS[nextStep]}</button>
+      {#if step === 5 && !built}
+        <button type="button" class="rounded-md bg-teal-600 px-3 py-2 text-sm font-semibold text-white shadow-xs hover:bg-teal-500 disabled:opacity-40" disabled={barcodeIssues.length > 0} onclick={() => ((built = true), saveLast())}>Build pre-flight</button>
+      {:else}
+        <button type="button" class="rounded-md bg-teal-600 px-3 py-2 text-sm font-semibold text-white shadow-xs hover:bg-teal-500 disabled:opacity-40" disabled={!canLeave[step]} onclick={() => go(nextStep)}>Next: {STEPS[nextStep]}</button>
+      {/if}
     {/if}
   </div>
 </div>
