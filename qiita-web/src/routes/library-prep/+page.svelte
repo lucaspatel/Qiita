@@ -1,12 +1,13 @@
 <script lang="ts">
   // MOCKUP of the Library prep flow: from "a box of tubes was dropped off" to "the
   // amplicon workflow is running", replacing kl-metapool's
-  // amplicon_pre_prep_file_generator notebook. One task per screen. Everything here
-  // is local and mocked (lib/libraryPrep/mock.ts); each step says what of it runs in
-  // the browser and what the server must own.
-  import PageHeading from '$lib/ui/PageHeading.svelte';
-  import Card from '$lib/ui/Card.svelte';
-  import Select from '$lib/ui/Select.svelte';
+  // amplicon_pre_prep_file_generator notebook. The tube codes drive it: scanning the
+  // racks is enough to know which samples and studies are in the box, and anything
+  // Qiita can't place is fixed before the plates are laid out. One task per screen;
+  // each screen shows only what that task needs. Local, mocked data
+  // (lib/libraryPrep/mock.ts); each step notes what runs where.
+  import { untrack } from 'svelte';
+  import { api, type PrepProtocol } from '$lib/api';
   import PlateMap, { type Well } from '$lib/ui/PlateMap.svelte';
   import {
     DETAIL_FIELDS,
@@ -17,7 +18,6 @@
     demoBox,
     mockGolay,
     parseVisionMate,
-    to384,
     toVisionMate,
     validateDetails,
     type PlateDetails,
@@ -25,44 +25,29 @@
     type Resolution
   } from '$lib/libraryPrep/mock';
 
-  const STEPS = [
-    { title: 'Intake', task: 'Name the prep, check the studies are ready, scan the racks' },
-    { title: 'Identify', task: 'Resolve every tube to its sample and study' },
-    { title: 'Controls', task: 'Confirm the blanks' },
-    { title: 'Plate details', task: 'Positions, primer plates and processing facts' },
-    { title: 'Compress', task: 'Check the 384-well layout and barcodes' },
-    { title: 'Register', task: 'Register the prep with Qiita' },
-    { title: 'Sequence', task: 'Point at the run and start the amplicon workflow' }
-  ];
-  // Where each step's work belongs; shown beside it.
-  const WHERE: { client: string[]; server: string[] }[] = [
+  const STEPS = ['Protocol', 'Scan', 'Fix', 'Plates', 'Details', 'Register', 'Sequence'];
+  const WHERE: { client: string; server: string }[] = [
+    { client: 'Show the choices.', server: 'GET /prep-protocol; which protocols this flow supports.' },
     {
-      client: ['Parse VisionMate .tsv, normalise tube codes, draw the racks', 'Flag in-file problems (bad wells, repeats)'],
-      server: ['Which studies have tube-coded metadata (study reads)', 'Create the prep draft so a multi-day prep resumes on any machine']
+      client: 'Read the VisionMate files and normalise tube codes.',
+      server: 'POST /biosample/resolve-roster with every tube: sample, QB and study for each, every problem at once.'
     },
     {
-      client: ['Show resolutions and offer the fixes'],
-      server: ['POST /biosample/resolve-roster: tube → biosample (QB) → study, every problem at once', 'Record the choices (primary study, exclusions) on the draft']
+      client: 'Group the problems and offer the fixes.',
+      server: 'Re-check after metadata is added; keep the decisions (blanks, exclusions, chosen study) on the prep draft.'
     },
     {
-      client: ['Pick which wells are blanks'],
-      server: ['Register blanks as biosamples in each plate\'s study (they are samples downstream)']
+      client: 'Draw the quadrants, take clicks on wells.',
+      server: 'The EMP primer plates and the compression rule, so barcodes have one implementation (golay-demux checks them later).'
+    },
+    { client: 'Validate as you type, for feedback.', server: 'The same checks on save; they gate the pre-flight.' },
+    {
+      client: 'Show what will be written; offer the legacy pre-prep file.',
+      server: 'Register blanks as samples, write the pre-flight, link each sample to its study.'
     },
     {
-      client: ['Live validation for feedback (the notebook\'s validate_plate_metadata rules)'],
-      server: ['The same rules again on save: they gate the pre-flight']
-    },
-    {
-      client: ['Draw the 384 map from the server\'s answer'],
-      server: ['Compress (interleaved quadrants) and assign EMP Golay barcodes from the primer plates — the barcodes golay-demux later checks, so one implementation, not two']
-    },
-    {
-      client: ['Show what will be written; offer the legacy pre-prep .txt'],
-      server: ['Write the pre-flight (what kl-run-preflight holds today) and link each sample to its studies', 'Mint the prep\'s identifiers']
-    },
-    {
-      client: ['Pick the run, show ticket progress'],
-      server: ['POST /run-folder/inspect, create run + pool from the stored pre-flight', 'Submit golay-demux with amplicon as its follow-on']
+      client: 'Pick the run; show progress.',
+      server: 'Inspect the run folder, create run + pool from the stored pre-flight, submit golay-demux → amplicon.'
     }
   ];
 
@@ -73,55 +58,83 @@
     reached = Math.max(reached, i);
   };
 
-  // --- intake ---
-  let prepName = $state('2026-10-14 IBD + Adaptation');
-  let seqType = $state('16S');
-  let expected = $state<number[]>([15663, 12986, SOIL_STUDY]);
-  let tubeCoded = $state<Record<number, boolean>>(
-    Object.fromEntries(STUDIES.map((s) => [s.study_idx, s.withTubes > 0]))
-  );
+  // --- 1. protocol ---
+  const SUPPORTED_PROTOCOL = 'short_read_amplicon';
+  const FALLBACK_PROTOCOLS = [
+    'short_read_amplicon',
+    'short_read_metagenomics',
+    'long_read_metagenomics',
+    'short_read_transcriptomics'
+  ];
+  let protocols = $state<{ name: string }[]>(FALLBACK_PROTOCOLS.map((name) => ({ name })));
+  $effect(() => {
+    api.prepProtocols().then((r) => {
+      if (r.ok && r.data.length)
+        protocols = r.data
+          .filter((p: PrepProtocol) => !p.retired)
+          .map((p) => ({ name: p.name }))
+          .sort((a, b) => Number(b.name === SUPPORTED_PROTOCOL) - Number(a.name === SUPPORTED_PROTOCOL));
+    });
+  });
+  let protocol = $state<string | null>(null);
+  const TARGETS = [
+    { id: '16S', label: '16S rRNA (V4)', note: '515F / 806R, EMP Golay barcodes', enabled: true },
+    { id: '18S', label: '18S rRNA', note: 'not yet', enabled: false },
+    { id: 'ITS', label: 'ITS', note: 'not yet', enabled: false }
+  ];
+  let target = $state<string | null>(null);
+  const pretty = (s: string) => s.replaceAll('_', ' ').replace(/^./, (c) => c.toUpperCase());
+
+  // --- 2. scan ---
   let racks = $state<Rack[]>([]);
   let registry = $state.raw(new Map<string, Resolution>());
+  let checking = $state(false);
   let dragging = $state(false);
+  let soilMetadataAdded = $state(false);
 
+  function check() {
+    checking = true;
+    setTimeout(() => (checking = false), 700); // the mock's round trip
+  }
   function loadDemo() {
     const box = demoBox();
     racks = box.racks;
     registry = box.registry;
+    check();
   }
   async function addFiles(files: FileList | null) {
-    if (!files) return;
+    if (!files?.length) return;
     if (registry.size === 0) registry = demoBox().registry; // the mock's Qiita
     const parsed = await Promise.all([...files].map(async (f) => parseVisionMate(f.name, await f.text())));
     racks = [...racks, ...parsed].slice(0, 4);
+    check();
   }
-  function downloadDemoRacks() {
-    for (const r of demoBox().racks) {
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(new Blob([toVisionMate(r)], { type: 'text/tab-separated-values' }));
-      a.download = r.fileName;
-      a.click();
-    }
+  function download(name: string, text: string) {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+    a.download = name;
+    a.click();
   }
-  const unready = $derived(STUDIES.filter((s) => expected.includes(s.study_idx) && !tubeCoded[s.study_idx]));
+  const downloadDemoRacks = () => demoBox().racks.forEach((r) => download(r.fileName, toVisionMate(r)));
 
-  // --- identify ---
+  // --- resolution (what the server answers for every tube) ---
   type Decision = { primary?: number; exclude?: boolean; blank?: boolean };
   let decisions = $state<Record<string, Decision>>({});
   const keyOf = (r: number, well: string) => `${r}:${well}`;
-  const STUDY_COLOR: Record<number, string> = { 15663: '#0d9488', 12986: '#7c3aed', 13001: '#b45309' };
+  const decide = (r: number, well: string, d: Decision) =>
+    (decisions = { ...decisions, [keyOf(r, well)]: { ...(decisions[keyOf(r, well)] ?? {}), ...d } });
 
   type Cell =
     | { state: 'sample'; sample: string; qb: string; study: number }
     | { state: 'blank' }
     | { state: 'excluded' }
     | { state: 'unknown' }
-    | { state: 'multi'; sample: string; qb: string; studies: number[] }
+    | { state: 'multi'; sample: string; studies: number[] }
     | { state: 'duplicate'; other: string };
 
-  const tubeCount = $derived.by(() => {
-    const n = new Map<string, string[]>();
+  const placesOf = $derived.by(() => {
     // A well left out no longer holds its tube, so its twin stops being a duplicate.
+    const n = new Map<string, string[]>();
     racks.forEach((r, ri) => {
       for (const t of r.tubes)
         if (!decisions[keyOf(ri, t.well)]?.exclude)
@@ -134,16 +147,16 @@
     const d = decisions[keyOf(r, well)] ?? {};
     if (d.exclude) return { state: 'excluded' };
     if (d.blank) return { state: 'blank' };
-    const places = tubeCount.get(tube) ?? [];
+    const places = placesOf.get(tube) ?? [];
     if (places.length > 1) {
       const me = `${racks[r].rackId} ${well}`;
       return { state: 'duplicate', other: places.filter((p) => p !== me).join(', ') };
     }
     const res = registry.get(tube);
     if (!res) {
-      // The mock's stand-in for metadata ingested after the fact: plate 4's soil.
-      if (racks[r].rackId === 'SC0004' && tubeCoded[SOIL_STUDY])
-        return { state: 'sample', sample: `13001.${well}`, qb: `QB${9100 + WELLS_96.indexOf(well)}`, study: SOIL_STUDY };
+      // The mock's stand-in for the soil study's metadata gaining its tube codes.
+      if (racks[r].rackId === 'SC0004' && soilMetadataAdded)
+        return { state: 'sample', sample: `13001.soil.${well}`, qb: `QB${9100 + WELLS_96.indexOf(well)}`, study: SOIL_STUDY };
       return { state: 'unknown' };
     }
     if (res.kind === 'blank') return { state: 'blank' };
@@ -151,500 +164,501 @@
     if (res.kind === 'multi')
       return d.primary
         ? { state: 'sample', sample: res.sample, qb: res.qb, study: d.primary }
-        : { state: 'multi', sample: res.sample, qb: res.qb, studies: res.studies };
+        : { state: 'multi', sample: res.sample, studies: res.studies };
     return { state: 'sample', sample: res.sample, qb: res.qb, study: res.study_idx };
   }
 
   const cells = $derived(
-    racks.map((rack, r) => Object.fromEntries(rack.tubes.map((t) => [t.well, { tube: t.tube, cell: cellOf(r, t.well, t.tube) }])))
-  );
-  const issues = $derived(
-    cells.flatMap((rc, r) =>
-      Object.entries(rc)
-        .filter(([, v]) => ['unknown', 'multi', 'duplicate'].includes(v.cell.state))
-        .map(([well, v]) => ({ r, well, tube: v.tube, cell: v.cell }))
+    racks.map((rack, r) =>
+      Object.fromEntries(rack.tubes.map((t) => [t.well, { tube: t.tube, cell: cellOf(r, t.well, t.tube) }]))
     )
   );
-  const unknownByRack = $derived(
-    racks.map((_, r) => issues.filter((i) => i.r === r && i.cell.state === 'unknown').length)
+  const all = $derived(cells.flatMap((rc, r) => Object.entries(rc).map(([well, v]) => ({ r, well, ...v }))));
+  const unknown = $derived(all.filter((x) => x.cell.state === 'unknown'));
+  const multi = $derived(all.filter((x) => x.cell.state === 'multi'));
+  const dupes = $derived(all.filter((x) => x.cell.state === 'duplicate'));
+  const blanks = $derived(all.filter((x) => x.cell.state === 'blank'));
+  const needFix = $derived(unknown.length + multi.length + dupes.length);
+  const byStudy = $derived(
+    STUDIES.map((s) => ({
+      s,
+      n: all.filter((x) => x.cell.state === 'sample' && x.cell.study === s.study_idx).length
+    })).filter((x) => x.n)
+  );
+  const blanksOn = (r: number) => blanks.filter((x) => x.r === r).length;
+  // Unknown tubes that sit together on one rack: most likely one study without tube codes.
+  const unknownRacks = $derived(
+    racks.map((rack, r) => ({ rack, n: unknown.filter((x) => x.r === r).length })).filter((x) => x.n >= 24)
+  );
+  const looseUnknown = $derived(
+    unknown.filter((x) => !unknownRacks.some((u) => u.rack.rackId === racks[x.r].rackId))
   );
 
-  function wellView(r: number): Record<string, Well> {
+  const STUDY_COLOR: Record<number, string> = { 15663: '#0d9488', 12986: '#7c3aed', 13001: '#b45309' };
+  const studyName = (id: number) => STUDIES.find((s) => s.study_idx === id)?.title ?? `#${id}`;
+
+  // --- 4. plates: four quadrants ---
+  let rackAt = $state<(number | null)[]>([null, null, null, null]); // position 1..4 → rack index
+  let primerAt = $state(['1', '2', '3', '4']);
+  // A removed rack leaves its position empty; a new rack takes the first empty one.
+  $effect(() => {
+    const n = racks.length;
+    untrack(() => {
+      const fixed = rackAt.map((r) => (r !== null && r < n ? r : null));
+      for (let r = 0; r < n; r++)
+        if (!fixed.includes(r)) {
+          const free = fixed.indexOf(null);
+          if (free >= 0) fixed[free] = r;
+        }
+      if (fixed.some((r, i) => r !== rackAt[i])) rackAt = fixed;
+    });
+  });
+  function wellsOf(r: number | null): Record<string, Well> {
+    if (r === null) return {};
     const out: Record<string, Well> = {};
     for (const [well, { tube, cell }] of Object.entries(cells[r] ?? {})) {
       if (cell.state === 'sample')
-        out[well] = { fill: STUDY_COLOR[cell.study], title: `${cell.sample} · ${cell.qb} · tube ${tube}` };
-      else if (cell.state === 'blank') out[well] = { fill: '#9ca3af', title: `blank · tube ${tube}`, mark: 'B' };
-      else if (cell.state === 'excluded') out[well] = { fill: '#e5e7eb', title: `excluded · tube ${tube}`, mark: '×' };
-      else if (cell.state === 'unknown') out[well] = { fill: '#fecaca', ring: 'ring-red-500', title: `tube ${tube}: not in Qiita`, mark: '?' };
-      else if (cell.state === 'multi') out[well] = { fill: '#fde68a', ring: 'ring-amber-500', title: `${cell.sample}: in studies ${cell.studies.join(', ')}`, mark: '2' };
-      else out[well] = { fill: '#fed7aa', ring: 'ring-orange-500', title: `tube ${tube} also at ${cell.other}`, mark: 'D' };
+        out[well] = { fill: STUDY_COLOR[cell.study], title: `${cell.sample} · ${cell.qb} · ${tube}` };
+      else if (cell.state === 'blank') out[well] = { fill: '#9ca3af', title: `blank · ${tube}`, mark: 'B' };
+      else if (cell.state === 'excluded') out[well] = { fill: '#e5e7eb', title: `left out · ${tube}`, mark: '×' };
+      else out[well] = { fill: '#fecaca', ring: 'ring-red-500', title: `unresolved · ${tube}`, mark: '!' };
     }
     return out;
   }
-  let picked = $state<{ r: number; well: string } | null>(null);
-  const decide = (r: number, well: string, d: Decision) =>
-    (decisions = { ...decisions, [keyOf(r, well)]: { ...(decisions[keyOf(r, well)] ?? {}), ...d } });
-
-  // --- controls ---
-  const blanks = $derived(
-    cells.map((rc) => Object.entries(rc).filter(([, v]) => v.cell.state === 'blank').map(([w]) => w))
-  );
-  let blankNaming = $state('BLANK.{plate}.{well}');
-
-  // --- plate details ---
-  let details = $state<PlateDetails[]>([]);
-  $effect(() => {
-    if (details.length !== racks.length)
-      details = racks.map((rack, i) => {
-        const prior = details[i];
-        if (prior) return prior;
-        const base = Object.fromEntries(DETAIL_FIELDS.map(([k, , ex]) => [k, ex])) as PlateDetails;
-        return {
-          ...base,
-          position: String(i + 1),
-          primerPlate: String(i + 1),
-          samplePlate: `Plate_${16 + i}`,
-          project: '',
-          plating: i === 0 ? 'SF' : ''
-        };
-      });
-  });
-  const messages = $derived(validateDetails(details));
-  const detailErrors = $derived(messages.flat().filter((m) => m.level === 'error').length);
-  // The processing facts, not the plate's own identity, carry over.
-  const copyFromFirst = (i: number) => {
-    const { position, primerPlate, samplePlate } = details[i];
-    details[i] = { ...details[0], position, primerPlate, samplePlate };
+  const toggleBlank = (r: number, well: string) => {
+    if (cells[r]?.[well]) decide(r, well, { blank: !(decisions[keyOf(r, well)]?.blank ?? false) });
   };
-  const studiesOn = (r: number) =>
-    [...new Set(Object.values(cells[r] ?? {}).flatMap((v) => (v.cell.state === 'sample' ? [v.cell.study] : [])))];
+  const layoutProblems = $derived.by(() => {
+    const p: string[] = [];
+    const placed = rackAt.filter((r) => r !== null);
+    if (new Set(placed).size !== placed.length) p.push('A rack is in two positions');
+    if (new Set(placed).size !== racks.length) p.push('Every rack needs a position');
+    const pp = rackAt.flatMap((r, i) => (r !== null ? [primerAt[i]] : []));
+    if (new Set(pp).size !== pp.length) p.push('A primer plate is used twice');
+    return p;
+  });
 
-  // --- compress ---
-  type Placed = { well384: string; well96: string; r: number; tube: string; cell: Cell; barcode: string };
-  const placed = $derived(
-    racks.flatMap((_, r) =>
-      Object.entries(cells[r] ?? {})
-        .filter(([, v]) => v.cell.state === 'sample' || v.cell.state === 'blank')
-        .map(([well, v]) => ({
-          well384: to384(details[r]?.position ?? String(r + 1), well),
-          well96: well,
-          r,
-          tube: v.tube,
-          cell: v.cell,
-          barcode: mockGolay(details[r]?.primerPlate ?? '1', well)
-        }))
+  // --- 5. details: one shared form, plus each plate's name ---
+  const SHARED = DETAIL_FIELDS.filter(([k]) => k !== 'samplePlate');
+  let shared = $state(
+    Object.fromEntries(SHARED.map(([k, , ex]) => [k, k === 'plating' ? '' : ex])) as Record<string, string>
+  );
+  let platesNamed = $state(['Plate_16', 'Plate_17', 'Plate_18', 'Plate_19']);
+  const plateDetails = $derived(
+    rackAt.flatMap((r, i) =>
+      r === null
+        ? []
+        : [
+            {
+              ...(shared as unknown as PlateDetails),
+              position: String(i + 1),
+              primerPlate: primerAt[i],
+              samplePlate: platesNamed[i],
+              project: ''
+            }
+          ]
     )
   );
-  const QUADRANT = ['#0d9488', '#7c3aed', '#b45309', '#2563eb'];
-  const view384 = $derived(
-    Object.fromEntries(
-      placed.map((p) => [
-        p.well384,
-        {
-          fill: p.cell.state === 'blank' ? '#9ca3af' : QUADRANT[Number(details[p.r]?.position ?? 1) - 1],
-          title: `${p.cell.state === 'sample' ? p.cell.sample : 'blank'} · ${racks[p.r].rackId} ${p.well96} · ${p.barcode}`
-        }
-      ])
+  const detailMessages = $derived(validateDetails(plateDetails).flat());
+  const detailErrors = $derived([...new Set(detailMessages.filter((m) => m.level === 'error').map((m) => m.text))]);
+  const detailWarnings = $derived([
+    ...new Set(detailMessages.filter((m) => m.level === 'warning').map((m) => m.text))
+  ]);
+
+  // --- 6. register ---
+  const placedWells = $derived(
+    rackAt.flatMap((r, i) =>
+      r === null
+        ? []
+        : Object.entries(cells[r] ?? {})
+            .filter(([, v]) => v.cell.state === 'sample' || v.cell.state === 'blank')
+            .map(([well, v]) => ({ i, r, well, ...v, barcode: mockGolay(primerAt[i], well) }))
     )
   );
-  const barcodeClashes = $derived(placed.length - new Set(placed.map((p) => p.barcode)).size);
-  let picked384 = $state<string | null>(null);
-  const pick384 = $derived(placed.find((p) => p.well384 === picked384) ?? null);
-
-  // --- register ---
-  const perStudy = $derived(
-    STUDIES.map((s) => ({
-      s,
-      samples: placed.filter((p) => p.cell.state === 'sample' && p.cell.study === s.study_idx).length
-    })).filter((x) => x.samples)
-  );
+  const clashes = $derived(placedWells.length - new Set(placedWells.map((w) => w.barcode)).size);
   let registered = $state<string | null>(null);
   function downloadPrePrep() {
-    const head = ['sample_name', 'tube_id', 'qiita_study_id', 'sample_plate', 'well_id_384', 'well_id_96', 'primer_plate', 'barcode', 'plating', 'extraction_kit_lot', 'water_lot'];
-    const rows = placed.map((p) => {
-      const d = details[p.r];
-      const name = p.cell.state === 'sample' ? p.cell.sample : blankNaming.replace('{plate}', d.samplePlate).replace('{well}', p.well96);
-      const study = p.cell.state === 'sample' ? p.cell.study : (studiesOn(p.r)[0] ?? '');
-      return [name, p.tube, study, d.samplePlate, p.well384, p.well96, d.primerPlate, p.barcode, d.plating, d.extractionKitLot, d.waterLot].join('\t');
-    });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob([[head.join('\t'), ...rows].join('\n')], { type: 'text/plain' }));
-    a.download = `${new Date().toISOString().slice(0, 10).replaceAll('-', '')}_IL515fBC_806_${prepName.replace(/\W+/g, '_')}.txt`;
-    a.click();
+    const head = ['sample_name', 'tube_id', 'qiita_study_id', 'sample_plate', 'well_id_96', 'plate_position', 'primer_plate', 'barcode'];
+    const rows = placedWells.map((w) =>
+      [
+        w.cell.state === 'sample' ? w.cell.sample : `BLANK.${platesNamed[w.i]}.${w.well}`,
+        w.tube,
+        w.cell.state === 'sample' ? w.cell.study : '',
+        platesNamed[w.i],
+        w.well,
+        w.i + 1,
+        primerAt[w.i],
+        w.barcode
+      ].join('\t')
+    );
+    download('pre-prep.txt', [head.join('\t'), ...rows].join('\n'));
   }
 
-  // --- sequence ---
-  let runFolder = $state(RUN_FOLDERS[0].id);
-  let trim = $state(150);
-  let started = $state<{ demux: string; amplicon: string } | null>(null);
+  // --- 7. sequence ---
+  let runFolder = $state<string | null>(null);
+  let started = $state(false);
 
-  // What blocks leaving each step.
-  const blockers = $derived<string[][]>([
-    [
-      ...(racks.length ? [] : ['Scan or drop at least one rack']),
-      ...unready.map((s) => `${s.title} has no tube codes in its metadata`),
-      ...racks.flatMap((r) => r.problems.map((p) => `${r.rackId}: ${p}`))
-    ],
-    issues.length ? [`${issues.length} well(s) still need a decision`] : [],
-    [],
-    detailErrors ? [`${detailErrors} plate-detail error(s)`] : [],
-    barcodeClashes ? [`${barcodeClashes} barcode clash(es)`] : [],
-    registered ? [] : ['Register the prep first'],
-    []
+  const canLeave = $derived([
+    !!protocol && !!target,
+    racks.length > 0 && !checking,
+    needFix === 0,
+    layoutProblems.length === 0,
+    detailErrors.length === 0,
+    !!registered,
+    true
   ]);
+  // With nothing to fix, Scan goes straight to Plates.
+  const nextStep = $derived(step === 1 && needFix === 0 ? 3 : step + 1);
 </script>
 
-<PageHeading
-  title="Library prep"
-  subtitle="From a box of tubes to a running amplicon workflow — replaces the amplicon pre-prep notebook."
-/>
-
-<div class="mb-4 rounded-lg border border-amber-300 bg-amber-50 px-4 py-2 text-sm text-amber-900">
-  <strong>Mockup.</strong> Every screen works on local, made-up data; nothing is sent to Qiita.
-  Each step notes what the real version does in the browser and what on the server.
+<div class="mb-6">
+  <h1 class="text-2xl/7 font-bold text-gray-900">Library prep</h1>
+  <p class="mt-1 text-sm text-gray-500">From a box of tubes to a running amplicon workflow.</p>
+  <p class="mt-2 inline-flex rounded-md bg-amber-50 px-2 py-1 text-xs font-medium text-amber-800 ring-1 ring-amber-600/20 ring-inset">
+    Mockup — local made-up data, nothing is sent to Qiita
+  </p>
 </div>
 
-<div class="grid grid-cols-1 gap-6 lg:grid-cols-[14rem_minmax(0,1fr)]">
-  <!-- Step rail -->
-  <nav aria-label="Steps" class="lg:sticky lg:top-4 lg:self-start">
-    <ol class="space-y-1">
-      {#each STEPS as s, i}
-        <li>
-          <button
-            type="button"
-            disabled={i > reached}
-            class="flex w-full items-start gap-3 rounded-lg px-3 py-2 text-left text-sm transition disabled:opacity-40
-              {i === step ? 'bg-teal-50 ring-1 ring-teal-600' : 'hover:bg-gray-50'}"
-            onclick={() => go(i)}
-          >
-            <span
-              class="mt-0.5 flex size-6 shrink-0 items-center justify-center rounded-full text-xs font-semibold
-                {i < reached || (i === reached && i < step) ? 'bg-teal-600 text-white' : i === step ? 'bg-teal-700 text-white' : 'bg-gray-200 text-gray-600'}"
-              >{i + 1}</span
-            >
-            <span>
-              <span class="block font-medium text-gray-900">{s.title}</span>
-              <span class="block text-xs text-gray-500">{s.task}</span>
+<!-- Steps (Tailwind UI: navigation / progress bars / panels) -->
+<nav aria-label="Progress" class="mb-6">
+  <ol role="list" class="divide-y divide-gray-300 rounded-md border border-gray-300 bg-white md:flex md:divide-y-0">
+    {#each STEPS as label, i}
+      {@const done = i < step}
+      {@const current = i === step}
+      <li class="relative md:flex md:flex-1">
+        <button
+          type="button"
+          disabled={i > reached}
+          aria-current={current ? 'step' : undefined}
+          class="group flex w-full items-center px-4 py-3 text-sm font-medium disabled:cursor-not-allowed"
+          onclick={() => go(i)}
+        >
+          {#if done}
+            <span class="flex size-8 shrink-0 items-center justify-center rounded-full bg-teal-600 group-hover:bg-teal-800">
+              <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" class="size-5 text-white"><path d="M19.916 4.626a.75.75 0 0 1 .208 1.04l-9 13.5a.75.75 0 0 1-1.154.114l-6-6a.75.75 0 0 1 1.06-1.06l5.353 5.353 8.493-12.74a.75.75 0 0 1 1.04-.207Z" clip-rule="evenodd" fill-rule="evenodd" /></svg>
             </span>
-          </button>
-        </li>
-      {/each}
-    </ol>
-  </nav>
-
-  <div class="min-w-0 space-y-4">
-    <Card title={`${step + 1}. ${STEPS[step].title} — ${STEPS[step].task}`}>
-      {#if step === 0}
-        <div class="space-y-6">
-          <div class="flex flex-wrap gap-4">
-            <label class="flex flex-col gap-1 text-xs text-gray-600">
-              Prep name
-              <input class="w-72 rounded-md border border-gray-300 px-2.5 py-1.5 text-sm" bind:value={prepName} />
-            </label>
-            <label class="flex flex-col gap-1 text-xs text-gray-600">
-              Amplicon
-              <Select bind:value={seqType} class="w-40">
-                <option>16S</option><option>18S</option><option>ITS</option>
-              </Select>
-            </label>
+            <span class="ml-3 text-gray-900">{label}</span>
+          {:else if current}
+            <span class="flex size-8 shrink-0 items-center justify-center rounded-full border-2 border-teal-600 text-teal-600">{i + 1}</span>
+            <span class="ml-3 text-teal-700">{label}</span>
+          {:else}
+            <span class="flex size-8 shrink-0 items-center justify-center rounded-full border-2 border-gray-300 text-gray-500">{i + 1}</span>
+            <span class="ml-3 text-gray-500">{label}</span>
+          {/if}
+        </button>
+        {#if i < STEPS.length - 1}
+          <div aria-hidden="true" class="absolute top-0 right-0 hidden h-full w-4 md:block">
+            <svg viewBox="0 0 22 80" fill="none" preserveAspectRatio="none" class="size-full text-gray-300"><path d="M0 -2L20 40L0 82" stroke="currentcolor" vector-effect="non-scaling-stroke" stroke-linejoin="round" /></svg>
           </div>
+        {/if}
+      </li>
+    {/each}
+  </ol>
+</nav>
 
-          <div>
-            <h4 class="mb-2 text-sm font-medium text-gray-900">Which studies are in this box?</h4>
-            <p class="mb-2 text-xs text-gray-500">
-              Tubes are matched to samples by the tube codes in each study's metadata, so every study
-              must have its sample metadata, with tube codes, in Qiita before its tubes can be placed.
+<div class="rounded-lg bg-white px-4 py-5 shadow-sm ring-1 ring-gray-900/5 sm:p-6">
+  {#if step === 0}
+    <!-- Tailwind UI: forms / radio groups / cards -->
+    <fieldset>
+      <legend class="text-sm/6 font-semibold text-gray-900">What is being prepared?</legend>
+      <div class="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        {#each protocols as p (p.name)}
+          {@const enabled = p.name === SUPPORTED_PROTOCOL}
+          <label class="group relative flex rounded-lg border border-gray-300 bg-white p-4 has-checked:outline-2 has-checked:-outline-offset-2 has-checked:outline-teal-600 has-disabled:bg-gray-50 has-disabled:opacity-50">
+            <input type="radio" name="protocol" value={p.name} disabled={!enabled} bind:group={protocol} class="absolute inset-0 appearance-none focus:outline-none" />
+            <span class="flex-1">
+              <span class="block text-sm font-medium text-gray-900">{pretty(p.name)}</span>
+              <span class="mt-1 block text-xs text-gray-500">{enabled ? 'Rapid 16S, Golay-barcoded' : 'not in this flow yet'}</span>
+            </span>
+            <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" class="invisible size-5 text-teal-600 group-has-checked:visible"><path d="M10 18a8 8 0 1 0 0-16 8 8 0 0 0 0 16Zm3.857-9.809a.75.75 0 0 0-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 1 0-1.06 1.061l2.5 2.5a.75.75 0 0 0 1.137-.089l4-5.5Z" clip-rule="evenodd" fill-rule="evenodd" /></svg>
+          </label>
+        {/each}
+      </div>
+    </fieldset>
+    {#if protocol}
+      <fieldset class="mt-8">
+        <legend class="text-sm/6 font-semibold text-gray-900">Target</legend>
+        <div class="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
+          {#each TARGETS as t (t.id)}
+            <label class="group relative flex rounded-lg border border-gray-300 bg-white p-4 has-checked:outline-2 has-checked:-outline-offset-2 has-checked:outline-teal-600 has-disabled:bg-gray-50 has-disabled:opacity-50">
+              <input type="radio" name="target" value={t.id} disabled={!t.enabled} bind:group={target} class="absolute inset-0 appearance-none focus:outline-none" />
+              <span class="flex-1">
+                <span class="block text-sm font-medium text-gray-900">{t.label}</span>
+                <span class="mt-1 block text-xs text-gray-500">{t.note}</span>
+              </span>
+              <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" class="invisible size-5 text-teal-600 group-has-checked:visible"><path d="M10 18a8 8 0 1 0 0-16 8 8 0 0 0 0 16Zm3.857-9.809a.75.75 0 0 0-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 1 0-1.06 1.061l2.5 2.5a.75.75 0 0 0 1.137-.089l4-5.5Z" clip-rule="evenodd" fill-rule="evenodd" /></svg>
+            </label>
+          {/each}
+        </div>
+      </fieldset>
+    {/if}
+  {:else if step === 1}
+    <h2 class="text-sm/6 font-semibold text-gray-900">Scan the box</h2>
+    <p class="mt-1 text-sm text-gray-500">Drop the VisionMate scan of each rack (up to four). Qiita checks every tube code as they land.</p>
+    <!-- Tailwind UI: feedback / empty states / with dashed border -->
+    <div
+      role="region"
+      aria-label="Drop rack scans"
+      class="mt-4 rounded-lg border-2 border-dashed p-8 text-center transition {dragging ? 'border-teal-500 bg-teal-50' : 'border-gray-300'}"
+      ondragover={(e) => (e.preventDefault(), (dragging = true))}
+      ondragleave={() => (dragging = false)}
+      ondrop={(e) => (e.preventDefault(), (dragging = false), addFiles(e.dataTransfer?.files ?? null))}
+    >
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" class="mx-auto size-10 text-gray-400"><path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5m-13.5-9L12 3m0 0 4.5 4.5M12 3v13.5" /></svg>
+      <p class="mt-2 text-sm font-semibold text-gray-900">
+        {racks.length ? `${racks.length} of 4 racks — drop more, or continue` : 'Drop rack scans here'}
+      </p>
+      <p class="mt-1 text-xs text-gray-500">
+        <label class="cursor-pointer font-medium text-teal-700 hover:text-teal-600">choose files<input type="file" multiple accept=".tsv,.txt" class="hidden" onchange={(e) => addFiles(e.currentTarget.files)} /></label>
+        · <button type="button" class="font-medium text-teal-700 hover:text-teal-600" onclick={loadDemo}>use the demo box</button>
+        · <button type="button" class="font-medium text-teal-700 hover:text-teal-600" onclick={downloadDemoRacks}>download demo scans</button>
+      </p>
+    </div>
+
+    {#if racks.length}
+      <ul role="list" class="mt-4 divide-y divide-gray-100 rounded-md border border-gray-200 text-sm">
+        {#each racks as rack, r}
+          <li class="flex items-center justify-between px-4 py-2">
+            <span><span class="font-medium text-gray-900">{rack.rackId}</span> <span class="text-gray-500">· {rack.tubes.length} tubes</span></span>
+            {#each rack.problems as p}<span class="text-xs text-red-700">{p}</span>{/each}
+            <button type="button" class="text-xs text-gray-400 hover:text-red-600" onclick={() => (racks = racks.filter((_, i) => i !== r))}>Remove</button>
+          </li>
+        {/each}
+      </ul>
+
+      <div class="mt-4">
+        {#if checking}
+          <p class="text-sm text-gray-500">Checking {all.length} tube codes against Qiita…</p>
+        {:else if needFix === 0}
+          <!-- Tailwind UI: feedback / alerts / with description -->
+          <div class="rounded-md bg-green-50 p-4">
+            <h3 class="text-sm font-medium text-green-800">All {all.length} tubes are in Qiita</h3>
+            <p class="mt-2 text-sm text-green-700">
+              {[...byStudy.map((x) => `${x.n} from ${x.s.title}`), ...(blanks.length ? [`${blanks.length} blanks`] : [])].join(' · ')}
             </p>
-            <ul class="divide-y divide-gray-100 rounded-lg border border-gray-200">
-              {#each STUDIES as s}
-                {@const on = expected.includes(s.study_idx)}
-                <li class="flex flex-wrap items-center gap-3 px-3 py-2 text-sm">
-                  <input
-                    type="checkbox"
-                    class="rounded border-gray-300 text-teal-600"
-                    checked={on}
-                    onchange={(e) =>
-                      (expected = e.currentTarget.checked
-                        ? [...expected, s.study_idx]
-                        : expected.filter((x) => x !== s.study_idx))}
-                  />
-                  <span class="size-3 rounded-full" style="background:{STUDY_COLOR[s.study_idx]}"></span>
-                  <span class="font-medium">{s.title}</span>
-                  <span class="text-gray-400">#{s.study_idx}</span>
-                  {#if tubeCoded[s.study_idx]}
-                    <span class="ml-auto text-xs text-teal-700">✓ {s.biosamples} samples, tube codes on {s.withTubes || s.biosamples}</span>
-                  {:else}
-                    <span class="ml-auto flex items-center gap-2 text-xs text-red-700">
-                      {s.biosamples} samples, <strong>no tube codes</strong>
-                      <a class="rounded bg-white px-2 py-0.5 text-gray-700 ring-1 ring-gray-300 hover:bg-gray-50" href="/studies/{s.study_idx}">Add metadata →</a>
-                      <button
-                        type="button"
-                        class="rounded bg-white px-2 py-0.5 text-gray-700 ring-1 ring-gray-300 hover:bg-gray-50"
-                        onclick={() => (tubeCoded = { ...tubeCoded, [s.study_idx]: true })}
-                        title="Mockup: pretend the metadata was loaded">(mock) done</button
-                      >
-                    </span>
-                  {/if}
+          </div>
+        {:else}
+          <div class="rounded-md bg-yellow-50 p-4">
+            <h3 class="text-sm font-medium text-yellow-800">{needFix} of {all.length} tubes need attention before plating</h3>
+            <ul class="mt-2 list-disc space-y-1 pl-5 text-sm text-yellow-700">
+              {#if unknown.length}<li>{unknown.length} aren't in Qiita</li>{/if}
+              {#if multi.length}<li>{multi.length} belong to more than one study</li>{/if}
+              {#if dupes.length}<li>{dupes.length} appear on two racks</li>{/if}
+            </ul>
+            {#if byStudy.length}
+              <p class="mt-2 text-sm text-yellow-700">The rest: {byStudy.map((x) => `${x.n} from ${x.s.title}`).join(' · ')}</p>
+            {/if}
+          </div>
+        {/if}
+      </div>
+    {/if}
+  {:else if step === 2}
+    {#if needFix === 0}
+      <div class="rounded-md bg-green-50 p-4">
+        <h3 class="text-sm font-medium text-green-800">Nothing to fix</h3>
+        <p class="mt-2 text-sm text-green-700">Every tube is a known sample in exactly one study, or a blank.</p>
+      </div>
+    {:else}
+      <h2 class="text-sm/6 font-semibold text-gray-900">Fix what Qiita can't place</h2>
+      <div class="mt-4 space-y-6">
+        {#each unknownRacks as u (u.rack.rackId)}
+          <!-- Tailwind UI: feedback / alerts / with actions -->
+          <div class="rounded-md bg-red-50 p-4">
+            <h3 class="text-sm font-medium text-red-800">{u.n} tubes on {u.rack.rackId} aren't in Qiita</h3>
+            <p class="mt-2 text-sm text-red-700">
+              A whole rack of unknown tubes almost always means its study's sample metadata isn't in Qiita with tube
+              codes yet. Add the tube codes to that study's samples, then check again.
+            </p>
+            <div class="mt-4 -mx-2 -my-1.5 flex flex-wrap gap-1">
+              <button type="button" class="rounded-md bg-red-50 px-2 py-1.5 text-sm font-medium text-red-800 hover:bg-red-100" onclick={() => download(`${u.rack.rackId}-tube-codes.txt`, unknown.filter((x) => racks[x.r].rackId === u.rack.rackId).map((x) => `${x.well}\t${x.tube}`).join('\n'))}>Download the tube codes</button>
+              <a href="/studies" class="rounded-md bg-red-50 px-2 py-1.5 text-sm font-medium text-red-800 hover:bg-red-100">Open studies →</a>
+              <button type="button" class="rounded-md bg-red-50 px-2 py-1.5 text-sm font-medium text-red-800 hover:bg-red-100" onclick={() => ((soilMetadataAdded = true), check())}>(mock) metadata added — check again</button>
+            </div>
+          </div>
+        {/each}
+
+        {#if looseUnknown.length}
+          <section>
+            <h3 class="text-sm font-medium text-gray-900">{looseUnknown.length} stray tubes not in Qiita</h3>
+            <p class="mt-1 text-sm text-gray-500">A mislabelled tube, a sample not yet registered, or a blank.</p>
+            <ul role="list" class="mt-2 divide-y divide-gray-100 rounded-md border border-gray-200 text-sm">
+              {#each looseUnknown as x (x.r + x.well)}
+                <li class="flex flex-wrap items-center gap-3 px-4 py-2">
+                  <span class="font-mono text-xs text-gray-700">{racks[x.r].rackId} {x.well}</span>
+                  <span class="font-mono text-xs text-gray-500">{x.tube}</span>
+                  <span class="ml-auto flex gap-2">
+                    <button type="button" class="rounded-md bg-white px-2.5 py-1 text-xs font-semibold text-gray-900 shadow-xs ring-1 ring-gray-300 ring-inset hover:bg-gray-50" onclick={() => decide(x.r, x.well, { blank: true })}>Blank</button>
+                    <button type="button" class="rounded-md bg-white px-2.5 py-1 text-xs font-semibold text-gray-900 shadow-xs ring-1 ring-gray-300 ring-inset hover:bg-gray-50" onclick={() => decide(x.r, x.well, { exclude: true })}>Leave out</button>
+                  </span>
                 </li>
               {/each}
             </ul>
-          </div>
+          </section>
+        {/if}
 
-          <div>
-            <h4 class="mb-2 text-sm font-medium text-gray-900">Racks (up to four 96-well racks)</h4>
-            <div
-              role="region"
-              aria-label="Drop VisionMate rack files"
-              class="flex flex-col items-center gap-2 rounded-lg border-2 border-dashed px-4 py-6 text-center text-sm transition
-                {dragging ? 'border-teal-500 bg-teal-50' : 'border-gray-300'}"
-              ondragover={(e) => (e.preventDefault(), (dragging = true))}
-              ondragleave={() => (dragging = false)}
-              ondrop={(e) => (e.preventDefault(), (dragging = false), addFiles(e.dataTransfer?.files ?? null))}
-            >
-              <span class="text-gray-700">Drop the VisionMate rack scans (.tsv) here</span>
-              <span class="text-xs text-gray-500">or</span>
-              <span class="flex flex-wrap justify-center gap-2">
-                <label class="cursor-pointer rounded-md bg-white px-3 py-1.5 text-sm ring-1 ring-gray-300 hover:bg-gray-50">
-                  Choose files<input type="file" multiple accept=".tsv,.txt" class="hidden" onchange={(e) => addFiles(e.currentTarget.files)} />
-                </label>
-                <button type="button" class="rounded-md bg-teal-600 px-3 py-1.5 text-sm text-white hover:bg-teal-500" onclick={loadDemo}>Load the demo box</button>
-                <button type="button" class="rounded-md bg-white px-3 py-1.5 text-sm ring-1 ring-gray-300 hover:bg-gray-50" onclick={downloadDemoRacks}>Download demo rack files</button>
-              </span>
-            </div>
-            {#if racks.length}
-              <div class="mt-4 flex flex-wrap gap-4">
-                {#each racks as rack, r}
-                  <div class="space-y-1">
-                    <div class="flex items-center justify-between text-xs text-gray-600">
-                      <span><strong>{rack.rackId}</strong> · {rack.tubes.length} tubes</span>
-                      <button type="button" class="text-gray-400 hover:text-red-600" onclick={() => (racks = racks.filter((_, i) => i !== r))}>remove</button>
-                    </div>
-                    <PlateMap wells={Object.fromEntries(rack.tubes.map((t) => [t.well, { fill: '#64748b', title: `tube ${t.tube}` }]))} />
-                    {#each rack.problems as p}<p class="text-xs text-red-700">{p}</p>{/each}
-                  </div>
-                {/each}
-              </div>
-            {/if}
-          </div>
-        </div>
-      {:else if step === 1}
-        <div class="space-y-4">
-          <div class="flex flex-wrap gap-3 text-xs">
-            {#each STUDIES.filter((s) => expected.includes(s.study_idx)) as s}
-              <span class="flex items-center gap-1"><span class="size-3 rounded-full" style="background:{STUDY_COLOR[s.study_idx]}"></span>{s.title}</span>
-            {/each}
-            <span class="flex items-center gap-1"><span class="size-3 rounded-full bg-gray-400"></span>blank</span>
-            <span class="flex items-center gap-1"><span class="size-3 rounded-full bg-red-200 ring-2 ring-red-500"></span>not in Qiita</span>
-            <span class="flex items-center gap-1"><span class="size-3 rounded-full bg-amber-200 ring-2 ring-amber-500"></span>in two studies</span>
-            <span class="flex items-center gap-1"><span class="size-3 rounded-full bg-orange-200 ring-2 ring-orange-500"></span>tube on two racks</span>
-          </div>
-          <div class="flex flex-wrap gap-4">
-            {#each racks as rack, r}
-              <div class="space-y-1">
-                <div class="text-xs text-gray-600"><strong>{rack.rackId}</strong></div>
-                <PlateMap wells={wellView(r)} selected={picked?.r === r ? picked.well : null} onpick={(w) => (picked = { r, well: w })} />
-                {#if unknownByRack[r] > 40}
-                  <p class="max-w-[22rem] text-xs text-red-700">
-                    {unknownByRack[r]} tubes on this rack match no sample. A whole rack unknown usually means its
-                    study's metadata isn't in Qiita with tube codes yet.
-                  </p>
-                {/if}
-              </div>
-            {/each}
-          </div>
-
-          <div>
-            <h4 class="mb-2 text-sm font-medium text-gray-900">
-              {issues.length ? `${issues.length} well(s) need a decision` : 'Every tube resolved ✓'}
-            </h4>
-            {#if issues.length}
-              <ul class="max-h-80 divide-y divide-gray-100 overflow-y-auto rounded-lg border border-gray-200 text-sm">
-                {#each issues as it (it.r + it.well)}
-                  <li class="flex flex-wrap items-center gap-2 px-3 py-2 {picked?.r === it.r && picked.well === it.well ? 'bg-teal-50' : ''}">
-                    <button type="button" class="font-mono text-xs text-teal-700 hover:underline" onclick={() => (picked = { r: it.r, well: it.well })}>{racks[it.r].rackId} {it.well}</button>
-                    <span class="font-mono text-xs text-gray-500">{it.tube}</span>
-                    {#if it.cell.state === 'unknown'}
-                      <span class="text-red-700">No sample has this tube code.</span>
-                      <span class="ml-auto flex gap-1">
-                        <button type="button" class="rounded px-2 py-0.5 text-xs ring-1 ring-gray-300 hover:bg-gray-50" onclick={() => decide(it.r, it.well, { blank: true })}>It's a blank</button>
-                        <button type="button" class="rounded px-2 py-0.5 text-xs ring-1 ring-gray-300 hover:bg-gray-50" onclick={() => decide(it.r, it.well, { exclude: true })}>Leave out</button>
-                      </span>
-                    {:else if it.cell.state === 'multi'}
-                      {@const c = it.cell}
-                      <span class="text-amber-800">{c.sample} is in {c.studies.length} studies — which one is this prep for?</span>
-                      <span class="ml-auto flex gap-1">
-                        {#each c.studies as sid}
-                          <button type="button" class="rounded px-2 py-0.5 text-xs ring-1 ring-gray-300 hover:bg-gray-50" onclick={() => decide(it.r, it.well, { primary: sid })}>#{sid}</button>
-                        {/each}
-                      </span>
-                    {:else if it.cell.state === 'duplicate'}
-                      <span class="text-orange-800">The same tube is also at {it.cell.other}.</span>
-                      <span class="ml-auto"><button type="button" class="rounded px-2 py-0.5 text-xs ring-1 ring-gray-300 hover:bg-gray-50" onclick={() => decide(it.r, it.well, { exclude: true })}>Leave this well out</button></span>
-                    {/if}
-                  </li>
-                {/each}
-              </ul>
-              <p class="mt-2 text-xs text-gray-500">
-                A tube Qiita doesn't know is fixed in its study (add or correct the sample's tube code), not
-                here; once that's done this list refreshes. Rack SC0004 is the soil study from Intake — mark its
-                metadata done there to see it resolve.
-              </p>
-            {/if}
-          </div>
-        </div>
-      {:else if step === 2}
-        <div class="space-y-4">
-          <p class="text-sm text-gray-700">
-            Blanks are named, registered as samples in their plate's study, and carried through sequencing like
-            any other sample. Wells marked as blanks on the last step are included.
-          </p>
-          <label class="flex flex-col gap-1 text-xs text-gray-600">
-            Blank name pattern
-            <input class="w-72 rounded-md border border-gray-300 px-2.5 py-1.5 font-mono text-sm" bind:value={blankNaming} />
-          </label>
-          <ul class="space-y-1 text-sm">
-            {#each racks as rack, r}
-              <li>
-                <strong>{rack.rackId}</strong>: {blanks[r].length} blank{blanks[r].length === 1 ? '' : 's'}
-                {#if blanks[r].length}
-                  <span class="font-mono text-xs text-gray-500">({blanks[r].join(', ')})</span>
-                {:else}
-                  <span class="text-xs text-amber-700"> — no blank on this plate; is that right?</span>
-                {/if}
-              </li>
-            {/each}
-          </ul>
-        </div>
-      {:else if step === 3}
-        <div class="space-y-4">
-          {#each details as d, i}
-            <div class="rounded-lg border border-gray-200 p-3">
-              <div class="mb-2 flex flex-wrap items-center gap-3">
-                <strong class="text-sm">{racks[i]?.rackId}</strong>
-                <span class="text-xs text-gray-500">studies: {studiesOn(i).map((s) => '#' + s).join(', ') || '—'}</span>
-                <label class="flex items-center gap-1 text-xs text-gray-600">Position
-                  <Select bind:value={d.position} class="w-16">{#each ['1', '2', '3', '4'] as p}<option>{p}</option>{/each}</Select>
-                </label>
-                <label class="flex items-center gap-1 text-xs text-gray-600">Primer plate #
-                  <input class="w-14 rounded-md border border-gray-300 px-2 py-1 text-sm" bind:value={d.primerPlate} />
-                </label>
-                {#if i > 0}<button type="button" class="ml-auto text-xs text-teal-700 hover:underline" onclick={() => copyFromFirst(i)}>Copy processing facts from {racks[0]?.rackId}</button>{/if}
-              </div>
-              <div class="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4">
-                {#each DETAIL_FIELDS as [key, label]}
-                  <label class="flex flex-col gap-0.5 text-[11px] text-gray-600">
-                    {label}
-                    <input class="rounded-md border px-2 py-1 text-sm {d[key].trim() ? 'border-gray-300' : 'border-red-400 bg-red-50'}" bind:value={d[key]} />
-                  </label>
-                {/each}
-              </div>
-              {#each messages[i] ?? [] as m}
-                <p class="mt-1 text-xs {m.level === 'error' ? 'text-red-700' : 'text-amber-700'}">{m.level === 'error' ? '✕' : '!'} {m.text}</p>
+        {#if multi.length}
+          <section>
+            <h3 class="text-sm font-medium text-gray-900">{multi.length} in more than one study</h3>
+            <p class="mt-1 text-sm text-gray-500">Which study is this prep for?</p>
+            <ul role="list" class="mt-2 divide-y divide-gray-100 rounded-md border border-gray-200 text-sm">
+              {#each multi as x (x.r + x.well)}
+                {@const c = x.cell as { sample: string; studies: number[] }}
+                <li class="flex flex-wrap items-center gap-3 px-4 py-2">
+                  <span class="font-mono text-xs text-gray-700">{racks[x.r].rackId} {x.well}</span>
+                  <span class="text-gray-700">{c.sample}</span>
+                  <span class="ml-auto flex gap-2">
+                    {#each c.studies as sid}
+                      <button type="button" class="rounded-md bg-white px-2.5 py-1 text-xs font-semibold text-gray-900 shadow-xs ring-1 ring-gray-300 ring-inset hover:bg-gray-50" onclick={() => decide(x.r, x.well, { primary: sid })}>{studyName(sid)}</button>
+                    {/each}
+                  </span>
+                </li>
               {/each}
-            </div>
-          {/each}
-        </div>
-      {:else if step === 4}
-        <div class="flex flex-wrap gap-6">
-          <div class="space-y-2">
-            <PlateMap format={384} wells={view384} selected={picked384} onpick={(w) => (picked384 = w)} />
-            <div class="flex flex-wrap gap-3 text-xs">
-              {#each details as d, i}
-                <span class="flex items-center gap-1"><span class="size-3 rounded-full" style="background:{QUADRANT[Number(d.position) - 1]}"></span>{racks[i]?.rackId} → position {d.position}, primer plate {d.primerPlate}</span>
-              {/each}
-            </div>
-          </div>
-          <div class="min-w-64 flex-1 space-y-2 text-sm">
-            <p class="text-gray-700">{placed.length} wells placed in the interleaved 4-quadrant layout.</p>
-            <p class={barcodeClashes ? 'text-red-700' : 'text-teal-700'}>
-              {barcodeClashes ? `${barcodeClashes} wells share a Golay barcode` : '✓ Every well has its own Golay barcode'}
-            </p>
-            {#if pick384}
-              <dl class="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 rounded-lg border border-gray-200 p-3 text-xs">
-                <dt class="text-gray-500">384 well</dt><dd class="font-mono">{pick384.well384}</dd>
-                <dt class="text-gray-500">From</dt><dd class="font-mono">{racks[pick384.r].rackId} {pick384.well96}</dd>
-                <dt class="text-gray-500">Sample</dt><dd>{pick384.cell.state === 'sample' ? `${pick384.cell.sample} (${pick384.cell.qb})` : 'blank'}</dd>
-                <dt class="text-gray-500">Tube</dt><dd class="font-mono">{pick384.tube}</dd>
-                <dt class="text-gray-500">Golay</dt><dd class="font-mono">{pick384.barcode}</dd>
-              </dl>
-            {:else}
-              <p class="text-xs text-gray-500">Click a well to see what's in it.</p>
-            {/if}
-          </div>
-        </div>
-      {:else if step === 5}
-        <div class="space-y-4">
-          <table class="min-w-full divide-y divide-gray-200 text-sm">
-            <thead class="bg-gray-50 text-xs text-gray-500 uppercase"><tr><th class="px-3 py-2 text-left">Study</th><th class="px-3 py-2 text-left">Samples in this prep</th></tr></thead>
-            <tbody class="divide-y divide-gray-100">
-              {#each perStudy as x}
-                <tr><td class="px-3 py-2"><span class="mr-2 inline-block size-3 rounded-full align-middle" style="background:{STUDY_COLOR[x.s.study_idx]}"></span>{x.s.title} <span class="text-gray-400">#{x.s.study_idx}</span></td><td class="px-3 py-2">{x.samples}</td></tr>
-              {/each}
-              <tr><td class="px-3 py-2 text-gray-600">Blanks (registered in their plate's study)</td><td class="px-3 py-2">{blanks.flat().length}</td></tr>
-            </tbody>
-          </table>
-          <div class="rounded-lg bg-gray-50 p-3 text-xs text-gray-600">
-            <p class="mb-1 font-medium text-gray-700">Registering will:</p>
-            <ul class="list-disc space-y-0.5 pl-5">
-              <li>register the {blanks.flat().length} blanks as samples in their plate's study</li>
-              <li>store the prep's pre-flight (plates, wells, barcodes, processing facts) in Qiita</li>
-              <li>link every sample to the study it was resolved to</li>
             </ul>
-          </div>
-          <div class="flex flex-wrap gap-2">
-            <button type="button" class="rounded-md bg-teal-600 px-3 py-1.5 text-sm text-white hover:bg-teal-500 disabled:opacity-50" disabled={!!registered} onclick={() => (registered = 'PREP-0042')}>
-              {registered ? `Registered as ${registered}` : 'Register prep'}
-            </button>
-            <button type="button" class="rounded-md bg-white px-3 py-1.5 text-sm ring-1 ring-gray-300 hover:bg-gray-50" onclick={downloadPrePrep}>Download pre-prep file (.txt)</button>
-          </div>
-        </div>
-      {:else if step === 6}
-        <div class="space-y-4">
-          <p class="text-sm text-gray-700">When the MiSeq run has finished and its folder is on the ingest roots:</p>
-          <div class="flex flex-wrap items-end gap-3">
-            <label class="flex flex-col gap-1 text-xs text-gray-600">Run folder
-              <Select bind:value={runFolder} class="w-[26rem]">
-                {#each RUN_FOLDERS as f}<option value={f.id}>{f.id} · {f.instrument} · {f.cycles}</option>{/each}
-              </Select>
-            </label>
-            <label class="flex flex-col gap-1 text-xs text-gray-600">Trim (nt)
-              <input type="number" class="w-20 rounded-md border border-gray-300 px-2 py-1.5 text-sm" bind:value={trim} />
-            </label>
-            <button type="button" class="rounded-md bg-teal-600 px-3 py-1.5 text-sm text-white hover:bg-teal-500 disabled:opacity-50" disabled={!!started} onclick={() => (started = { demux: '#101', amplicon: '#102' })}>
-              Start demux → amplicon
-            </button>
-          </div>
-          {#if started}
-            <ol class="space-y-2 text-sm">
-              <li class="flex items-center gap-2"><span class="size-2 rounded-full bg-blue-500"></span>golay-demux {started.demux} — queued (splits the run by Golay barcode into {placed.length} samples)</li>
-              <li class="flex items-center gap-2"><span class="size-2 rounded-full bg-gray-300"></span>amplicon {started.amplicon} — starts when demux completes (trim {trim}, deblur → ASVs → feature table)</li>
-            </ol>
-            <p class="text-xs text-gray-500">Both appear under Jobs, and the studies' lineage shows the new reads and ASVs as they land.</p>
-          {/if}
-        </div>
-      {/if}
+          </section>
+        {/if}
 
-      <div class="mt-6 flex items-center justify-between border-t border-gray-200 pt-4">
-        <button type="button" class="rounded-md px-3 py-1.5 text-sm text-gray-600 ring-1 ring-gray-300 hover:bg-gray-50 disabled:opacity-40" disabled={step === 0} onclick={() => go(step - 1)}>← Back</button>
-        <span class="text-xs text-red-700">{blockers[step].join(' · ')}</span>
-        {#if step < STEPS.length - 1}
-          <button type="button" class="rounded-md bg-teal-700 px-4 py-1.5 text-sm font-medium text-white hover:bg-teal-600 disabled:opacity-40" disabled={blockers[step].length > 0} onclick={() => go(step + 1)}>Next: {STEPS[step + 1].title} →</button>
+        {#if dupes.length}
+          <section>
+            <h3 class="text-sm font-medium text-gray-900">{dupes.length / 2} tube{dupes.length === 2 ? '' : 's'} on two racks</h3>
+            <p class="mt-1 text-sm text-gray-500">A tube can only be in one well. Keep one, leave the other out.</p>
+            <ul role="list" class="mt-2 divide-y divide-gray-100 rounded-md border border-gray-200 text-sm">
+              {#each dupes as x (x.r + x.well)}
+                <li class="flex flex-wrap items-center gap-3 px-4 py-2">
+                  <span class="font-mono text-xs text-gray-700">{racks[x.r].rackId} {x.well}</span>
+                  <span class="font-mono text-xs text-gray-500">{x.tube}</span>
+                  <span class="ml-auto"><button type="button" class="rounded-md bg-white px-2.5 py-1 text-xs font-semibold text-gray-900 shadow-xs ring-1 ring-gray-300 ring-inset hover:bg-gray-50" onclick={() => decide(x.r, x.well, { exclude: true })}>Leave this one out</button></span>
+                </li>
+              {/each}
+            </ul>
+          </section>
         {/if}
       </div>
-    </Card>
-
-    <Card title="Where this step runs">
-      <div class="grid grid-cols-1 gap-4 text-xs sm:grid-cols-2">
-        <div>
-          <p class="mb-1 font-medium text-gray-700">Browser</p>
-          <ul class="list-disc space-y-0.5 pl-4 text-gray-600">{#each WHERE[step].client as c}<li>{c}</li>{/each}</ul>
+    {/if}
+  {:else if step === 3}
+    <h2 class="text-sm/6 font-semibold text-gray-900">Lay out the plates</h2>
+    <p class="mt-1 text-sm text-gray-500">The four positions of the 384-well plate. Click a well to mark or unmark it as a blank.</p>
+    <div class="mt-4 grid grid-cols-1 gap-6 xl:grid-cols-2">
+      {#each [0, 1, 2, 3] as i}
+        <div class="rounded-lg border border-gray-200 p-3">
+          <div class="mb-2 flex flex-wrap items-center gap-3 text-sm">
+            <span class="font-semibold text-gray-900">Position {i + 1}</span>
+            <select aria-label="Rack at position {i + 1}" class="rounded-md border-0 py-1 pr-8 pl-2 text-sm ring-1 ring-gray-300 ring-inset" bind:value={rackAt[i]}>
+              <option value={null}>— empty —</option>
+              {#each racks as rack, r}<option value={r}>{rack.rackId}</option>{/each}
+            </select>
+            <label class="ml-auto flex items-center gap-2 text-xs text-gray-600">Primer plate
+              <select class="rounded-md border-0 py-1 pr-8 pl-2 text-sm ring-1 ring-gray-300 ring-inset" bind:value={primerAt[i]}>
+                {#each Array.from({ length: 10 }, (_, k) => String(k + 1)) as n}<option>{n}</option>{/each}
+              </select>
+            </label>
+          </div>
+          <PlateMap wells={wellsOf(rackAt[i])} onpick={(w) => rackAt[i] !== null && toggleBlank(rackAt[i]!, w)} />
+          {#if rackAt[i] !== null}
+            <p class="mt-1 text-xs {blanksOn(rackAt[i]!) ? 'text-gray-500' : 'text-amber-700'}">
+              {blanksOn(rackAt[i]!) ? `${blanksOn(rackAt[i]!)} blanks` : 'No blank on this plate — is that right?'}
+            </p>
+          {/if}
         </div>
+      {/each}
+    </div>
+    <div class="mt-4 flex flex-wrap gap-4 text-xs text-gray-600">
+      {#each byStudy as x}<span class="flex items-center gap-1"><span class="size-3 rounded-full" style="background:{STUDY_COLOR[x.s.study_idx]}"></span>{x.s.title}</span>{/each}
+      <span class="flex items-center gap-1"><span class="size-3 rounded-full bg-gray-400"></span>blank</span>
+    </div>
+    {#if layoutProblems.length}<p class="mt-3 text-sm text-red-700">{layoutProblems.join(' · ')}</p>{/if}
+  {:else if step === 4}
+    <h2 class="text-sm/6 font-semibold text-gray-900">Processing details</h2>
+    <p class="mt-1 text-sm text-gray-500">Recorded with every sample. Write "not applicable" for anything that doesn't apply.</p>
+    <div class="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+      {#each SHARED as [key, label]}
         <div>
-          <p class="mb-1 font-medium text-gray-700">Server (Qiita-miint)</p>
-          <ul class="list-disc space-y-0.5 pl-4 text-gray-600">{#each WHERE[step].server as c}<li>{c}</li>{/each}</ul>
+          <label for="f-{key}" class="block text-sm/6 font-medium text-gray-900">{label}</label>
+          <input id="f-{key}" class="mt-1 block w-full rounded-md bg-white px-3 py-1.5 text-sm text-gray-900 outline-1 -outline-offset-1 {shared[key].trim() ? 'outline-gray-300' : 'outline-red-300'} focus:outline-2 focus:-outline-offset-2 focus:outline-teal-600" bind:value={shared[key]} />
         </div>
+      {/each}
+    </div>
+    <h3 class="mt-8 text-sm font-medium text-gray-900">Plate names</h3>
+    <div class="mt-2 grid grid-cols-2 gap-4 lg:grid-cols-4">
+      {#each rackAt as r, i}
+        {#if r !== null}
+          <div>
+            <label for="p-{i}" class="block text-xs text-gray-600">Position {i + 1} · {racks[r]?.rackId}</label>
+            <input id="p-{i}" class="mt-1 block w-full rounded-md bg-white px-3 py-1.5 text-sm outline-1 -outline-offset-1 outline-gray-300 focus:outline-2 focus:outline-teal-600" bind:value={platesNamed[i]} />
+          </div>
+        {/if}
+      {/each}
+    </div>
+    {#if detailErrors.length || detailWarnings.length}
+      <ul class="mt-4 space-y-1 text-sm">
+        {#each detailErrors as t}<li class="text-red-700">{t}</li>{/each}
+        {#each detailWarnings as t}<li class="text-amber-700">{t}</li>{/each}
+      </ul>
+    {/if}
+  {:else if step === 5}
+    <h2 class="text-sm/6 font-semibold text-gray-900">Register the prep</h2>
+    <!-- Tailwind UI: data display / stats -->
+    <dl class="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-4">
+      {#each byStudy as x}
+        <div class="overflow-hidden rounded-lg bg-gray-50 px-4 py-4">
+          <dt class="truncate text-sm text-gray-500">{x.s.title}</dt>
+          <dd class="mt-1 text-2xl font-semibold text-gray-900">{x.n}</dd>
+        </div>
+      {/each}
+      <div class="overflow-hidden rounded-lg bg-gray-50 px-4 py-4">
+        <dt class="truncate text-sm text-gray-500">Blanks</dt>
+        <dd class="mt-1 text-2xl font-semibold text-gray-900">{blanks.length}</dd>
       </div>
-    </Card>
+    </dl>
+    <p class="mt-4 text-sm {clashes ? 'text-red-700' : 'text-gray-600'}">
+      {clashes ? `${clashes} wells share a barcode` : `${placedWells.length} wells, each with its own EMP Golay barcode.`}
+    </p>
+    <p class="mt-1 text-sm text-gray-600">Registering adds the blanks as samples in their plate's study and stores the plates, barcodes and processing details with Qiita.</p>
+    <div class="mt-6 flex flex-wrap gap-3">
+      <button type="button" class="rounded-md bg-teal-600 px-3 py-2 text-sm font-semibold text-white shadow-xs hover:bg-teal-500 disabled:opacity-50" disabled={!!registered || clashes > 0} onclick={() => (registered = 'PREP-0042')}>
+        {registered ? `Registered as ${registered}` : 'Register prep'}
+      </button>
+      {#if registered}
+        <button type="button" class="rounded-md bg-white px-3 py-2 text-sm font-semibold text-gray-900 shadow-xs ring-1 ring-gray-300 ring-inset hover:bg-gray-50" onclick={downloadPrePrep}>Download pre-prep file</button>
+      {/if}
+    </div>
+  {:else if step === 6}
+    <h2 class="text-sm/6 font-semibold text-gray-900">Sequence</h2>
+    <p class="mt-1 text-sm text-gray-500">When the run has finished, pick its folder.</p>
+    <fieldset class="mt-4 space-y-2">
+      {#each RUN_FOLDERS as f}
+        <label class="flex items-center gap-3 rounded-md border border-gray-200 px-4 py-2 text-sm has-checked:border-teal-600 has-checked:bg-teal-50">
+          <input type="radio" name="run" value={f.id} bind:group={runFolder} class="size-4 accent-teal-600" />
+          <span class="font-mono text-xs text-gray-900">{f.id}</span>
+          <span class="ml-auto text-xs text-gray-500">{f.instrument} · {f.cycles} · {f.when}</span>
+        </label>
+      {/each}
+    </fieldset>
+    {#if runFolder}
+      <div class="mt-6">
+        {#if !started}
+          <button type="button" class="rounded-md bg-teal-600 px-3 py-2 text-sm font-semibold text-white shadow-xs hover:bg-teal-500" onclick={() => (started = true)}>Start demux → amplicon</button>
+        {:else}
+          <ol class="space-y-2 text-sm">
+            <li class="flex items-center gap-2"><span class="size-2 rounded-full bg-blue-500"></span>golay-demux — queued: split the run into {placedWells.length} samples</li>
+            <li class="flex items-center gap-2"><span class="size-2 rounded-full bg-gray-300"></span>amplicon — starts when demux completes (trim 150, deblur → ASVs → feature table)</li>
+          </ol>
+        {/if}
+      </div>
+    {/if}
+  {/if}
+
+  <div class="mt-8 flex items-center justify-between border-t border-gray-100 pt-4">
+    <button type="button" class="rounded-md bg-white px-3 py-2 text-sm font-semibold text-gray-900 shadow-xs ring-1 ring-gray-300 ring-inset hover:bg-gray-50 disabled:invisible" disabled={step === 0} onclick={() => go(step - 1)}>Back</button>
+    {#if step < STEPS.length - 1}
+      <button type="button" class="rounded-md bg-teal-600 px-3 py-2 text-sm font-semibold text-white shadow-xs hover:bg-teal-500 disabled:opacity-40" disabled={!canLeave[step]} onclick={() => go(nextStep)}>
+        Next: {STEPS[nextStep]}
+      </button>
+    {/if}
   </div>
 </div>
+
+<details class="mt-4 text-xs text-gray-500">
+  <summary class="cursor-pointer">Where this step runs</summary>
+  <p class="mt-2"><span class="font-medium text-gray-700">Browser:</span> {WHERE[step].client}</p>
+  <p class="mt-1"><span class="font-medium text-gray-700">Server:</span> {WHERE[step].server}</p>
+</details>
