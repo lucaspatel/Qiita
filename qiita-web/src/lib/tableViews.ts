@@ -1,25 +1,25 @@
-// Feature-table views: a feature table read a different way (today, filtered to a
-// reference's ASVs) that the server computes on each read and never stores. The
+// Feature-table views: a feature table read a different way (today, filtered to the
+// ASVs Greengenes2 places) that the server computes on each read and never stores. The
 // lineage draws each as a dashed node off the table it reads, and keeps the list in
 // this browser so a view survives a reload.
 //
 // A convenience, like the plot prefs: storage can be absent or throw, and anything
-// malformed is dropped. A view naming a reference that is gone fails its read with
-// the server's refusal, shown on the node's panel.
+// malformed is dropped. A view the server can no longer answer (its filter not
+// configured there) fails its read with the server's refusal, shown on its panel.
 import { scopedKey } from './environment';
 import type { LineageGroup, LineageNode } from './api';
 
 export type TableView = {
   /** The lineage node id the view reads (a product node's). */
   from: string;
-  /** The reference whose ASVs the table is filtered to, and its display name. */
-  filterReferenceIdx: number;
+  /** The server-side filter the view reads the table through, and its name. */
+  filter: 'greengenes2';
   label: string;
 };
 
 const VIEW_PREFIX = 'view:';
 export const isViewId = (id: string) => id.startsWith(VIEW_PREFIX);
-export const viewId = (v: TableView) => `${VIEW_PREFIX}${v.from}@${v.filterReferenceIdx}`;
+export const viewId = (v: TableView) => `${VIEW_PREFIX}${v.from}@${v.filter}`;
 
 const key = (studyIdx: number, protocol: string) =>
   scopedKey(`qiita-web:table-views:${studyIdx}:${protocol}`);
@@ -30,9 +30,7 @@ const wellFormed = (v: unknown): v is TableView => {
     !!o &&
     typeof o.from === 'string' &&
     typeof o.label === 'string' &&
-    typeof o.filterReferenceIdx === 'number' &&
-    Number.isInteger(o.filterReferenceIdx) &&
-    o.filterReferenceIdx > 0
+    o.filter === 'greengenes2'
   );
 };
 

@@ -8,7 +8,7 @@ import type { Component } from 'svelte';
 import type { LineageGroup, LineageNode, LineageSample } from './api';
 import { isViewId, type TableView } from './tableViews';
 import SylphProfileForm from './ui/SylphProfileForm.svelte';
-import ReferenceFilterForm from './ui/ReferenceFilterForm.svelte';
+import Greengenes2FilterForm from './ui/Greengenes2FilterForm.svelte';
 
 export type WorkflowFormProps = {
   /** The node's group's samples. */
@@ -41,7 +41,8 @@ const metagenomicReads = (n: LineageNode, g: LineageGroup) =>
   n.kind === 'reads' && METAGENOMIC_PROTOCOLS.includes(g.prep_protocol);
 // A sample whose reads landed (the profiler streams stored reads).
 const hasReads = (s: LineageSample, n: LineageNode) => s.cells[n.id]?.state === 'completed';
-// An amplicon run's own feature table (not a view of one).
+// A rapid-16S amplicon run's own feature table (not a view of one): V4 deblur
+// ASVs, the only ones Greengenes2 places.
 const ampliconTable = (n: LineageNode, g: LineageGroup) =>
   n.kind === 'product' && !isViewId(n.id) && g.prep_protocol.includes('amplicon');
 
@@ -61,10 +62,10 @@ export const NODE_WORKFLOWS: NodeWorkflow[] = [
     takes: hasReads
   },
   {
-    id: 'filter-to-reference',
-    label: 'Filter to reference ASVs (Greengenes2)',
+    id: 'filter-to-greengenes2',
+    label: 'Filter to Greengenes2',
     appliesTo: ampliconTable,
-    form: ReferenceFilterForm
+    form: Greengenes2FilterForm
   }
 ];
 

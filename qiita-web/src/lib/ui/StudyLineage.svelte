@@ -103,7 +103,7 @@
         {
           processing_idx: [from.processing_idx],
           study_idx: studyIdx,
-          filter_reference_idx: view.filterReferenceIdx
+          feature_filter: view.filter
         },
         key
       );
@@ -122,7 +122,7 @@
     const request: FeatureTableRequest = { processing_idx: [n.processing_idx], study_idx: studyIdx };
     if (!isViewId(n.id)) return { key: String(n.processing_idx), request };
     const v = (viewsFor[g.prep_protocol] ?? []).find((x) => viewId(x) === n.id);
-    return v ? { key: n.id, request: { ...request, filter_reference_idx: v.filterReferenceIdx } } : null;
+    return v ? { key: n.id, request: { ...request, feature_filter: v.filter } } : null;
   }
 
   function toggleChosen(g: LineageGroup, idxs: number[], on: boolean) {
@@ -396,7 +396,7 @@
     // Only a filtered view drops empty samples; an unfiltered table with one is a
     // fault the worker reports.
     const { table: data, dropped } =
-      request.filter_reference_idx != null ? dropEmptySamples(loaded.data) : { table: loaded.data, dropped: [] };
+      request.feature_filter != null ? dropEmptySamples(loaded.data) : { table: loaded.data, dropped: [] };
     const table = { ok: true as const, data };
     try {
       let pcoa = await pyworker.pcoa(table.data);
@@ -807,7 +807,7 @@
                     {#if pc.dropped.length}
                       <p class="px-4 pt-1 text-xs text-gray-500 sm:px-6">
                         {pc.dropped.length} sample{pc.dropped.length === 1 ? ' has' : 's have'} none of
-                        the reference's ASVs and {pc.dropped.length === 1 ? 'is' : 'are'} left out of the plot.
+                        the filter's ASVs and {pc.dropped.length === 1 ? 'is' : 'are'} left out of the plot.
                       </p>
                     {/if}
                     <PcoaPlot
