@@ -55,9 +55,9 @@
   });
   let protocol = $state<string | null>(null);
   const TARGETS = [
-    { id: '16S', label: '16S rRNA (V4)', note: '515F / 806R, EMP Golay barcodes', enabled: true },
-    { id: '18S', label: '18S rRNA', note: 'not yet', enabled: false },
-    { id: 'ITS', label: 'ITS', note: 'not yet', enabled: false }
+    { id: '16S', label: '16S V4 · 515fbc / 806r (EMP Golay)', enabled: true },
+    { id: '18S', label: '18S · 1391f / EukBr', enabled: false },
+    { id: 'ITS', label: 'ITS · ITS1f / ITS2', enabled: false }
   ];
   let target = $state<string | null>(null);
   const pretty = (s: string) => s.replaceAll('_', ' ').replace(/^./, (c) => c.toUpperCase());
@@ -335,13 +335,13 @@
             <span class="flex size-8 shrink-0 items-center justify-center rounded-full bg-teal-600 group-hover:bg-teal-800">
               <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" class="size-5 text-white"><path d="M19.916 4.626a.75.75 0 0 1 .208 1.04l-9 13.5a.75.75 0 0 1-1.154.114l-6-6a.75.75 0 0 1 1.06-1.06l5.353 5.353 8.493-12.74a.75.75 0 0 1 1.04-.207Z" clip-rule="evenodd" fill-rule="evenodd" /></svg>
             </span>
-            <span class="ml-3 text-gray-900">{label}</span>
+            <span class="ml-3 whitespace-nowrap text-gray-900">{label}</span>
           {:else if i === step}
             <span class="flex size-8 shrink-0 items-center justify-center rounded-full border-2 border-teal-600 text-teal-600">{i + 1}</span>
-            <span class="ml-3 text-teal-700">{label}</span>
+            <span class="ml-3 whitespace-nowrap text-teal-700">{label}</span>
           {:else}
             <span class="flex size-8 shrink-0 items-center justify-center rounded-full border-2 border-gray-300 text-gray-500">{i + 1}</span>
-            <span class="ml-3 text-gray-500">{label}</span>
+            <span class="ml-3 whitespace-nowrap text-gray-500">{label}</span>
           {/if}
         </button>
         {#if i < STEPS.length - 1}
@@ -356,41 +356,37 @@
 
 <div class="rounded-lg bg-white px-4 py-5 shadow-sm ring-1 ring-gray-900/5 sm:p-6">
   {#if step === 0}
-    <!-- Tailwind UI: forms / select menus / simple native -->
-    <label for="protocol" class="block text-sm/6 font-semibold text-gray-900">Prep protocol</label>
-    <div class="mt-2 grid max-w-md grid-cols-1">
-      <select
-        id="protocol"
-        bind:value={protocol}
-        class="col-start-1 row-start-1 w-full appearance-none rounded-md bg-white py-1.5 pr-8 pl-3 text-base text-gray-900 outline-1 -outline-offset-1 outline-gray-300 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-teal-600 sm:text-sm/6"
-      >
-        <option value={null} disabled>Choose a prep protocol…</option>
-        {#each protocols as p (p)}
-          <option value={p} disabled={p !== SUPPORTED_PROTOCOL}>
-            {pretty(p)}{p !== SUPPORTED_PROTOCOL ? ' — not in this flow yet' : ''}
-          </option>
-        {/each}
-      </select>
-      <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" class="pointer-events-none col-start-1 row-start-1 mr-2 size-5 self-center justify-self-end text-gray-500 sm:size-4"><path d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" fill-rule="evenodd" /></svg>
-    </div>
-    {#if protocol}
-      <!-- Tailwind UI: forms / radio groups / cards -->
-      <fieldset class="mt-8">
-        <legend class="text-sm/6 font-semibold text-gray-900">Target</legend>
-        <div class="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
-          {#each TARGETS as t (t.id)}
-            <label class="group relative flex rounded-lg border border-gray-300 bg-white p-4 has-checked:outline-2 has-checked:-outline-offset-2 has-checked:outline-teal-600 has-disabled:bg-gray-50 has-disabled:opacity-50">
-              <input type="radio" name="target" value={t.id} disabled={!t.enabled} bind:group={target} class="absolute inset-0 appearance-none focus:outline-none" />
-              <span class="flex-1">
-                <span class="block text-sm font-medium text-gray-900">{t.label}</span>
-                <span class="mt-1 block text-xs text-gray-500">{t.note}</span>
-              </span>
-              <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true" class="invisible size-5 text-teal-600 group-has-checked:visible"><path d="M10 18a8 8 0 1 0 0-16 8 8 0 0 0 0 16Zm3.857-9.809a.75.75 0 0 0-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 1 0-1.06 1.061l2.5 2.5a.75.75 0 0 0 1.137-.089l4-5.5Z" clip-rule="evenodd" fill-rule="evenodd" /></svg>
-            </label>
-          {/each}
+    <!-- Tailwind UI: forms / select menus / simple native, side by side -->
+    <div class="grid max-w-3xl grid-cols-1 gap-4 sm:grid-cols-2">
+      <div>
+        <label for="protocol" class="block text-sm/6 font-semibold text-gray-900">Prep protocol</label>
+        <div class="mt-2 grid grid-cols-1">
+          <select id="protocol" bind:value={protocol} class="col-start-1 row-start-1 w-full appearance-none rounded-md bg-white py-1.5 pr-8 pl-3 text-base text-gray-900 outline-1 -outline-offset-1 outline-gray-300 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-teal-600 sm:text-sm/6">
+            <option value={null} disabled>Choose a prep protocol…</option>
+            {#each protocols as p (p)}
+              <option value={p} disabled={p !== SUPPORTED_PROTOCOL}>
+                {pretty(p)}{p !== SUPPORTED_PROTOCOL ? ' — not in this flow yet' : ''}
+              </option>
+            {/each}
+          </select>
+          <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" class="pointer-events-none col-start-1 row-start-1 mr-2 size-5 self-center justify-self-end text-gray-500 sm:size-4"><path d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" fill-rule="evenodd" /></svg>
         </div>
-      </fieldset>
-    {/if}
+      </div>
+      {#if protocol}
+        <div>
+          <label for="primers" class="block text-sm/6 font-semibold text-gray-900">Primers</label>
+          <div class="mt-2 grid grid-cols-1">
+            <select id="primers" bind:value={target} class="col-start-1 row-start-1 w-full appearance-none rounded-md bg-white py-1.5 pr-8 pl-3 text-base text-gray-900 outline-1 -outline-offset-1 outline-gray-300 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-teal-600 sm:text-sm/6">
+              <option value={null} disabled>Choose primers…</option>
+              {#each TARGETS as t (t.id)}
+                <option value={t.id} disabled={!t.enabled}>{t.label}{t.enabled ? '' : ' — not yet'}</option>
+              {/each}
+            </select>
+            <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" class="pointer-events-none col-start-1 row-start-1 mr-2 size-5 self-center justify-self-end text-gray-500 sm:size-4"><path d="M4.22 6.22a.75.75 0 0 1 1.06 0L8 8.94l2.72-2.72a.75.75 0 1 1 1.06 1.06l-3.25 3.25a.75.75 0 0 1-1.06 0L4.22 7.28a.75.75 0 0 1 0-1.06Z" clip-rule="evenodd" fill-rule="evenodd" /></svg>
+          </div>
+        </div>
+      {/if}
+    </div>
   {:else if step === 1}
     <h2 class="text-sm/6 font-semibold text-gray-900">Scan the box</h2>
     <p class="mt-1 text-sm text-gray-500">Drop the VisionMate scan of each rack (up to four). Every tube code is checked against Qiita-miint as they land.</p>
