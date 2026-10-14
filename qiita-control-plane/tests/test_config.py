@@ -450,3 +450,21 @@ def test_settings_deployment_name_malformed_fails_boot(monkeypatch, bad):
 
     with pytest.raises(RuntimeError, match="QIITA_DEPLOYMENT_NAME"):
         Settings.from_env()
+
+
+def test_settings_greengenes2_path_is_optional_and_checked(monkeypatch, tmp_path):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost:5432/db")
+    from qiita_control_plane.config import Settings
+
+    monkeypatch.delenv("GREENGENES2_ASV_TAXONOMY_PATH", raising=False)
+    assert Settings.from_env().greengenes2_asv_taxonomy_path is None
+
+    path = tmp_path / "gg2.parquet"
+    path.write_bytes(b"PAR1")
+    monkeypatch.setenv("GREENGENES2_ASV_TAXONOMY_PATH", str(path))
+    assert Settings.from_env().greengenes2_asv_taxonomy_path == path
+
+    for bad in ("gg2.parquet", str(tmp_path / "missing.parquet"), str(tmp_path)):
+        monkeypatch.setenv("GREENGENES2_ASV_TAXONOMY_PATH", bad)
+        with pytest.raises(RuntimeError, match="GREENGENES2_ASV_TAXONOMY_PATH"):
+            Settings.from_env()

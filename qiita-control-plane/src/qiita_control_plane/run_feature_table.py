@@ -52,10 +52,11 @@ from qiita_common.taxonomic_profile_constants import TAXONOMIC_PROFILE_TABLE
 from qiita_common.taxonomy import (
     RANK_COLUMNS,
     TAXONOMY_SOURCE_TABLE,
-    prefixed_rank_columns_sql,
     quote_rank,
+    rank_columns_sql,
 )
 
+from . import greengenes2
 from .auth.tickets import sign_ticket
 from .repositories.exported_feature import mint_exported_features
 from .repositories.reference_membership import GENOME_MAP_PAIRS_SQL
@@ -127,8 +128,9 @@ _NAME = pa.dictionary(pa.int32(), pa.string())
 VALUES_SCHEMA = pa.schema([("sample", _NAME), ("feature", _NAME), ("value", pa.float64())])
 # `sequence` and `length` are null for a method whose features are not sequences;
 # the eight ranks are a genome's, from its reference's taxonomy with the source
-# prefixes restored (the alignment taxonomy sidecar's columns), or a filtered ASV's
-# from the filter reference's; null for an unfiltered ASV and an unclassified one.
+# prefixes restored (the alignment taxonomy sidecar's columns), or a Greengenes2-
+# filtered ASV's from its lineage; null for an unfiltered ASV and an unclassified
+# genome.
 FEATURES_SCHEMA = pa.schema(
     [
         ("feature", pa.string()),
@@ -164,8 +166,8 @@ class Cohort:
     # The reference whose genomes a genome-keyed table's features are (one, by the
     # merge keys); None for amplicon runs.
     reference_idx: int | None = None
-    # The reference an amplicon table is filtered to, when the request names one.
-    filter_reference_idx: int | None = None
+    # The read-time filter the request names (`greengenes2`), if any.
+    feature_filter: str | None = None
 
     @property
     def prep_sample_idxs(self) -> list[int]:
@@ -204,26 +206,6 @@ def _source_of(runs: list[int], found: dict[int, asyncpg.Record]) -> tuple[Sourc
     return source, _params(found[runs[0]])
 
 
-async def _check_filter_reference(pool: asyncpg.Pool, source: Source, reference_idx: int) -> None:
-    """Refuse a filter a table can't take: only ASV-keyed tables filter to a
-    reference's members, and only to an active sequence reference."""
-    if source.feature_key != "feature_idx":
-        raise CohortError(
-            409, f"a {source.method} table's features are genomes; only ASVs filter to a reference"
-        )
-    row = await pool.fetchrow(
-        "SELECT kind, status FROM qiita.reference WHERE reference_idx = $1", reference_idx
-    )
-    if row is None:
-        raise CohortError(404, f"no reference {reference_idx}")
-    if row["kind"] != "sequence_reference" or row["status"] != "active":
-        raise CohortError(
-            409,
-            f"reference {reference_idx} is a {row['status']} {row['kind']!r},"
-            " not an active sequence_reference",
-        )
-
-
 async def resolve_cohort(pool: asyncpg.Pool, request: FeatureTableRequest) -> Cohort:
     """The processed samples `request` names, each with its column name.
 
@@ -240,8 +222,12 @@ async def resolve_cohort(pool: asyncpg.Pool, request: FeatureTableRequest) -> Co
         runs,
     )
     source, params = _source_of(runs, {r["processing_idx"]: r for r in rows})
-    if request.filter_reference_idx is not None:
-        await _check_filter_reference(pool, source, request.filter_reference_idx)
+    if request.feature_filter is not None and source.feature_key != "feature_idx":
+        raise CohortError(
+            409,
+            f"a {source.method} table's features are genomes;"
+            f" the {request.feature_filter} filter applies to an amplicon table's ASVs",
+        )
 
     processed = await pool.fetch(
         "SELECT ei.processing_idx, ei.prep_sample_idx, ei.export_id,"
@@ -305,7 +291,7 @@ async def resolve_cohort(pool: asyncpg.Pool, request: FeatureTableRequest) -> Co
         runs=runs,
         samples=samples,
         reference_idx=params.get(source.reference_key) if source.reference_key else None,
-        filter_reference_idx=request.filter_reference_idx,
+        feature_filter=request.feature_filter,
     )
 
 
@@ -380,17 +366,18 @@ def stage_values(
     values: str,
     chunks: str | None = None,
     genome_labels: str | None = None,
-    kept: str | None = None,
+    greengenes2_path: str | None = None,
 ) -> None:
     """Create `FEATURE_RELATION` (feature, sequence, length) and `VALUE_RELATION`
     (sample, feature, value): the values in `values` relabelled to public names,
     one row per nonzero cell. `names` maps (processing_idx, prep_sample_idx) to a
     column name; `chunks` is the ASV chunk relation of an amplicon table, and
     `genome_labels` the `exported_feature` handles `(genome_idx, export_feature_id)`
-    of a genome-keyed one, and `kept` the `feature_idx` an amplicon table is
-    filtered to (its other ASVs are dropped from both relations). Refuses rather
-    than guesses: a value of a processed sample `names` lacks, or of a feature with
-    no name, would need an internal idx as its name."""
+    of a genome-keyed one. `greengenes2_path` filters an amplicon table to the ASVs
+    Greengenes2 places (`greengenes2.py`): the others leave both relations. Refuses
+    rather than guesses: a value of a processed
+    sample `names` lacks, or of a feature with no name, would need an internal idx
+    as its name."""
     _refuse_unnamed(con, names=names, values=values)
     if source.feature_key == "genome_idx":
         if genome_labels is None:
@@ -426,8 +413,8 @@ def stage_values(
     ).fetchone()[0]
     if missing:
         raise RuntimeError(f"{missing} observed ASV(s) have no sequence in the lake")
-    if kept is not None:
-        _keep(con, kept)
+    if greengenes2_path is not None:
+        _keep_greengenes2(con, greengenes2_path)
     con.execute(
         f"CREATE TEMP TABLE {VALUE_RELATION} AS"
         f" SELECT n.sample, f.feature, sum(m.{source.value_column})::DOUBLE AS value"
@@ -438,9 +425,11 @@ def stage_values(
     )
 
 
-def _keep(con, kept: str) -> None:
+def _keep_greengenes2(con, path: str) -> None:
+    greengenes2.stage(con, path=path, features=FEATURE_RELATION)
     con.execute(
-        f"DELETE FROM {FEATURE_RELATION} WHERE feature_idx NOT IN (SELECT feature_idx FROM {kept})"
+        f"DELETE FROM {FEATURE_RELATION}"
+        f" WHERE feature NOT IN (SELECT feature FROM {greengenes2.GREENGENES2_RELATION})"
     )
 
 
@@ -453,16 +442,6 @@ def names_table(cohort: Cohort) -> pa.Table:
             "sample": pa.array([s.column.sample for s in cohort.samples], pa.string()),
         }
     )
-
-
-@dataclass(frozen=True)
-class Kept:
-    """What a reference filter keeps of an amplicon table: the observed ASVs that
-    are members of the reference `(feature_idx)`, and for the features answer their
-    taxonomy rows from it (None when only the values are wanted)."""
-
-    features: pa.Table
-    taxonomy: pa.Table | None = None
 
 
 @dataclass(frozen=True)
@@ -483,11 +462,9 @@ def _staged(
     chunks: pa.Table | None,
     genomes: Genomes | None,
     query: str,
-    kept: Kept | None = None,
+    greengenes2_path: str | None = None,
 ) -> pa.Table:
     with duckdb.connect() as duck:
-        if kept is not None:
-            duck.register("kept", kept.features)
         duck.register("run_values", values)
         duck.register("names", names_table(cohort))
         if chunks is not None:
@@ -501,7 +478,7 @@ def _staged(
             values="run_values",
             chunks="chunks" if chunks is not None else None,
             genome_labels="genome_labels" if genomes is not None else None,
-            kept="kept" if kept is not None else None,
+            greengenes2_path=greengenes2_path,
         )
         if genomes is not None and genomes.members is not None:
             duck.register("genome_members", genomes.members)
@@ -517,7 +494,7 @@ def build_values(
     values: pa.Table,
     chunks: pa.Table | None,
     genomes: Genomes | None = None,
-    kept: Kept | None = None,
+    greengenes2_path: str | None = None,
 ) -> pa.Table:
     """The values `(sample, feature, value)` as Arrow, for the REST answer."""
     table = _staged(
@@ -526,7 +503,7 @@ def build_values(
         chunks,
         genomes,
         f"SELECT sample, feature, value FROM {VALUE_RELATION} ORDER BY sample, feature",
-        kept,
+        greengenes2_path,
     )
     return table.cast(VALUES_SCHEMA)
 
@@ -557,21 +534,6 @@ async def genome_labels(pool: asyncpg.Pool, genome_idx: list[int], created_by_id
             "export_feature_id": pa.array([r["export_feature_id"] for r in rows], pa.string()),
         }
     )
-
-
-async def reference_members(
-    pool: asyncpg.Pool, reference_idx: int, feature_idx: list[int]
-) -> pa.Table:
-    """Which of `feature_idx` are members of the reference, `(feature_idx)`: the
-    ASVs a filter to it keeps. Features are content-addressed, so an ASV identical
-    to a reference sequence is that sequence's feature."""
-    rows = await pool.fetch(
-        "SELECT feature_idx FROM qiita.reference_membership"
-        " WHERE reference_idx = $1 AND feature_idx = ANY($2::bigint[])",
-        reference_idx,
-        feature_idx,
-    )
-    return pa.table({"feature_idx": pa.array([r["feature_idx"] for r in rows], pa.int64())})
 
 
 async def genome_members(pool: asyncpg.Pool, reference_idx: int, genome_idx: list[int]) -> pa.Table:
@@ -611,30 +573,27 @@ def build_features(
     values: pa.Table | None,
     chunks: pa.Table | None,
     genomes: Genomes | None = None,
-    kept: Kept | None = None,
+    greengenes2_path: str | None = None,
 ) -> pa.Table:
     """The features `(feature, sequence, length, <ranks>)` as Arrow, for the REST
     answer. An amplicon table's needs only the chunks (the ticket already scopes
-    them to the ASVs the cohort observed); a genome-keyed one's are read from its
-    values, named by `genomes.labels` and ranked from `genomes.taxonomy`. A
-    filtered amplicon table's are the `kept` ASVs, ranked from `kept.taxonomy`."""
+    them to the ASVs the cohort observed), and a Greengenes2-filtered one's are the
+    ASVs it places, ranked by it; a genome-keyed one's are read from its values,
+    named by `genomes.labels` and ranked from `genomes.taxonomy`."""
     if cohort.source.sequences_table is not None:
         if chunks is None:
             raise RuntimeError(f"a {cohort.source.method} table needs its ASV chunks")
         with duckdb.connect() as duck:
             duck.register("chunks", chunks)
             stage_features(duck, chunks="chunks")
-            ranks, taxonomy_join = _NULL_RANKS, ""
-            if kept is not None:
-                duck.register("kept", kept.features)
-                _keep(duck, "kept")
-                if kept.taxonomy is not None:
-                    duck.register("kept_taxonomy", kept.taxonomy)
-                    ranks = prefixed_rank_columns_sql(alias="t")
-                    taxonomy_join = " LEFT JOIN kept_taxonomy t USING (feature_idx)"
+            ranks, join = _NULL_RANKS, ""
+            if greengenes2_path is not None:
+                _keep_greengenes2(duck, greengenes2_path)
+                ranks = rank_columns_sql(alias="t")
+                join = f" JOIN {greengenes2.GREENGENES2_RELATION} t USING (feature)"
             table = duck.execute(
                 f"SELECT f.feature, f.sequence, f.length, {ranks}"
-                f" FROM {FEATURE_RELATION} f{taxonomy_join} ORDER BY f.feature"
+                f" FROM {FEATURE_RELATION} f{join} ORDER BY f.feature"
             ).to_arrow_table()
         return table.cast(FEATURES_SCHEMA)
     if values is None or genomes is None:

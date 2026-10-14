@@ -266,6 +266,10 @@ class Settings:
     # label typed on the client. Optional: an unnamed deploy reports null and
     # clients fall back to the URL. A present-but-malformed value fails boot.
     deployment_name: str | None = None
+    # The Greengenes2 ASV taxonomy the feature table's `greengenes2` filter joins
+    # against (`greengenes2.py` says what it holds). Optional: unset, the filter
+    # answers 503. Set but not a readable file fails boot.
+    greengenes2_asv_taxonomy_path: Path | None = None
     # reference_idx of the canonical `artifact_sequence_set` reference the QC
     # step trims adapters against. Optional in the dataclass (tests and
     # QC-less deploys don't need it); set from QIITA_DEFAULT_ADAPTER_REFERENCE_IDX.
@@ -364,6 +368,18 @@ class Settings:
                 f"CONTACT_EMAIL must be a local@domain.tld address, got {contact_email!r}"
             )
 
+        gg2_raw = os.environ.get("GREENGENES2_ASV_TAXONOMY_PATH") or None
+        greengenes2_asv_taxonomy_path = Path(gg2_raw) if gg2_raw else None
+        if greengenes2_asv_taxonomy_path is not None and not (
+            greengenes2_asv_taxonomy_path.is_absolute()
+            and greengenes2_asv_taxonomy_path.is_file()
+            and os.access(greengenes2_asv_taxonomy_path, os.R_OK)
+        ):
+            raise RuntimeError(
+                "GREENGENES2_ASV_TAXONOMY_PATH must be an absolute path to a readable file,"
+                f" got {gg2_raw!r}"
+            )
+
         deployment_name = os.environ.get("QIITA_DEPLOYMENT_NAME") or None
         if deployment_name is not None and not _DEPLOYMENT_NAME_RE.match(deployment_name):
             raise RuntimeError(
@@ -433,6 +449,7 @@ class Settings:
             build_sha=os.environ.get("BUILD_SHA") or None,
             build_version=os.environ.get("BUILD_VERSION") or None,
             deployment_name=deployment_name,
+            greengenes2_asv_taxonomy_path=greengenes2_asv_taxonomy_path,
             default_adapter_reference_idx=_parse_optional_positive_int_env(
                 "QIITA_DEFAULT_ADAPTER_REFERENCE_IDX"
             ),

@@ -151,14 +151,14 @@ def test_an_amplicon_bundle_carries_each_asvs_sequence(monkeypatch, tmp_path):
     assert not out.with_name("table.taxonomy.parquet").exists()
 
 
-def test_a_filtered_amplicon_bundle_carries_sequences_and_taxonomy(monkeypatch, tmp_path):
+def test_a_greengenes2_bundle_carries_sequences_and_taxonomy(monkeypatch, tmp_path):
     out = _run(
         monkeypatch,
         tmp_path,
         "amplicon",
         _values([("QM1", "md5a", 5.0)]),
         _features([("md5a", "ACGT", {"domain": "d__Bacteria", "genus": "g__Bacteroides"})]),
-        extra=("--filter-reference-idx", "12"),
+        extra=("--filter", "greengenes2"),
     )
     with duckdb.connect() as con:
         taxonomy = con.execute(
@@ -168,4 +168,4 @@ def test_a_filtered_amplicon_bundle_carries_sequences_and_taxonomy(monkeypatch, 
     assert taxonomy == [("md5a", "d__Bacteria", "g__Bacteroides")]
     assert out.with_name("table.sequences.parquet").exists()
     manifest = json.loads(out.with_name("table.manifest.json").read_text())
-    assert manifest["request"]["filter_reference_idx"] == 12
+    assert manifest["request"]["feature_filter"] == "greengenes2"

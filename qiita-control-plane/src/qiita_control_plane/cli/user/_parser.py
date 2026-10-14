@@ -51,6 +51,7 @@ from qiita_common.models import (
     Tier,
     WorkTicketState,
 )
+from qiita_common.models.run_feature_table import GREENGENES2_FILTER
 from qiita_common.work_ticket_constants import (
     FORCE_RESUBMIT_EXPLANATION,
 )
@@ -1418,12 +1419,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Exactly these prep_samples; one the runs did not process is refused.",
     )
     p_ft_runs.add_argument(
-        "--filter-reference-idx",
-        type=int,
+        "--filter",
+        dest="feature_filter",
+        choices=[GREENGENES2_FILTER],
         help=(
-            "Keep only the ASVs that are members of this sequence reference (e.g."
-            " Greengenes2's ASVs), ranked by its taxonomy; writes <stem>.taxonomy.parquet"
-            " too. Amplicon runs only."
+            "greengenes2: keep only the ASVs Greengenes2 places (V4 rapid-16S ASVs),"
+            " ranked by its taxonomy; writes <stem>.taxonomy.parquet too."
         ),
     )
     p_ft_runs.add_argument(

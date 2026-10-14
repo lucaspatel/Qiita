@@ -30,7 +30,17 @@ Everything merged but not yet deployed, folded in by each PR as it merges. Run b
 
 ### 2. One-time host setup
 
-_None yet._
+- `[admin]` **Optional: the Greengenes2 filter's file.** The feature table's `greengenes2`
+  filter (a rapid-16S table cut to the ASVs Greengenes2 places) needs a Parquet built once
+  from the release's `taxonomy.md5.tsv.gz` (~490 MB; ~23.1M ASVs), placed where `qiita-api`
+  can read it, and named in `control-plane.env` as `GREENGENES2_ASV_TAXONOMY_PATH` (an
+  unreadable path **fails CP boot**; unset, the filter answers 503). (#feat/web-ui)
+  ```
+  curl -O http://ftp.microbio.me/greengenes_release/2024.09/2024.09.taxonomy.md5.tsv.gz
+  python scripts/greengenes2-asv-taxonomy.py --taxonomy 2024.09.taxonomy.md5.tsv.gz \
+      --out <shared dir>/greengenes2-2024.09-asv.parquet
+  sudo bash -c 'echo "GREENGENES2_ASV_TAXONOMY_PATH=<shared dir>/greengenes2-2024.09-asv.parquet" >> /etc/qiita/control-plane.env'
+  ```
 
 ### 3. Migrations
 
