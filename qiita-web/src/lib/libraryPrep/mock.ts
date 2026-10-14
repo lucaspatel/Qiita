@@ -1,30 +1,32 @@
-// MOCKUP data and rules for the Library prep flow: what a box of tubes looks like
-// when it arrives, and the notebook's (kl-metapool amplicon_pre_prep_file_generator)
-// checks and transforms, so the screens can be clicked through end to end without a
-// server. Nothing here talks to Qiita. Each piece is tagged with where the real
-// implementation belongs (CLIENT or SERVER); see `docs` in the page for the split.
+// MOCKUP data and rules for the Library prep flow. The demo box is half real and
+// half made up: IBD's plates 5-6 come from a sample sheet the amplicon notebook
+// produced (fixture.ts), and the run's other two plates are a made-up second study
+// that is not in Qiita-miint, as a multi-study run has. Nothing here talks to Qiita.
+
+import { IBD_PLATES_5_6 } from './fixture';
+import type { Plate, RunFacts, StudyFacts } from './sampleSheet';
 
 export const ROWS_96 = 'ABCDEFGH'.split('');
 export const COLS_96 = Array.from({ length: 12 }, (_, i) => i + 1);
 export const ROWS_384 = 'ABCDEFGHIJKLMNOP'.split('');
 export const COLS_384 = Array.from({ length: 24 }, (_, i) => i + 1);
-export const WELLS_96 = COLS_96.flatMap((c) => ROWS_96.map((r) => `${r}${c}`));
+/** Row-major (A1, A2, … H12): the order a sheet lists a plate's wells in. */
+export const WELLS_96 = ROWS_96.flatMap((r) => COLS_96.map((c) => `${r}${c}`));
 
 /** One tube as the VisionMate rack reader reports it. */
 export type RackTube = { well: string; tube: string; rackId: string };
 export type Rack = { fileName: string; rackId: string; tubes: RackTube[]; problems: string[] };
 
-/** CLIENT: parse a VisionMate export (TubeCode, LocationCell, LocationColumn,
- *  LocationRow, RackID, Time, Date). Tube codes are normalised to Qiita's 10-digit
- *  form (the rack reader drops nothing, but spreadsheets eat leading zeroes). */
+/** Parse a VisionMate export (TubeCode, LocationCell, LocationColumn, LocationRow,
+ *  RackID, Time, Date). Tube codes are normalised to Qiita's 10-digit form
+ *  (spreadsheets eat leading zeroes). */
 export function parseVisionMate(fileName: string, text: string): Rack {
   const lines = text.split(/\r?\n/).filter((l) => l.trim());
   const problems: string[] = [];
   const header = (lines.shift() ?? '').split('\t').map((h) => h.trim());
-  const col = (name: string) => header.indexOf(name);
-  const [iTube, iCell, iRack] = [col('TubeCode'), col('LocationCell'), col('RackID')];
+  const [iTube, iCell, iRack] = ['TubeCode', 'LocationCell', 'RackID'].map((n) => header.indexOf(n));
   if (iTube < 0 || iCell < 0)
-    return { fileName, rackId: '?', tubes: [], problems: ['not a VisionMate file: needs TubeCode and LocationCell columns'] };
+    return { fileName, rackId: '?', tubes: [], problems: ['not a VisionMate file: needs TubeCode and LocationCell'] };
   const tubes: RackTube[] = [];
   const seen = new Map<string, string>();
   for (const line of lines) {
@@ -32,12 +34,12 @@ export function parseVisionMate(fileName: string, text: string): Rack {
     const well = f[iCell]?.toUpperCase();
     const raw = f[iTube] ?? '';
     if (!WELLS_96.includes(well)) {
-      problems.push(`row "${line.slice(0, 40)}": ${well || 'no'} well is not on a 96-well rack`);
+      problems.push(`"${line.slice(0, 40)}": ${well || 'no'} well is not on a 96-well rack`);
       continue;
     }
     if (!raw || /^no ?read$|^no ?tube$/i.test(raw)) continue; // an empty position
     if (!/^\d{1,10}$/.test(raw)) {
-      problems.push(`${well}: "${raw}" is not a tube code (digits only)`);
+      problems.push(`${well}: "${raw}" is not a tube code`);
       continue;
     }
     const tube = raw.padStart(10, '0');
@@ -45,182 +47,155 @@ export function parseVisionMate(fileName: string, text: string): Rack {
     seen.set(tube, well);
     tubes.push({ well, tube, rackId: iRack >= 0 ? f[iRack] : '' });
   }
-  return { fileName, rackId: tubes[0]?.rackId || fileName, tubes, problems };
+  return { fileName, rackId: tubes[0]?.rackId || fileName.replace(/\.\w+$/, ''), tubes, problems };
 }
 
 export function toVisionMate(rack: Rack): string {
   const rows = rack.tubes.map(
-    (t) =>
-      `${t.tube}\t${t.well}\t${t.well.slice(1)}\t${t.well[0]}\t${rack.rackId}\t105935\t20261013`
+    (t) => `${t.tube}\t${t.well}\t${t.well.slice(1)}\t${t.well[0]}\t${rack.rackId}\t105935\t20260918`
   );
   return ['TubeCode\tLocationCell\tLocationColumn\tLocationRow\tRackID\tTime\tDate', ...rows].join('\n');
 }
 
-// --- what Qiita knows (SERVER: POST /biosample/resolve-roster and study reads) ---
-
-export type Study = {
-  study_idx: number;
-  title: string;
-  /** Biosamples registered, and how many carry a matrix tube code. */
-  biosamples: number;
-  withTubes: number;
-};
-export const STUDIES: Study[] = [
-  { study_idx: 15663, title: 'IBD longitudinal cohort', biosamples: 843, withTubes: 812 },
-  { study_idx: 12986, title: 'Celeste Adaptation', biosamples: 420, withTubes: 420 },
-  { study_idx: 13001, title: 'Soil warming plots', biosamples: 96, withTubes: 0 }
-];
-
-export type Resolution =
-  | { kind: 'ok'; sample: string; qb: string; study_idx: number; others: number[] }
-  | { kind: 'multi'; sample: string; qb: string; studies: number[] }
-  | { kind: 'unknown' }
-  | { kind: 'blank' };
-
-// Deterministic fake tube codes per (study, n).
-const tubeOf = (seed: number, n: number) => String(363000000 + seed * 1000 + n).padStart(10, '0');
-
-/** The demo box: four racks. Plates 1-2 are IBD, plate 3 Celeste Adaptation, plate 4
- *  mixes soil (a study whose metadata has no tube codes) with a blank column. Edge
- *  cases planted: unknown tubes, a tube shared by two studies, a tube on two racks. */
-export function demoBox(): { racks: Rack[]; registry: Map<string, Resolution> } {
-  const registry = new Map<string, Resolution>();
-  const racks: Rack[] = [];
-  const add = (rackId: string, fill: (well: string, i: number) => string | null) => {
-    const tubes: RackTube[] = [];
-    WELLS_96.forEach((well, i) => {
-      const tube = fill(well, i);
-      if (tube) tubes.push({ well, tube, rackId });
-    });
-    racks.push({ fileName: `${rackId}.tsv`, rackId, tubes, problems: [] });
-  };
-  const reg = (tube: string, r: Resolution) => (registry.set(tube, r), tube);
-
-  // Plate 1: IBD, 94 samples + 2 blanks (G12, H12); 3 tubes not in Qiita.
-  add('SC0001', (well, i) => {
-    if (well === 'G12' || well === 'H12') return reg(tubeOf(9, i), { kind: 'blank' });
-    const t = tubeOf(1, i);
-    if ([17, 52, 77].includes(i)) return t; // unknown
-    if (i === 30)
-      return reg(t, { kind: 'multi', sample: `15663.${800100 + i}`, qb: `QB${12700 + i}`, studies: [15663, 12986] });
-    return reg(t, { kind: 'ok', sample: `15663.${800100 + i}`, qb: `QB${12700 + i}`, study_idx: 15663, others: [] });
-  });
-  // Plate 2: IBD, 88 samples, 8 empty wells; one tube also on plate 1.
-  add('SC0002', (well, i) => {
-    if (i >= 88) return null;
-    if (i === 5) return tubeOf(1, 3);
-    return reg(tubeOf(2, i), { kind: 'ok', sample: `15663.${800300 + i}`, qb: `QB${12900 + i}`, study_idx: 15663, others: [] });
-  });
-  // Plate 3: Celeste Adaptation, full.
-  add('SC0003', (_well, i) =>
-    reg(tubeOf(3, i), { kind: 'ok', sample: `12986.ADAPT.${i + 1}`, qb: `QB${5400 + i}`, study_idx: 12986, others: [] })
-  );
-  // Plate 4: soil (no tube codes in Qiita yet) + a blank column.
-  add('SC0004', (well, i) => {
-    if (well.endsWith('12')) return reg(tubeOf(8, i), { kind: 'blank' });
-    return tubeOf(4, i); // soil: unknown until its metadata carries tube codes
-  });
-  return { racks, registry };
-}
-
-/** The study a tube belongs to though its metadata lacks tube codes: the mock's
- *  stand-in for the lab saying "plate 4 is the soil study". */
-export const SOIL_STUDY = 13001;
-
-// --- plate details (notebook step 3; CLIENT validates for feedback, SERVER again) ---
-
-export type PlateDetails = {
-  position: string;
-  primerPlate: string;
-  samplePlate: string;
-  project: string;
-  elutionVolume: string;
-  plating: string;
-  extractionKitLot: string;
-  extractionRobot: string;
-  tm1000Tool: string;
-  primerDate: string;
-  mastermixLot: string;
-  waterLot: string;
-  tm10Tool: string;
-  processingRobot: string;
-};
-export const DETAIL_FIELDS: [keyof PlateDetails, string, string][] = [
-  ['samplePlate', 'Sample plate', 'Plate_16'],
-  ['elutionVolume', 'Elution volume (µl)', '70'],
-  ['plating', 'Plating (initials)', 'SF'],
-  ['extractionKitLot', 'Extraction kit lot', '166032128'],
-  ['extractionRobot', 'Extraction robot', 'Carmen_HOWE_KF3'],
-  ['tm1000Tool', 'TM1000 8 tool', '109379Z'],
-  ['primerDate', 'Primer date', '2026-10-01'],
-  ['mastermixLot', 'MasterMix lot', '978215'],
-  ['waterLot', 'Water lot', 'RNBJ0628'],
-  ['tm10Tool', 'TM10 8 tool', '865HS8'],
-  ['processingRobot', 'Processing robot', 'Echo550']
-];
-
-export type Message = { level: 'error' | 'warning'; text: string };
-
-/** The checks `metapool.plate.validate_plate_metadata` makes, per plate and across. */
-export function validateDetails(plates: PlateDetails[]): Message[][] {
-  const out = plates.map(() => [] as Message[]);
-  const repeated = (key: keyof PlateDetails) => {
-    const seen = new Map<string, number>();
-    plates.forEach((p, i) => {
-      const v = p[key];
-      if (!v) return;
-      if (seen.has(v)) out[i].push({ level: 'error', text: `${String(key)} "${v}" is repeated` });
-      seen.set(v, i);
-    });
-  };
-  plates.forEach((p, i) => {
-    const m = out[i];
-    if (!['1', '2', '3', '4'].includes(p.position))
-      m.push({ level: 'error', text: 'Plate position must be 1, 2, 3 or 4' });
-    const pp = Number(p.primerPlate);
-    if (!Number.isInteger(pp) || pp < 1 || pp > 10)
-      m.push({ level: 'error', text: `Primer plate # "${p.primerPlate}" is not between 1 and 10` });
-    else if (String(pp) !== p.position)
-      m.push({ level: 'warning', text: `Primer plate # ${pp} at position ${p.position} is unusual` });
-    if (/\s/.test(p.samplePlate)) m.push({ level: 'warning', text: 'Spaces are not recommended in the sample plate name' });
-    for (const [key, label] of DETAIL_FIELDS)
-      if (!p[key].trim()) m.push({ level: 'error', text: `${label} is missing (write "not applicable")` });
-    if (p.primerDate && !/^\d{4}-\d{2}-\d{2}$/.test(p.primerDate))
-      m.push({ level: 'error', text: 'Primer date must be YYYY-MM-DD' });
-    else if (p.primerDate && p.primerDate > new Date().toISOString().slice(0, 10))
-      m.push({ level: 'warning', text: 'The primer date is in the future' });
-  });
-  repeated('position');
-  repeated('primerPlate');
-  repeated('samplePlate');
-  return out;
-}
-
-// --- compression and barcodes (notebook steps 4 and 7) ---
-
-/** CLIENT preview, SERVER authoritative: metapool's interleaved 4-quadrant
- *  compression. Position 1 takes odd rows/odd columns, 2 odd rows/even columns,
- *  3 even rows/odd columns, 4 even rows/even columns. */
+/** metapool's interleaved 4-quadrant compression: position 1 takes odd rows/odd
+ *  columns, 2 odd rows/even columns, 3 even rows/odd columns, 4 even/even. */
 export function to384(position: string, well96: string): string {
   const r = ROWS_96.indexOf(well96[0]);
   const c = Number(well96.slice(1)) - 1;
   const q = Number(position);
-  const row = ROWS_384[2 * r + (q >= 3 ? 1 : 0)];
-  const col = 2 * c + (q % 2 === 0 ? 1 : 0) + 1;
-  return `${row}${col}`;
+  return `${ROWS_384[2 * r + (q >= 3 ? 1 : 0)]}${2 * c + (q % 2 === 0 ? 1 : 0) + 1}`;
 }
 
-/** SERVER: the EMP Golay barcode for a well of a primer plate. Mocked as a stable
- *  12-mer; the real table is metapool's EMP primer plates, which the stored
- *  pre-flight carries and golay-demux checks the barcode map against. */
+/** A stand-in Golay barcode for a primer-plate well the fixture doesn't cover; the
+ *  real table is metapool's EMP primer plates, which belong on the server. */
 export function mockGolay(primerPlate: string, well96: string): string {
   let h = 2166136261;
   for (const ch of `${primerPlate}:${well96}`) h = Math.imul(h ^ ch.charCodeAt(0), 16777619);
   return Array.from({ length: 12 }, (_, i) => 'ACGT'[(h >>> (i * 2)) & 3]).join('');
 }
 
-/** A run folder on the ingest roots (SERVER: POST /run-folder/inspect). */
+/** The notebook's naming: a sample is its tube code without leading zeroes, a blank
+ *  BLANK.<abbreviation>.<plate number>.<96 well>. */
+export function sampleName(tube: string, blank: boolean, abbreviation: string, samplePlate: string, well96: string): string {
+  return blank
+    ? `BLANK.${abbreviation}.${samplePlate.replace(/^\D*/, '')}.${well96}`
+    : tube.replace(/^0+/, '');
+}
+
+// --- what Qiita-miint knows (the mock's stand-in for POST /biosample/resolve-roster) ---
+
+export type Study = { study_idx: number; classicId: number; title: string };
+/** The studies in Qiita-miint; only IBD of this run's two. */
+export const STUDIES: Study[] = [{ study_idx: 25060, classicId: 15663, title: 'IBD' }];
+
+export type Resolution =
+  | { kind: 'ok'; qb: string; study_idx: number }
+  | { kind: 'multi'; qb: string; studies: number[] }
+  | { kind: 'blank' };
+
+/** A made-up second study on the same run, not in Qiita-miint. */
+const OTHER: StudyFacts = {
+  project_name: 'DIET_14567',
+  project_abbreviation: 'DIET',
+  center_project_name: 'Diet pilot',
+  experiment_design_description: '16S sequencing of a diet pilot (made up for the demo)'
+};
+
+export type Demo = {
+  racks: Rack[];
+  registry: Map<string, Resolution>;
+  /** Defaults the tech would otherwise type: each rack's position and facts. */
+  plates: Record<string, { position: string; facts: Plate }>;
+  /** Barcodes by `primer_plate:well_96` (the fixture's real ones). */
+  barcodes: Map<string, string>;
+  studyFacts: Record<string, StudyFacts>;
+  /** The made-up study's facts, offered when its plates go in as sheet-only. */
+  otherStudy: StudyFacts;
+  run: RunFacts;
+};
+
+export function demoBox(): Demo {
+  const racks: Rack[] = [];
+  const registry = new Map<string, Resolution>();
+  const plates: Demo['plates'] = {};
+  const barcodes = new Map<string, string>();
+  const fix = IBD_PLATES_5_6;
+
+  fix.plates.forEach((p, i) => {
+    const rackId = `SC${String(5 + i).padStart(4, '0')}`;
+    const tubes: RackTube[] = [];
+    for (const [well96, tube, , control, barcode, well384] of p.wells) {
+      const t = tube.padStart(10, '0');
+      tubes.push({ well: well96, tube: t, rackId });
+      registry.set(t, control ? { kind: 'blank' } : { kind: 'ok', qb: `QB${12695 + registry.size}`, study_idx: 25060 });
+      barcodes.set(`${p.facts.primer_plate}:${well96}`, barcode);
+      plates[rackId] ??= { position: positionOf(well96, well384), facts: { ...p.facts } };
+    }
+    racks.push({ fileName: `${rackId}.tsv`, rackId, tubes, problems: [] });
+  });
+
+  // The other study's two plates: positions 2 and 4, 94 samples + 2 blanks each.
+  [7, 8].forEach((n, i) => {
+    const rackId = `SC${String(n).padStart(4, '0')}`;
+    const tubes = WELLS_96.map((well, w) => {
+      const tube = String(365100000 + n * 1000 + w).padStart(10, '0');
+      if (well === 'G12' || well === 'H12') registry.set(tube, { kind: 'blank' });
+      return { well, tube, rackId };
+    });
+    racks.push({ fileName: `${rackId}.tsv`, rackId, tubes, problems: [] });
+    plates[rackId] = {
+      position: String(2 + 2 * i),
+      facts: { ...fix.plates[0].facts, sample_plate: `Plate_${n - 6}`, primer_plate: String(2 + 2 * i) }
+    };
+  });
+
+  return {
+    racks,
+    registry,
+    plates,
+    barcodes,
+    studyFacts: { '25060': { ...fix.study } },
+    otherStudy: OTHER,
+    run: { ...fix.run }
+  };
+}
+
+/** Which quadrant a plate sits in, from one of its wells' 96 and 384 positions. */
+function positionOf(well96: string, well384: string): string {
+  return ['1', '2', '3', '4'].find((q) => to384(q, well96) === well384) ?? '1';
+}
+
+// --- the notebook's checks (metapool.plate.validate_plate_metadata) ---
+
+export type Message = { level: 'error' | 'warning'; text: string };
+
+export function validatePlates(plates: { position: string; facts: Plate }[]): Message[] {
+  const out: Message[] = [];
+  const repeated = (label: string, values: string[]) => {
+    const seen = new Set<string>();
+    for (const v of values) {
+      if (v && seen.has(v)) out.push({ level: 'error', text: `${label} "${v}" is used twice` });
+      seen.add(v);
+    }
+  };
+  for (const { position, facts: f } of plates) {
+    const at = `Position ${position}`;
+    const pp = Number(f.primer_plate);
+    if (!Number.isInteger(pp) || pp < 1 || pp > 10)
+      out.push({ level: 'error', text: `${at}: primer plate # "${f.primer_plate}" is not between 1 and 10` });
+    for (const [k, v] of Object.entries(f))
+      if (!v.trim()) out.push({ level: 'error', text: `${at}: ${k} is empty (write not_applicable)` });
+    if (/\s/.test(f.sample_plate)) out.push({ level: 'warning', text: `${at}: spaces in the sample plate name` });
+    if (f.primer_date && !/^\d{4}-\d{2}-\d{2}$/.test(f.primer_date))
+      out.push({ level: 'error', text: `${at}: primer date must be YYYY-MM-DD` });
+  }
+  repeated('Primer plate', plates.map((p) => p.facts.primer_plate));
+  repeated('Sample plate', plates.map((p) => p.facts.sample_plate));
+  return out;
+}
+
+/** A run folder on the ingest roots (server: POST /run-folder/inspect). */
 export const RUN_FOLDERS = [
-  { id: '20261020_SL00377_0012_ASC2299011-SC3', instrument: 'MiSeq i100', cycles: '151x12x151', when: '2026-10-20' },
-  { id: '20260925_SL00377_0008_ASC2267726-SC3', instrument: 'MiSeq i100', cycles: '151x12x151', when: '2026-09-25' }
+  { id: '20260925_SL00377_0008_ASC2267726-SC3', instrument: 'MiSeq i100', cycles: '151x12x151', when: '2026-09-25' },
+  { id: '20261020_SL00377_0012_ASC2299011-SC3', instrument: 'MiSeq i100', cycles: '151x12x151', when: '2026-10-20' }
 ];
