@@ -161,14 +161,21 @@ async def delete_reference_cascade(
     The schema uses ON DELETE RESTRICT throughout (no cascades), so order is
     explicit: work_ticket (→ work_ticket_step CASCADEs) → reference_index →
     reference_membership → annotation_to_term → reference_annotation → orphan
-    annotation_term → orphan feature_genome/feature → orphan genome → reference.
-    Features, genomes and terms are deleted only when *orphaned* — claimed by
-    nothing that outlives this delete — so a shared one survives. A feature has one
-    claim from outside the reference graph: `qiita.assembly_membership`, which keeps
-    an assembled contig's feature whatever happens to the reference.
+    annotation_term → reference. Terms are deleted only when *orphaned* — cited by
+    nothing that outlives this delete. Features, their genome mappings and genomes
+    are never deleted here; see `orphan_features` below.
 
     Returns the per-table delete counts for the caller's response."""
-    # Orphan features: this reference's features that nothing else claims.
+    # Orphan features: this reference's features that no other reference or assembly
+    # claims. They are COUNTED, never deleted, and neither are their feature_genome
+    # rows or genomes. A feature is a content identity (the canonical hash of its
+    # bytes), and claims on it exist that Postgres cannot see: an amplicon ASV is
+    # minted through the same `mint-features` path, so an ASV identical to a
+    # reference sequence IS that feature, and its counts live only in DuckLake
+    # (`amplicon_membership`). Deleting the row would leave those counts naming a
+    # feature_idx that no longer exists, and the next load of the same bytes would
+    # mint a new one they never match. A kept row costs one narrow row; a reload
+    # reuses it.
     #
     # A reference claims a feature in TWO ways, and both count: as a member
     # (reference_membership — a whole sequence, indexed and aligned against) or as
@@ -194,15 +201,13 @@ async def delete_reference_cascade(
     # own it and deleting this reference does not release it.
     #
     # Computed before the DELETEs below (the EXCEPT needs this reference's rows
-    # present). The two reference-claim terms MUST match the data-plane orphan
-    # computation in qiita-data-plane's flight_service.rs::delete_reference — the two
-    # stores GC the same features independently, so a change to either query must
-    # change the other or sequences/features desync across stores. The assembly term is
-    # deliberately Postgres-only: an assembly's contig bytes land in
-    # qiita_lake.assembled_sequence(_chunks) once its assembly_load step has run, so
-    # dropping the qiita_lake.reference_sequences copy of a feature no reference claims
-    # leaves the assembly's own copy resolvable, keyed by the qiita.feature row this
-    # query retains.
+    # present). The two reference-claim terms match the data-plane orphan computation
+    # in qiita-data-plane's flight_service.rs::delete_reference, which drops the
+    # `reference_sequences` copy of a feature no reference claims; this count reports
+    # the same set. The assembly term is Postgres-only: an assembly's contig bytes land
+    # in qiita_lake.assembled_sequence(_chunks), and an ASV's in amplicon chunks, so
+    # dropping a feature's reference copy leaves its other copies resolvable, keyed by
+    # the qiita.feature row kept here.
     #
     # The assembly term is scoped to `claimed` rather than reading the table whole:
     # unlike the other two it has no reference_idx to filter on, and assembly_membership
@@ -292,34 +297,6 @@ async def delete_reference_cascade(
             cited_terms,
         )
     )
-
-    if orphan_features:
-        # Capture the genomes these features mapped to before deleting the
-        # junction rows, so we can GC any genome left with no features.
-        candidate_genomes = [
-            r["genome_idx"]
-            for r in await conn.fetch(
-                "SELECT DISTINCT genome_idx FROM qiita.feature_genome"
-                " WHERE feature_idx = ANY($1::bigint[])",
-                orphan_features,
-            )
-        ]
-        await conn.execute(
-            "DELETE FROM qiita.feature_genome WHERE feature_idx = ANY($1::bigint[])",
-            orphan_features,
-        )
-        await conn.execute(
-            "DELETE FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])",
-            orphan_features,
-        )
-        if candidate_genomes:
-            await conn.execute(
-                "DELETE FROM qiita.genome g WHERE g.genome_idx = ANY($1::bigint[])"
-                " AND NOT EXISTS ("
-                "   SELECT 1 FROM qiita.feature_genome fg WHERE fg.genome_idx = g.genome_idx"
-                ")",
-                candidate_genomes,
-            )
 
     await conn.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", reference_idx)
 

@@ -3,7 +3,7 @@
 Exercises the Postgres-teardown + gating half of the delete flow against a
 real Postgres. The data-plane DoAction (DuckLake cleanup) is stubbed — this
 tier has no data plane — so these tests focus on what the control plane owns:
-authorization, work-ticket gating, and orphan-vs-shared feature GC.
+authorization, work-ticket gating, and that features survive the delete.
 """
 
 import json
@@ -171,9 +171,10 @@ async def test_delete_reference_requires_delete_scope(postgres_pool, wet_lab_adm
         await postgres_pool.execute("DELETE FROM qiita.reference WHERE reference_idx = $1", ref_idx)
 
 
-async def test_delete_reference_orphan_vs_shared_features(client, postgres_pool):
-    """A feature claimed by another reference survives; a feature claimed only
-    by the deleted reference is GC'd from qiita.feature."""
+async def test_delete_reference_keeps_unclaimed_features(client, postgres_pool):
+    """A feature only the deleted reference claimed is counted as unclaimed and
+    kept: an amplicon ASV with the same bytes is that feature, and its counts (in
+    DuckLake) would otherwise name a feature_idx that no longer exists."""
     ref_a = await _create_ref(client, f"del-orphan-a-{uuid.uuid4()}")
     ref_b = await _create_ref(client, f"del-orphan-b-{uuid.uuid4()}")
 
@@ -194,18 +195,13 @@ async def test_delete_reference_orphan_vs_shared_features(client, postgres_pool)
         assert resp.json()["orphan_feature_count"] == 1
         assert resp.json()["membership_deleted"] == 2
 
-        # Orphan feature GC'd; shared feature retained.
+        # Both features kept, the unclaimed one included.
         assert (
             await postgres_pool.fetchval(
-                "SELECT 1 FROM qiita.feature WHERE feature_idx = $1", orphan
+                "SELECT count(*) FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])",
+                [orphan, shared],
             )
-            is None
-        )
-        assert (
-            await postgres_pool.fetchval(
-                "SELECT 1 FROM qiita.feature WHERE feature_idx = $1", shared
-            )
-            == 1
+            == 2
         )
         # ref_b still claims the shared feature.
         assert (
@@ -229,8 +225,8 @@ async def test_delete_reference_orphan_vs_shared_features(client, postgres_pool)
 async def test_delete_reference_keeps_a_feature_an_assembly_claims(
     client, postgres_pool, human_admin_session
 ):
-    """A feature an assembly also claims survives the delete; one only this
-    reference claimed is still GC'd.
+    """A feature an assembly also claims is not counted as unclaimed, and the
+    delete does not trip over the assembly's FK on it.
 
     Assembled contigs and reference sequences are minted through the same
     `mint_features` path on the same canonical hash, so a contig whose bytes match a
@@ -296,12 +292,12 @@ async def test_delete_reference_keeps_a_feature_an_assembly_claims(
             )
             == 1
         )
-        # The feature only this reference claimed is GC'd, as before.
+        # The feature only this reference claimed is kept too.
         assert (
             await postgres_pool.fetchval(
                 "SELECT 1 FROM qiita.feature WHERE feature_idx = $1", orphan
             )
-            is None
+            == 1
         )
     finally:
         await teardown_entity_graph(
@@ -323,21 +319,17 @@ async def test_delete_reference_keeps_a_feature_an_assembly_claims(
         )
 
 
-async def test_delete_reference_gcs_annotated_features(client, postgres_pool):
-    """An ANNOTATED interval's feature is GC'd on delete, exactly like a member's.
+async def test_delete_reference_counts_annotated_features(client, postgres_pool):
+    """An ANNOTATED interval's feature counts as unclaimed exactly like a member's.
 
     Annotated features are deliberately kept OUT of `reference_membership` (membership
-    is what gets indexed, and an insert is quantified rather than aligned against). If
-    the orphan computation read only membership — which it did before
-    `qiita.reference_annotation` existed — every annotated `feature_idx` would survive
-    `DELETE /reference/{idx}` forever, referenced by nothing, while the data plane
-    happily deleted its lake rows. The two stores would then disagree about which
-    features exist, which is precisely the desync the cascade is built to avoid.
+    is what gets indexed, and an insert is quantified rather than aligned against), so
+    a count reading only membership would miss them, and the data plane, which drops
+    the reference copies of the same set, would disagree with it.
 
-    Both directions are asserted, because only one of them is the interesting one:
-    the annotated feature of the deleted reference must GO, and a feature another
-    reference still ANNOTATES must STAY — the latter is what a naive "just delete all
-    annotation features" fix would get wrong.
+    Both directions are asserted: the annotated feature of the deleted reference is
+    counted, and a feature another reference still ANNOTATES is not. Every feature
+    row is kept either way; the annotation rows and their orphan terms go.
     """
     ref_a = await _create_ref(client, f"del-annot-a-{uuid.uuid4()}")
     ref_b = await _create_ref(client, f"del-annot-b-{uuid.uuid4()}")
@@ -424,28 +416,11 @@ async def test_delete_reference_gcs_annotated_features(client, postgres_pool):
 
         assert (
             await postgres_pool.fetchval(
-                "SELECT 1 FROM qiita.feature WHERE feature_idx = $1", insert_a
+                "SELECT count(*) FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])",
+                everything,
             )
-            is None
-        ), "an annotated feature claimed only by the deleted reference must be GC'd"
-        assert (
-            await postgres_pool.fetchval(
-                "SELECT 1 FROM qiita.feature WHERE feature_idx = $1", plasmid_a
-            )
-            is None
-        )
-        assert (
-            await postgres_pool.fetchval(
-                "SELECT 1 FROM qiita.feature WHERE feature_idx = $1", insert_shared
-            )
-            == 1
-        ), "a feature another reference still ANNOTATES must survive — it is in no membership row"
-        assert (
-            await postgres_pool.fetchval(
-                "SELECT 1 FROM qiita.feature WHERE feature_idx = $1", plasmid_shared
-            )
-            == 1
-        )
+            == 4
+        ), "no feature row is deleted with a reference"
         assert (
             await postgres_pool.fetchval(
                 "SELECT count(*) FROM qiita.reference_annotation WHERE reference_idx = $1", ref_b
@@ -605,9 +580,9 @@ async def test_delete_reference_no_data_ticket_requires_force(client, postgres_p
     assert forced.json()["work_ticket_deleted"] == 1
 
 
-async def test_delete_reference_gcs_orphan_genome_keeps_shared(client, postgres_pool):
-    """The genome-GC branch: a genome mapped only by orphaned features is
-    deleted; a genome still mapped by a surviving reference's feature stays."""
+async def test_delete_reference_keeps_genomes_and_their_mappings(client, postgres_pool):
+    """Genomes and feature->genome mappings outlive the reference too: they are
+    facts about the bytes, which a reload of the same genomes reuses."""
     ref_a = await _create_ref(client, f"del-genome-a-{uuid.uuid4()}")
     ref_b = await _create_ref(client, f"del-genome-b-{uuid.uuid4()}")
 
@@ -648,37 +623,36 @@ async def test_delete_reference_gcs_orphan_genome_keeps_shared(client, postgres_
         assert resp.status_code == 200, resp.text
         assert resp.json()["orphan_feature_count"] == 2
 
-        # Orphan genome GC'd; shared genome retained (survivor_feat still maps it).
         assert (
             await postgres_pool.fetchval(
-                "SELECT 1 FROM qiita.genome WHERE genome_idx = $1", genome_orphan
+                "SELECT count(*) FROM qiita.feature_genome WHERE feature_idx = ANY($1::bigint[])",
+                [orphan_feat, orphan_feat2, survivor_feat],
             )
-            is None
+            == 3
         )
         assert (
             await postgres_pool.fetchval(
-                "SELECT 1 FROM qiita.genome WHERE genome_idx = $1", genome_shared
+                "SELECT count(*) FROM qiita.genome WHERE genome_idx = ANY($1::bigint[])",
+                [genome_shared, genome_orphan],
             )
-            == 1
-        )
-        # Survivor feature + its feature_genome mapping intact.
-        assert (
-            await postgres_pool.fetchval(
-                "SELECT 1 FROM qiita.feature_genome WHERE feature_idx = $1", survivor_feat
-            )
-            == 1
+            == 2
         )
     finally:
+        features = [orphan_feat, orphan_feat2, survivor_feat]
         await postgres_pool.execute(
-            "DELETE FROM qiita.feature_genome WHERE feature_idx = $1", survivor_feat
+            "DELETE FROM qiita.feature_genome WHERE feature_idx = ANY($1::bigint[])", features
         )
         await postgres_pool.execute(
-            "DELETE FROM qiita.reference_membership WHERE feature_idx = $1", survivor_feat
+            "DELETE FROM qiita.reference_membership WHERE feature_idx = ANY($1::bigint[])",
+            features,
         )
         await postgres_pool.execute(
-            "DELETE FROM qiita.feature WHERE feature_idx = $1", survivor_feat
+            "DELETE FROM qiita.feature WHERE feature_idx = ANY($1::bigint[])", features
         )
-        await postgres_pool.execute("DELETE FROM qiita.genome WHERE genome_idx = $1", genome_shared)
+        await postgres_pool.execute(
+            "DELETE FROM qiita.genome WHERE genome_idx = ANY($1::bigint[])",
+            [genome_shared, genome_orphan],
+        )
 
 
 async def test_delete_reference_data_plane_failure_returns_502(client, postgres_pool, monkeypatch):
