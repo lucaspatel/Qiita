@@ -8,11 +8,14 @@
   // One task per screen. Local data only (lib/libraryPrep/); nothing is sent.
   import { untrack } from 'svelte';
   import { api, type PrepProtocol } from '$lib/api';
+  import { scopedKey } from '$lib/environment';
   import PlateMap, { type Well } from '$lib/ui/PlateMap.svelte';
   import {
+    MIN_BLANKS,
     RUN_FOLDERS,
     STUDIES,
     WELLS_96,
+    barcodeProblems,
     demoBox,
     mockGolay,
     parseVisionMate,
@@ -20,6 +23,7 @@
     to384,
     toVisionMate,
     validatePlates,
+    validateStudy,
     type Demo,
     type Rack,
     type Resolution
@@ -91,6 +95,8 @@
     a.click();
   }
   const downloadDemoRacks = () => demoBox().racks.forEach((r) => download(r.fileName, toVisionMate(r)));
+  /** A rack whose scan has a problem is refused until it is removed or rescanned. */
+  const refused = $derived(racks.filter((r) => r.problems.length));
 
   // --- resolution: what Qiita-miint answers for every tube, and the tech's decisions ---
   type Decision = { primary?: number; exclude?: boolean; blank?: boolean };
@@ -149,9 +155,23 @@
   const blanks = $derived(all.filter((x) => x.cell.state === 'blank'));
   const needFix = $derived(unknown.length + multi.length + dupes.length);
   const blanksOn = (r: number) => blanks.filter((x) => x.r === r).length;
-  /** The study a rack's samples belong to (its blanks follow it). */
-  const studyOfRack = (r: number) =>
-    all.find((x) => x.r === r && x.cell.state === 'sample')?.cell as { study: string } | undefined;
+  /** The studies a rack's samples belong to, in well order. */
+  const studiesOfRack = (r: number) => [
+    ...new Set(all.flatMap((x) => (x.r === r && x.cell.state === 'sample' ? [x.cell.study] : [])))
+  ];
+  /** Where a plate's blanks go when its samples are of more than one study: one
+   *  study's sheet, or EACH study's (the blank is then in every sheet). */
+  const EACH = 'each';
+  let blanksTo = $state<Record<string, string>>({});
+  const mixedRacks = $derived(
+    racks.flatMap((rack, r) => (studiesOfRack(r).length > 1 && blanksOn(r) ? [{ rack, r }] : []))
+  );
+  const blankStudies = (r: number): string[] => {
+    const studies = studiesOfRack(r);
+    if (studies.length <= 1) return studies;
+    const to = blanksTo[racks[r].rackId];
+    return to === EACH ? studies : to ? [to] : [];
+  };
   const studyKeys = $derived(
     [...new Set(all.flatMap((x) => (x.cell.state === 'sample' ? [x.cell.study] : [])))]
   );
@@ -194,20 +214,37 @@
       if (cell.state === 'sample') out[well] = { fill: colorOf(cell.study), title: `${tube}${cell.qb ? ` · ${cell.qb}` : ''}` };
       else if (cell.state === 'blank') out[well] = { fill: '#9ca3af', title: `blank · ${tube}`, mark: 'B' };
       else if (cell.state === 'excluded') out[well] = { fill: '#e5e7eb', title: `left out · ${tube}`, mark: '×' };
-      else out[well] = { fill: '#fecaca', ring: 'ring-red-500', title: `unresolved · ${tube}`, mark: '!' };
+      else out[well] = { fill: '#fecaca', ring: 'ring-red-500', title: `${tube} · ${problemOf(cell)}`, mark: '!' };
     }
     return out;
   }
+  function problemOf(cell: Cell): string {
+    if (cell.state === 'unknown') return 'not in Qiita-miint';
+    if (cell.state === 'multi') return `in ${cell.studies.length} studies: choose one`;
+    if (cell.state === 'duplicate') return `the same tube is also at ${cell.other}`;
+    return '';
+  }
+  /** Every tube Fix still has to settle, for the study owner or the tech's notes. */
+  const downloadProblems = () =>
+    download(
+      'unplaced-tube-codes.tsv',
+      ['rack\twell\ttube_code\tproblem', ...[...unknown, ...multi, ...dupes].map((x) => `${racks[x.r].rackId}\t${x.well}\t${x.tube}\t${problemOf(x.cell)}`)].join('\n')
+    );
   const toggleBlank = (r: number, well: string) => {
     if (cells[r]?.[well]) decide(r, well, { blank: !(decisions[keyOf(r, well)]?.blank ?? false) });
   };
-  const placed = $derived(rackAt.flatMap((r, i) => (r === null ? [] : [{ r, position: String(i + 1) }])));
+  // rackAt catches up with a removed rack an effect later; until then skip what's gone.
+  const placed = $derived(
+    rackAt.flatMap((r, i) => (r === null || r >= racks.length ? [] : [{ r, position: String(i + 1) }]))
+  );
   const layoutProblems = $derived.by(() => {
     const p: string[] = [];
     if (new Set(placed.map((x) => x.r)).size !== placed.length) p.push('A rack is in two positions');
     if (new Set(placed.map((x) => x.r)).size !== racks.length) p.push('Every rack needs a position');
     const pp = placed.map((x) => primerAt[Number(x.position) - 1]);
     if (new Set(pp).size !== pp.length) p.push('A primer plate is used twice');
+    for (const { rack } of mixedRacks)
+      if (!blanksTo[rack.rackId]) p.push(`Say which study ${rack.rackId}'s blanks belong to`);
     return p;
   });
 
@@ -216,15 +253,46 @@
   let plateFacts = $state<Record<string, Plate>>({});
   let studyFacts = $state<Record<string, StudyFacts>>({});
   let run = $state<RunFacts>({ run_date: '', instrument_model: '', platemap_generation_date: '' });
-  // Seed what the tech would type from the demo's defaults; keep what they've typed.
+  // The last prep's plate facts and instrument, so the lots and tools that repeat
+  // run to run arrive filled. A convenience: storage may be absent, and anything
+  // malformed is ignored.
+  const LAST_KEY = scopedKey('qiita-web:library-prep:last');
+  type Last = { plate: Partial<Plate>; instrument_model: string; when: string };
+  function loadLast(): Last | null {
+    try {
+      const v = JSON.parse(localStorage.getItem(LAST_KEY) ?? 'null');
+      return v && typeof v === 'object' && typeof v.plate === 'object' ? (v as Last) : null;
+    } catch {
+      return null;
+    }
+  }
+  function saveLast() {
+    const first = placed[0];
+    if (!first) return;
+    const { sample_plate: _s, primer_plate: _p, ...plate } = plateFacts[racks[first.r].rackId];
+    try {
+      localStorage.setItem(LAST_KEY, JSON.stringify({ plate, instrument_model: run.instrument_model, when: new Date().toISOString().slice(0, 10) }));
+    } catch {
+      // Storage unavailable: the next prep starts empty.
+    }
+  }
+  const last = loadLast();
+  let prefilled = $state(false);
+  // Seed what the tech would type: the demo's values for its racks, the last prep's
+  // for any other; keep what they've typed.
   $effect(() => {
     const d = demo;
     const rs = racks;
     untrack(() => {
-      for (const rack of rs)
-        plateFacts[rack.rackId] ??= { ...(d?.plates[rack.rackId]?.facts ?? EMPTY_PLATE) };
+      for (const rack of rs) {
+        if (plateFacts[rack.rackId]) continue;
+        const known = d?.plates[rack.rackId]?.facts;
+        if (!known && last) prefilled = true;
+        plateFacts[rack.rackId] = { ...(known ?? { ...EMPTY_PLATE, ...last?.plate, sample_plate: '' }) };
+      }
       for (const [k, v] of Object.entries(d?.studyFacts ?? {})) studyFacts[k] ??= { ...v };
       if (d && !run.run_date) run = { ...d.run };
+      else if (!run.instrument_model && last) run.instrument_model = last.instrument_model;
     });
   });
   const factsAt = (position: string, r: number): Plate => ({
@@ -234,11 +302,12 @@
   const messages = $derived(validatePlates(placed.map(({ r, position }) => ({ position, facts: factsAt(position, r) }))));
   const errors = $derived([...new Set(messages.filter((m) => m.level === 'error').map((m) => m.text))]);
   const warnings = $derived([...new Set(messages.filter((m) => m.level === 'warning').map((m) => m.text))]);
-  const studyErrors = $derived(
-    studyKeys.flatMap((k) =>
-      STUDY_COLUMNS.filter(([c]) => !(studyFacts[k]?.[c] ?? '').trim()).map(([, label]) => `${titleOf(k)}: ${label} is empty`)
-    )
-  );
+  const STUDY_LABELS = Object.fromEntries(STUDY_COLUMNS);
+  const studyErrors = $derived([
+    ...studyKeys.flatMap((k) => (studyFacts[k] ? validateStudy(titleOf(k), studyFacts[k], STUDY_LABELS) : [])),
+    ...(/^\d{4}-\d{2}-\d{2}$/.test(run.run_date) ? [] : ['Run date must be YYYY-MM-DD']),
+    ...Object.entries(run).flatMap(([k, v]) => (/[^\x00-\x7f]/.test(v) ? [`Run: ${k} has a non-ASCII character`] : []))
+  ]);
   const fillRight = (col: (typeof PLATE_COLUMNS)[number][0]) => {
     const first = placed[0];
     if (!first) return;
@@ -250,13 +319,12 @@
   const sheetWells = $derived(
     placed.flatMap(({ r, position }) => {
       const plate = factsAt(position, r);
-      const rackStudy = studyOfRack(r)?.study;
+      const toBlanks = blankStudies(r);
       return Object.entries(cells[r] ?? {}).flatMap(([well96, v]) => {
         const blank = v.cell.state === 'blank';
         if (!blank && v.cell.state !== 'sample') return [];
-        const study = blank ? rackStudy : (v.cell as { study: string }).study;
-        if (!study) return [];
-        return [
+        const studies = blank ? toBlanks : [(v.cell as { study: string }).study];
+        return studies.map((study) => (
           {
             study,
             position,
@@ -268,11 +336,23 @@
             barcode: demo?.barcodes.get(`${plate.primer_plate}:${well96}`) ?? mockGolay(plate.primer_plate, well96),
             plate
           }
-        ];
+        ));
       });
     })
   );
-  const clashes = $derived(sheetWells.length - new Set(sheetWells.map((w) => w.barcode)).size);
+  // A blank copied into each study's sheet is one well, not a barcode clash.
+  const barcodeIssues = $derived(barcodeProblems([...new Map(sheetWells.map((w) => [w.well384, w])).values()]));
+  /** The 384-well plate as it will be loaded: each well in its study's colour. */
+  const plate384 = $derived(
+    Object.fromEntries(
+      sheetWells.map((w) => [
+        w.well384,
+        w.control
+          ? { fill: '#9ca3af', title: `${w.name} · blank`, mark: 'B' }
+          : { fill: colorOf(w.study), title: `${w.name} · ${titleOf(w.study)} · ${w.barcode}` }
+      ])
+    ) as Record<string, Well>
+  );
   const sheets = $derived(
     studyKeys.map((key) => {
       const wells = sheetWells.filter((w) => w.study === key);
@@ -297,7 +377,7 @@
 
   const canLeave = $derived([
     !!protocol && !!target,
-    racks.length > 0 && !checking,
+    racks.length > 0 && !checking && refused.length === 0,
     needFix === 0,
     layoutProblems.length === 0,
     errors.length === 0 && studyErrors.length === 0,
@@ -413,15 +493,22 @@
     {#if racks.length}
       <ul role="list" class="mt-4 divide-y divide-gray-100 rounded-md border border-gray-200 text-sm">
         {#each racks as rack, r}
-          <li class="flex items-center justify-between gap-3 px-4 py-2">
-            <span><span class="font-medium text-gray-900">{rack.rackId}</span> <span class="text-gray-500">· {rack.tubes.length} tubes</span></span>
-            {#each rack.problems as p}<span class="text-xs text-red-700">{p}</span>{/each}
+          <li class="flex items-start justify-between gap-3 px-4 py-2">
+            <span>
+              <span class="font-medium text-gray-900">{rack.rackId}</span> <span class="text-gray-500">· {rack.fileName} · {rack.tubes.length} tubes</span>
+              {#if rack.problems.length}
+                <span class="mt-1 block text-xs text-red-700">Refused; fix the scan and drop it again:</span>
+                <span class="block text-xs text-red-700">{rack.problems.slice(0, 4).join(' · ')}{rack.problems.length > 4 ? ` · and ${rack.problems.length - 4} more` : ''}</span>
+              {/if}
+            </span>
             <button type="button" class="text-xs text-gray-400 hover:text-red-600" onclick={() => (racks = racks.filter((_, i) => i !== r))}>Remove</button>
           </li>
         {/each}
       </ul>
       <div class="mt-4">
-        {#if checking}
+        {#if refused.length}
+          <p class="text-sm text-red-700">Remove the refused {refused.length === 1 ? 'rack' : 'racks'} or rescan before going on.</p>
+        {:else if checking}
           <p class="text-sm text-gray-500">Checking {all.length} tube codes…</p>
         {:else if needFix === 0}
           <!-- Tailwind UI: feedback / alerts / with description -->
@@ -451,7 +538,21 @@
         <p class="mt-2 text-sm text-green-700">Every tube is a sample of one study, or a blank.</p>
       </div>
     {:else}
-      <h2 class="text-sm/6 font-semibold text-gray-900">Settle what Qiita-miint can't place</h2>
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <h2 class="text-sm/6 font-semibold text-gray-900">Settle what Qiita-miint can't place</h2>
+        <button type="button" class={btn} onclick={downloadProblems}>Download the {needFix} tube codes</button>
+      </div>
+      {@const problemRacks = racks.flatMap((rack, r) => (all.some((x) => x.r === r && problemOf(x.cell)) && !unknownRacks.some((u) => u.r === r) ? [{ rack, r }] : []))}
+      {#if problemRacks.length}
+        <div class="mt-4 flex flex-wrap gap-4">
+          {#each problemRacks as { rack, r } (rack.rackId)}
+            <div>
+              <p class="mb-1 text-xs font-medium text-gray-700">{rack.rackId}</p>
+              <PlateMap wells={wellsOf(r)} />
+            </div>
+          {/each}
+        </div>
+      {/if}
       <div class="mt-4 space-y-6">
         {#each unknownRacks as u (u.rack.rackId)}
           <!-- Tailwind UI: feedback / alerts / with actions -->
@@ -509,13 +610,14 @@
 
         {#if dupes.length}
           <section>
-            <h3 class="text-sm font-medium text-gray-900">Tubes on two racks</h3>
+            <h3 class="text-sm font-medium text-gray-900">Tubes scanned twice</h3>
             <p class="mt-1 text-sm text-gray-500">A tube can only be in one well. Keep one, leave the other out.</p>
             <ul role="list" class="mt-2 divide-y divide-gray-100 rounded-md border border-gray-200 text-sm">
               {#each dupes as x (x.r + x.well)}
                 <li class="flex flex-wrap items-center gap-3 px-4 py-2">
                   <span class="font-mono text-xs text-gray-700">{racks[x.r].rackId} {x.well}</span>
                   <span class="font-mono text-xs text-gray-500">{x.tube}</span>
+                  <span class="text-xs text-gray-500">also at {(x.cell as { other: string }).other}</span>
                   <span class="ml-auto"><button type="button" class={btn} onclick={() => decide(x.r, x.well, { exclude: true })}>Leave this one out</button></span>
                 </li>
               {/each}
@@ -544,18 +646,35 @@
           </div>
           <PlateMap wells={wellsOf(rackAt[i])} onpick={(w) => rackAt[i] !== null && toggleBlank(rackAt[i]!, w)} />
           {#if rackAt[i] !== null}
-            {@const s = studyOfRack(rackAt[i]!)}
-            <p class="mt-1 text-xs {blanksOn(rackAt[i]!) ? 'text-gray-500' : 'text-amber-700'}">
-              {s ? titleOf(s.study) : 'no samples'} · {blanksOn(rackAt[i]!) ? `${blanksOn(rackAt[i]!)} blanks` : 'no blank on this plate — is that right?'}
+            {@const r = rackAt[i]!}
+            {@const studies = studiesOfRack(r)}
+            <p class="mt-1 text-xs {blanksOn(r) ? 'text-gray-500' : 'text-amber-700'}">
+              {studies.length ? studies.map(titleOf).join(' + ') : 'no samples'} · {blanksOn(r) ? `${blanksOn(r)} blanks` : 'no blank on this plate — is that right?'}
             </p>
+            {#if studies.length > 1 && blanksOn(r)}
+              <label class="mt-2 flex flex-wrap items-center gap-2 text-xs {blanksTo[racks[r].rackId] ? 'text-gray-600' : 'text-red-700'}">
+                This plate mixes studies. Its blanks go to
+                <select aria-label="Blanks of {racks[r].rackId} go to" class="rounded-md border-0 py-1 pr-8 pl-2 text-xs ring-1 ring-inset {blanksTo[racks[r].rackId] ? 'ring-gray-300' : 'ring-red-400'}" bind:value={blanksTo[racks[r].rackId]}>
+                  <option value={undefined} disabled>choose…</option>
+                  {#each studies as k}<option value={k}>{titleOf(k)}</option>{/each}
+                  <option value={EACH}>each study's sheet</option>
+                </select>
+              </label>
+            {/if}
           {/if}
         </div>
       {/each}
     </div>
+    {#if blanks.length < MIN_BLANKS}
+      <p class="mt-3 text-sm text-amber-700">Only {blanks.length} blanks on this run; at least {MIN_BLANKS} are recommended.</p>
+    {/if}
     {#if layoutProblems.length}<p class="mt-3 text-sm text-red-700">{layoutProblems.join(' · ')}</p>{/if}
   {:else if step === 4}
     <h2 class="text-sm/6 font-semibold text-gray-900">Processing details</h2>
     <p class="mt-1 text-sm text-gray-500">Recorded with every sample. Write not_applicable for anything that doesn't apply.</p>
+    {#if prefilled && last}
+      <p class="mt-2 text-xs text-teal-700">Lots, tools and robots are filled from your last prep ({last.when}); check them against today's.</p>
+    {/if}
     <div class="mt-4 overflow-x-auto">
       <table class="min-w-full text-sm">
         <thead>
@@ -637,11 +756,20 @@
         </li>
       {/each}
     </ul>
-    <p class="mt-4 text-sm {clashes ? 'text-red-700' : 'text-gray-600'}">
-      {clashes ? `${clashes} wells share a Golay barcode` : `${sheetWells.length} wells, each with its own Golay barcode.`}
-    </p>
+    <div class="mt-6 flex flex-wrap items-start gap-6">
+      <PlateMap format={384} wells={plate384} />
+      <ul class="space-y-1 text-xs text-gray-600">
+        {#each studyKeys as k}<li><span class="mr-1.5 inline-block size-2.5 rounded-full align-middle" style="background:{colorOf(k)}"></span>{titleOf(k)}</li>{/each}
+        <li><span class="mr-1.5 inline-block size-2.5 rounded-full bg-gray-400 align-middle"></span>blank</li>
+      </ul>
+    </div>
+    {#if barcodeIssues.length}
+      <ul class="mt-4 space-y-1 text-sm text-red-700">{#each barcodeIssues as t}<li>{t}</li>{/each}</ul>
+    {:else}
+      <p class="mt-4 text-sm text-gray-600">{Object.keys(plate384).length} wells, each with its own Golay barcode.</p>
+    {/if}
     <div class="mt-4 flex flex-wrap items-center gap-3">
-      <button type="button" class="rounded-md bg-teal-600 px-3 py-2 text-sm font-semibold text-white shadow-xs hover:bg-teal-500 disabled:opacity-50" disabled={built || clashes > 0} onclick={() => (built = true)}>
+      <button type="button" class="rounded-md bg-teal-600 px-3 py-2 text-sm font-semibold text-white shadow-xs hover:bg-teal-500 disabled:opacity-50" disabled={built || barcodeIssues.length > 0} onclick={() => ((built = true), saveLast())}>
         {built ? 'Pre-flight built' : 'Build pre-flight'}
       </button>
       {#if built}
@@ -666,7 +794,7 @@
           <button type="button" class="rounded-md bg-teal-600 px-3 py-2 text-sm font-semibold text-white shadow-xs hover:bg-teal-500" onclick={() => (started = true)}>Start demux → amplicon</button>
         {:else}
           <ol class="space-y-2 text-sm">
-            <li class="flex items-center gap-2"><span class="size-2 rounded-full bg-blue-500"></span>golay-demux — queued with {preflightName}: {sheetWells.filter((w) => w.study !== OTHER).length} Qiita-miint wells</li>
+            <li class="flex items-center gap-2"><span class="size-2 rounded-full bg-blue-500"></span>golay-demux — queued with {preflightName}: {new Set(sheetWells.filter((w) => w.study !== OTHER).map((w) => w.well384)).size} Qiita-miint wells</li>
             <li class="flex items-center gap-2"><span class="size-2 rounded-full bg-gray-300"></span>amplicon — starts when demux completes (trim 150, deblur → ASVs → feature table)</li>
           </ol>
         {/if}

@@ -17,37 +17,44 @@ export const WELLS_96 = ROWS_96.flatMap((r) => COLS_96.map((c) => `${r}${c}`));
 export type RackTube = { well: string; tube: string; rackId: string };
 export type Rack = { fileName: string; rackId: string; tubes: RackTube[]; problems: string[] };
 
-/** Parse a VisionMate export (TubeCode, LocationCell, LocationColumn, LocationRow,
- *  RackID, Time, Date). Tube codes are normalised to Qiita's 10-digit form
- *  (spreadsheets eat leading zeroes). */
+/** The columns every VisionMate export carries; a file missing one is not a rack scan. */
+export const VISIONMATE_COLUMNS = ['TubeCode', 'LocationCell', 'LocationColumn', 'LocationRow', 'RackID', 'Time', 'Date'];
+
+/** Parse a VisionMate export. Tube codes are normalised to Qiita's 10-digit form
+ *  (spreadsheets eat leading zeroes). A rack with any problem is refused whole:
+ *  a scan that can't be trusted in one well can't be trusted in the others. A tube
+ *  scanned twice is not a problem here; Fix settles it with the other duplicates. */
 export function parseVisionMate(fileName: string, text: string): Rack {
   const lines = text.split(/\r?\n/).filter((l) => l.trim());
-  const problems: string[] = [];
   const header = (lines.shift() ?? '').split('\t').map((h) => h.trim());
-  const [iTube, iCell, iRack] = ['TubeCode', 'LocationCell', 'RackID'].map((n) => header.indexOf(n));
-  if (iTube < 0 || iCell < 0)
-    return { fileName, rackId: '?', tubes: [], problems: ['not a VisionMate file: needs TubeCode and LocationCell'] };
+  const missing = VISIONMATE_COLUMNS.filter((c) => !header.includes(c));
+  if (missing.length)
+    return { fileName, rackId: '?', tubes: [], problems: [`not a VisionMate scan: no ${missing.join(', ')} column`] };
+  const [iTube, iCell, iCol, iRow, iRack] = VISIONMATE_COLUMNS.map((n) => header.indexOf(n));
+  const problems: string[] = [];
   const tubes: RackTube[] = [];
-  const seen = new Map<string, string>();
+  const rackIds = new Set<string>();
   for (const line of lines) {
     const f = line.split('\t').map((x) => x.trim());
-    const well = f[iCell]?.toUpperCase();
+    const well = (f[iCell] ?? '').toUpperCase();
     const raw = f[iTube] ?? '';
     if (!WELLS_96.includes(well)) {
       problems.push(`"${line.slice(0, 40)}": ${well || 'no'} well is not on a 96-well rack`);
       continue;
     }
+    if (`${(f[iRow] ?? '').toUpperCase()}${Number(f[iCol])}` !== well)
+      problems.push(`${well}: its row and column say ${f[iRow]}${f[iCol]}`);
+    if (f[iRack]) rackIds.add(f[iRack]);
     if (!raw || /^no ?read$|^no ?tube$/i.test(raw)) continue; // an empty position
     if (!/^\d{1,10}$/.test(raw)) {
       problems.push(`${well}: "${raw}" is not a tube code`);
       continue;
     }
-    const tube = raw.padStart(10, '0');
-    if (seen.has(tube)) problems.push(`tube ${tube} is in ${seen.get(tube)} and ${well}`);
-    seen.set(tube, well);
-    tubes.push({ well, tube, rackId: iRack >= 0 ? f[iRack] : '' });
+    tubes.push({ well, tube: raw.padStart(10, '0'), rackId: f[iRack] });
   }
-  return { fileName, rackId: tubes[0]?.rackId || fileName.replace(/\.\w+$/, ''), tubes, problems };
+  if (rackIds.size > 1) problems.push(`rows name ${rackIds.size} racks: ${[...rackIds].join(', ')}`);
+  if (!tubes.length) problems.push('no readable tubes');
+  return { fileName, rackId: [...rackIds][0] || fileName.replace(/\.\w+$/, ''), tubes, problems };
 }
 
 export function toVisionMate(rack: Rack): string {
@@ -69,6 +76,7 @@ export function to384(position: string, well96: string): string {
 /** A stand-in Golay barcode for a primer-plate well the fixture doesn't cover; the
  *  real table is metapool's EMP primer plates, which belong on the server. */
 export function mockGolay(primerPlate: string, well96: string): string {
+  if (!/^([1-9]|10)$/.test(primerPlate)) return '';
   let h = 2166136261;
   for (const ch of `${primerPlate}:${well96}`) h = Math.imul(h ^ ch.charCodeAt(0), 16777619);
   return Array.from({ length: 12 }, (_, i) => 'ACGT'[(h >>> (i * 2)) & 3]).join('');
@@ -85,8 +93,18 @@ export function sampleName(tube: string, blank: boolean, abbreviation: string, s
 // --- what Qiita-miint knows (the mock's stand-in for POST /biosample/resolve-roster) ---
 
 export type Study = { study_idx: number; classicId: number; title: string };
-/** The studies in Qiita-miint; only IBD of this run's two. */
-export const STUDIES: Study[] = [{ study_idx: 25060, classicId: 15663, title: 'IBD' }];
+/** The studies in Qiita-miint: IBD, and a made-up infant-gut study that has six
+ *  tubes on the diet study's first rack (so that plate mixes studies). */
+export const STUDIES: Study[] = [
+  { study_idx: 25060, classicId: 15663, title: 'IBD' },
+  { study_idx: 25071, classicId: 14812, title: 'Infant gut' }
+];
+const INFANT: StudyFacts = {
+  project_name: 'INFANT_14812',
+  project_abbreviation: 'INF',
+  center_project_name: 'Infant gut',
+  experiment_design_description: '16S sequencing of infant stool (made up for the demo)'
+};
 
 export type Resolution =
   | { kind: 'ok'; qb: string; study_idx: number }
@@ -140,6 +158,7 @@ export function demoBox(): Demo {
     const tubes = WELLS_96.map((well, w) => {
       const tube = String(365100000 + n * 1000 + w).padStart(10, '0');
       if (well === 'G12' || well === 'H12') registry.set(tube, { kind: 'blank' });
+      else if (n === 7 && w < 6) registry.set(tube, { kind: 'ok', qb: `QB${13100 + w}`, study_idx: 25071 });
       return { well, tube, rackId };
     });
     racks.push({ fileName: `${rackId}.tsv`, rackId, tubes, problems: [] });
@@ -154,7 +173,7 @@ export function demoBox(): Demo {
     registry,
     plates,
     barcodes,
-    studyFacts: { '25060': { ...fix.study } },
+    studyFacts: { '25060': { ...fix.study }, '25071': { ...INFANT } },
     otherStudy: OTHER,
     run: { ...fix.run }
   };
@@ -169,6 +188,10 @@ function positionOf(well96: string, well384: string): string {
 
 export type Message = { level: 'error' | 'warning'; text: string };
 
+const NON_ASCII = /[^\x00-\x7f]/;
+/** Today as YYYY-MM-DD, for the primer-date check. */
+const today = () => new Date().toISOString().slice(0, 10);
+
 export function validatePlates(plates: { position: string; facts: Plate }[]): Message[] {
   const out: Message[] = [];
   const repeated = (label: string, values: string[]) => {
@@ -181,18 +204,59 @@ export function validatePlates(plates: { position: string; facts: Plate }[]): Me
   for (const { position, facts: f } of plates) {
     const at = `Position ${position}`;
     const pp = Number(f.primer_plate);
-    if (!Number.isInteger(pp) || pp < 1 || pp > 10)
+    if (!/^\d+$/.test(f.primer_plate) || pp < 1 || pp > 10)
       out.push({ level: 'error', text: `${at}: primer plate # "${f.primer_plate}" is not between 1 and 10` });
-    for (const [k, v] of Object.entries(f))
+    else if (pp >= 9)
+      out.push({ level: 'warning', text: `${at}: primer plate ${pp} is unusual; check it` });
+    for (const [k, v] of Object.entries(f)) {
       if (!v.trim()) out.push({ level: 'error', text: `${at}: ${k} is empty (write not_applicable)` });
+      if (NON_ASCII.test(v)) out.push({ level: 'error', text: `${at}: ${k} has a non-ASCII character` });
+    }
     if (/\s/.test(f.sample_plate)) out.push({ level: 'warning', text: `${at}: spaces in the sample plate name` });
     if (f.primer_date && !/^\d{4}-\d{2}-\d{2}$/.test(f.primer_date))
       out.push({ level: 'error', text: `${at}: primer date must be YYYY-MM-DD` });
+    else if (f.primer_date > today())
+      out.push({ level: 'warning', text: `${at}: primer date ${f.primer_date} is in the future` });
   }
   repeated('Primer plate', plates.map((p) => p.facts.primer_plate));
   repeated('Sample plate', plates.map((p) => p.facts.sample_plate));
   return out;
 }
+
+/** A study's facts: all filled, ASCII, a project name ending in its Qiita study ID,
+ *  and an abbreviation that is safe inside a blank's sample name. */
+export function validateStudy(title: string, f: StudyFacts, labels: Record<string, string>): string[] {
+  const out: string[] = [];
+  for (const [k, v] of Object.entries(f)) {
+    if (!v.trim()) out.push(`${title}: ${labels[k] ?? k} is empty`);
+    else if (NON_ASCII.test(v)) out.push(`${title}: ${labels[k] ?? k} has a non-ASCII character`);
+  }
+  if (f.project_name.trim() && !/_\d+$/.test(f.project_name))
+    out.push(`${title}: project name must end in _<Qiita study ID>, like IBD_15663`);
+  if (f.project_abbreviation.trim() && !/^[A-Za-z0-9.-]+$/.test(f.project_abbreviation))
+    out.push(`${title}: abbreviation may only use letters, digits, "." and "-"`);
+  return out;
+}
+
+/** The pre-flight's barcode check: every well has a 12-base Golay barcode, and no
+ *  two wells share one (demux could not tell them apart). */
+export function barcodeProblems(wells: { well384: string; name: string; barcode: string }[]): string[] {
+  const out: string[] = [];
+  const missing = wells.filter((w) => !/^[ACGT]{12}$/.test(w.barcode));
+  if (missing.length)
+    out.push(`${missing.length} wells have no barcode: ${missing.slice(0, 5).map((w) => w.well384).join(', ')}${missing.length > 5 ? '…' : ''}`);
+  const seen = new Map<string, string>();
+  for (const w of wells) {
+    if (!w.barcode) continue;
+    const other = seen.get(w.barcode);
+    if (other) out.push(`${w.well384} and ${other} share barcode ${w.barcode}`);
+    else seen.set(w.barcode, w.well384);
+  }
+  return out;
+}
+
+/** Fewer negative controls than this on a run draws a warning (the notebook's rule). */
+export const MIN_BLANKS = 6;
 
 /** A run folder on the ingest roots (server: POST /run-folder/inspect). */
 export const RUN_FOLDERS = [
