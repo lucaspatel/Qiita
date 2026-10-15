@@ -338,6 +338,7 @@ from qiita_common.models.step import (
     StepSubmitRequest,
 )
 from qiita_common.models.study import (
+    LEGACY_IDX_RESERVED_CEILING,
     StudyAccessGrant,
     StudyAccessResponse,
     StudyAccessTierUpdate,
@@ -460,6 +461,7 @@ __all__ = [
     "INDEX_TYPE_MINIMAP2",
     "INDEX_TYPE_RYPE_ROUTER",
     "INDEX_TYPE_SYLPH",
+    "LEGACY_IDX_RESERVED_CEILING",
     "MATRIX_TUBE_ID_PATTERN",
     "MISSING_REASON_CONTROL_SAMPLE",
     "MISSING_REASON_NOT_APPLICABLE",
