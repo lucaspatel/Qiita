@@ -11,21 +11,31 @@
     format = 96,
     wells,
     selected = null,
+    fill = false,
     onpick
   }: {
     format?: 96 | 384;
     wells: Record<string, Well>;
     selected?: string | null;
+    // When true, the plate stretches to fill its container width (wells become
+    // 1fr / aspect-square) instead of drawing at a fixed cell size.
+    fill?: boolean;
     onpick?: (well: string) => void;
   } = $props();
 
   const rows = $derived(format === 96 ? ROWS_96 : ROWS_384);
   const cols = $derived(format === 96 ? COLS_96 : COLS_384);
   const size = $derived(format === 96 ? 'size-7' : 'size-[15px]');
+  const cellClass = $derived(fill ? 'aspect-square w-full' : size);
+  const template = $derived(
+    fill
+      ? `auto repeat(${cols.length}, minmax(0, 1fr))`
+      : `auto repeat(${cols.length}, min-content)`
+  );
 </script>
 
-<div class="inline-block rounded-xl border border-gray-300 bg-gray-50 p-2 shadow-inner">
-  <div class="grid gap-[3px]" style="grid-template-columns: auto repeat({cols.length}, min-content)">
+<div class="{fill ? 'block w-full' : 'inline-block'} rounded-xl border border-gray-300 bg-gray-50 p-2 shadow-inner">
+  <div class="grid gap-[3px]" style="grid-template-columns: {template}">
     <span></span>
     {#each cols as c}
       <span class="text-center text-[9px] leading-3 text-gray-400">{c}</span>
@@ -37,7 +47,7 @@
         {@const w = wells[id]}
         <button
           type="button"
-          class="{size} flex items-center justify-center rounded-full text-[8px] font-semibold text-white transition
+          class="{cellClass} flex items-center justify-center rounded-full text-[8px] font-semibold text-white transition
             {w ? '' : 'border border-dashed border-gray-300 bg-white'}
             {selected === id ? 'ring-2 ring-gray-900 ring-offset-1' : w?.ring ? `ring-2 ${w.ring}` : ''}"
           style={w ? `background:${w.fill}` : ''}

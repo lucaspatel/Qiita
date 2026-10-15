@@ -36,8 +36,19 @@
     type RunFacts,
     type StudyFacts
   } from '$lib/libraryPrep/sampleSheet';
+  import * as lr from '$lib/libraryPrep/longRead';
+  import type {
+    PoolSample as LrSample,
+    Protocol as LrProtocol,
+    RunFacts as LrRunFacts
+  } from '$lib/libraryPrep/longRead';
 
-  const STEPS = ['Protocol', 'Scan', 'Fix', 'Plates', 'Details', 'Pre-flight', 'Sequence'];
+  // Flow bars by protocol. The short-read flow lays out plates and Golay-demuxes;
+  // the long-read flow is a multiplexed PacBio pool, demuxed upstream, authored
+  // straight into a pre-flight. Selecting the protocol reshapes the bar in place.
+  // Short-read folds scanning, fixing and plate layout into one quadrant screen.
+  const SHORT_STEPS = ['Protocol', 'Plates', 'Details', 'Pre-flight', 'Sequence'];
+  const LONG_STEPS = ['Protocol', 'Pool', 'Barcodes', 'Details', 'Pre-flight', 'Sequence'];
   let step = $state(0);
   let reached = $state(0);
   const go = (i: number) => {
@@ -47,23 +58,53 @@
 
   // --- 1. protocol ---
   const SUPPORTED_PROTOCOL = 'short_read_amplicon';
-  let protocols = $state<string[]>([SUPPORTED_PROTOCOL]);
+  const LONGREAD_PROTOCOL = 'long_read_amplicon';
+  const isEnabledProtocol = (p: string) => p === SUPPORTED_PROTOCOL || p === LONGREAD_PROTOCOL;
+  let protocols = $state<string[]>([SUPPORTED_PROTOCOL, LONGREAD_PROTOCOL]);
+  // The long-read flow exists, so always offer it as an entry point even if the
+  // catalog has no protocol row for it yet; the catalog's own protocols fill in
+  // the rest (short-read enabled, others shown but not in this flow).
+  const withFlows = (names: string[]) =>
+    [...new Set([SUPPORTED_PROTOCOL, LONGREAD_PROTOCOL, ...names])].sort(
+      (a, b) => Number(isEnabledProtocol(b)) - Number(isEnabledProtocol(a))
+    );
   $effect(() => {
     api.prepProtocols().then((r) => {
       if (r.ok && r.data.length)
-        protocols = r.data
-          .filter((p: PrepProtocol) => !p.retired)
-          .map((p) => p.name)
-          .sort((a, b) => Number(b === SUPPORTED_PROTOCOL) - Number(a === SUPPORTED_PROTOCOL));
+        protocols = withFlows(r.data.filter((p: PrepProtocol) => !p.retired).map((p) => p.name));
     });
   });
   let protocol = $state<string | null>(null);
+  // Picking a protocol reshapes the flow bar and restarts at step 0 (Protocol).
+  const pickProtocol = () => {
+    target = null;
+    step = 0;
+    reached = 0;
+  };
   const TARGETS = [
     { id: '16S', label: '16S V4 · 515fbc / 806r (EMP Golay)', enabled: true },
     { id: '18S', label: '18S · 1391f / EukBr', enabled: false },
     { id: 'ITS', label: 'ITS · ITS1f / ITS2', enabled: false }
   ];
+  const LONGREAD_TARGETS = [
+    { id: 'full_16s', label: 'Full-length 16S · 27F / 1492R (UMI-tagged)', enabled: true }
+  ];
   let target = $state<string | null>(null);
+
+  // --- long-read flow state (steps 1–5 when the long-read protocol is picked) ---
+  let lrPool = $state<LrSample[]>([]);
+  const lrScanned = $derived(lrPool.length > 0);
+  const lrProblems = $derived(lr.poolProblems(lrPool));
+  let lrDetails = $state<LrProtocol>({ ...lr.PROTOCOL_FULL_16S });
+  let lrRun = $state<LrRunFacts>({ ...lr.DEMO_RUN });
+  let lrBuilt = $state(false);
+  let lrStarted = $state(false);
+  const lrPreflightName = $derived(
+    lrRun.movie_context ? `${lrRun.movie_context}.preflight.db` : 'run.preflight.db'
+  );
+  const lrPreview = $derived(lr.builderPreview(lrPool, lrDetails, lrRun));
+  const lrTitleOf = (k: string) => (k === lr.OTHER ? 'Not in Qiita-miint' : (lr.STUDIES[k]?.title ?? k));
+  const lrColorOf = (k: string) => (k === lr.OTHER ? '#9ca3af' : (lr.STUDIES[k]?.color ?? '#9ca3af'));
   const pretty = (s: string) => s.replaceAll('_', ' ').replace(/^./, (c) => c.toUpperCase());
 
   // --- 2. scan ---
@@ -195,6 +236,7 @@
   // --- 4. plates: four quadrants ---
   let rackAt = $state<(number | null)[]>([null, null, null, null]); // position 1..4 → rack index
   let primerAt = $state(['1', '2', '3', '4']);
+  let dragQuad = $state<number | null>(null); // the quadrant a scan is being dragged over
   // A removed rack frees its position; a new rack takes its demo position, else the first free one.
   $effect(() => {
     const rs = racks;
@@ -211,6 +253,71 @@
       if (fixed.some((r, i) => r !== rackAt[i])) rackAt = fixed;
     });
   });
+  // Per-quadrant scan: a rack is dropped onto one position, placed there directly.
+  async function dropToQuadrant(i: number, files: FileList | null) {
+    if (!files?.length) return;
+    demo ??= demoBox();
+    const parsed = await parseVisionMate(files[0].name, await files[0].text());
+    racks = [...racks, parsed];
+    rackAt[i] = racks.length - 1;
+    check();
+  }
+  // Load a demo rack into one quadrant (the next demo rack not already placed).
+  function demoToQuadrant(i: number) {
+    demo ??= demoBox();
+    const placedIds = new Set(rackAt.flatMap((r) => (r === null ? [] : [racks[r]?.rackId])));
+    const next = demo.racks.find((dr) => !placedIds.has(dr.rackId) && !racks.some((x) => x.rackId === dr.rackId));
+    const rack = next ?? demo.racks[i] ?? demoBox().racks[i];
+    racks = [...racks, rack];
+    rackAt[i] = racks.length - 1;
+    check();
+  }
+  // Clear a quadrant: drop its rack entirely and renumber everything keyed by rack
+  // index (rackAt, and the r:well decision records) so nothing dangles.
+  function clearQuadrant(i: number) {
+    const r0 = rackAt[i];
+    if (r0 === null) return;
+    racks = racks.filter((_, r) => r !== r0);
+    rackAt = rackAt.map((r) => (r === r0 ? null : r !== null && r > r0 ? r - 1 : r));
+    const remap = <T,>(rec: Record<string, T>): Record<string, T> =>
+      Object.fromEntries(
+        Object.entries(rec).flatMap(([k, v]) => {
+          const [r, well] = k.split(':');
+          const ri = Number(r);
+          return ri === r0 ? [] : [[`${ri > r0 ? ri - 1 : ri}:${well}`, v]];
+        })
+      );
+    decisions = remap(decisions);
+    blankEdits = remap(blankEdits);
+  }
+
+  // Everything that needs settling, across all four quadrants, as one flat list:
+  // a whole rack whose study is unknown, a stray unknown tube, a tube in several
+  // studies, a tube scanned twice, and a mixed-study plate whose blanks are
+  // unassigned. Rendered as a paginated list below the plates.
+  type Attn =
+    | { kind: 'unknown-rack'; r: number; rackId: string; n: number }
+    | { kind: 'unknown'; r: number; well: string; tube: string }
+    | { kind: 'multi'; r: number; well: string; studies: number[] }
+    | { kind: 'duplicate'; r: number; well: string; other: string }
+    | { kind: 'mixed-blank'; r: number; rackId: string; studies: string[] };
+  const attention = $derived.by<Attn[]>(() => {
+    const out: Attn[] = [];
+    for (const u of unknownRacks) out.push({ kind: 'unknown-rack', r: u.r, rackId: u.rack.rackId, n: u.n });
+    for (const x of looseUnknown) out.push({ kind: 'unknown', r: x.r, well: x.well, tube: x.tube });
+    for (const x of multi) out.push({ kind: 'multi', r: x.r, well: x.well, studies: (x.cell as { studies: number[] }).studies });
+    for (const x of dupes) out.push({ kind: 'duplicate', r: x.r, well: x.well, other: (x.cell as { other: string }).other });
+    for (const { rack, r } of mixedRacks) if (!blanksTo[rack.rackId]) out.push({ kind: 'mixed-blank', r, rackId: rack.rackId, studies: studiesOfRack(r) });
+    return out;
+  });
+  const ERR_PER_PAGE = 10;
+  let errPage = $state(0);
+  const errPages = $derived(Math.max(1, Math.ceil(attention.length / ERR_PER_PAGE)));
+  const errView = $derived(attention.slice(errPage * ERR_PER_PAGE, errPage * ERR_PER_PAGE + ERR_PER_PAGE));
+  $effect(() => {
+    if (errPage >= errPages) errPage = errPages - 1; // clamp when the list shrinks as items settle
+  });
+
   function wellsOf(r: number | null): Record<string, Well> {
     if (r === null) return {};
     const out: Record<string, Well> = {};
@@ -404,17 +511,70 @@
   let runFolder = $state<string | null>(null);
   let started = $state(false);
 
-  const canLeave = $derived([
+  // Short-read: Protocol, Plates (scan + fix + lay out, merged), Details, Pre-flight, Sequence.
+  const shortCanLeave = $derived([
     !!protocol && !!target,
-    racks.length > 0 && !checking && refused.length === 0,
-    needFix === 0,
-    layoutProblems.length === 0,
+    racks.length > 0 && !checking && refused.length === 0 && needFix === 0 && layoutProblems.length === 0,
     errors.length === 0 && studyErrors.length === 0,
     built,
     true
   ]);
-  // With nothing to fix, Scan goes straight to Plates.
-  const nextStep = $derived(step === 1 && needFix === 0 ? 3 : step + 1);
+  // Long-read: Protocol, Pool, Barcodes, Details, Pre-flight, Sequence.
+  const longCanLeave = $derived([
+    !!protocol && !!target,
+    lrScanned,
+    lrProblems.length === 0,
+    !!(lrDetails.fwd_primer && lrDetails.rev_primer && lrDetails.umi_pattern),
+    lrBuilt,
+    true
+  ]);
+
+  // Flow registry: a protocol maps to its flow — the step bar, its primer options,
+  // the per-step "can advance" gates, and where/how the pre-flight is built. A new
+  // modality is one entry here plus its body branch below; the control logic
+  // (stepper, nav, build button) is flow-agnostic and never tests a protocol name.
+  type PrimerOption = { id: string; label: string; enabled: boolean };
+  type Flow = {
+    steps: string[];
+    targets: PrimerOption[];
+    canLeave: boolean[];
+    next: (s: number) => number;
+    build: { at: number; done: boolean; disabled: boolean; run: () => void };
+  };
+  const FLOWS: Record<string, Flow> = $derived({
+    [SUPPORTED_PROTOCOL]: {
+      steps: SHORT_STEPS,
+      targets: TARGETS,
+      canLeave: shortCanLeave,
+      next: (s) => s + 1,
+      build: {
+        at: 3,
+        done: built,
+        disabled: barcodeIssues.length > 0,
+        run: () => {
+          built = true;
+          saveLast();
+        }
+      }
+    },
+    [LONGREAD_PROTOCOL]: {
+      steps: LONG_STEPS,
+      targets: LONGREAD_TARGETS,
+      canLeave: longCanLeave,
+      next: (s) => s + 1,
+      build: {
+        at: 4,
+        done: lrBuilt,
+        disabled: lrProblems.length > 0,
+        run: () => (lrBuilt = true)
+      }
+    }
+  });
+  const flow = $derived(FLOWS[protocol ?? SUPPORTED_PROTOCOL]);
+  const steps = $derived(flow.steps);
+  const targets = $derived(flow.targets);
+  const canLeave = $derived(flow.canLeave);
+  const nextStep = $derived(flow.next(step));
 
   const btn = 'rounded-md bg-white px-2.5 py-1 text-xs font-semibold text-gray-900 shadow-xs ring-1 ring-gray-300 ring-inset hover:bg-gray-50';
   /** Tailwind UI: forms / select menus / simple native (the chevron is `chevron`). */
@@ -427,6 +587,75 @@
    *  input reads and writes YYYY-MM-DD. */
   const isoDate = (d: string) => d.replace(/^(\d{4})(\d{2})(\d{2})$/, '$1-$2-$3');
   const input = 'block w-full rounded-md bg-white px-2 py-1 text-sm text-gray-900 outline-1 -outline-offset-1 focus:outline-2 focus:-outline-offset-2 focus:outline-teal-600';
+
+  // --- draft cache: resume an in-progress prep across a refresh -----------------
+  // The whole wizard is scratch until it is submitted, so it lives in localStorage
+  // (scoped like every other key). Autosaved on any change, rehydrated on load, and
+  // cleared once the prep is submitted (its truth then lives on the server — the
+  // run/pool are content-addressed, so even a stale resumed draft re-submits to the
+  // same entities). `demo` holds Maps and is reconstructed via demoBox(), not stored.
+  const DRAFT_KEY = scopedKey('qiita-web:library-prep:draft');
+  const hasProgress = $derived(step > 0 || racks.length > 0 || lrPool.length > 0);
+  const submitted = $derived(started || lrStarted);
+
+  function snapshot() {
+    return {
+      protocol, target, step, reached, demoLoaded: demo !== null,
+      racks, decisions, sheetOnly, blankEdits, editBlanks, plateFacts, studyFacts, run, built, started,
+      lrPool, lrDetails, lrRun, lrBuilt, lrStarted
+    };
+  }
+
+  let resumed = $state(false);
+  // Rehydrate once at load, before any autosave can overwrite it. Every field is
+  // assigned from the saved draft (a full snapshot), so no current state is read.
+  try {
+    const d = JSON.parse(localStorage.getItem(DRAFT_KEY) ?? 'null');
+    if (d && typeof d === 'object' && (d.step > 0 || d.racks?.length || d.lrPool?.length)) {
+      protocol = d.protocol;
+      target = d.target;
+      step = d.step;
+      reached = d.reached;
+      racks = d.racks;
+      decisions = d.decisions;
+      sheetOnly = d.sheetOnly;
+      blankEdits = d.blankEdits;
+      editBlanks = d.editBlanks;
+      plateFacts = d.plateFacts;
+      studyFacts = d.studyFacts;
+      run = d.run;
+      built = d.built;
+      started = d.started;
+      lrPool = d.lrPool;
+      lrDetails = d.lrDetails;
+      lrRun = d.lrRun;
+      lrBuilt = d.lrBuilt;
+      lrStarted = d.lrStarted;
+      if (d.demoLoaded) demo = demoBox(); // reconstruct the mock Qiita-miint (Maps don't serialize)
+      resumed = true;
+    }
+  } catch {
+    // Storage unavailable or malformed: start fresh.
+  }
+
+  $effect(() => {
+    const draft = snapshot(); // reads every field, so this runs on any change
+    try {
+      if (submitted) localStorage.removeItem(DRAFT_KEY); // submitted → server is the truth
+      else if (hasProgress) localStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
+    } catch {
+      // Storage unavailable: the prep just won't survive a refresh.
+    }
+  });
+
+  function startOver() {
+    try {
+      localStorage.removeItem(DRAFT_KEY);
+    } catch {
+      // ignore
+    }
+    location.reload();
+  }
 </script>
 
 {#snippet chevron()}
@@ -440,18 +669,31 @@
   </ul>
 {/snippet}
 
+{#snippet lrField(label: string, value: string, set: (v: string) => void, mono = false)}
+  <label class="block">
+    <span class="block text-sm/6 font-medium text-gray-900">{label}</span>
+    <input class="{field} {mono ? 'font-mono text-xs' : ''}" {value} oninput={(e) => set(e.currentTarget.value)} />
+  </label>
+{/snippet}
+
 <div class="mb-6">
   <div class="flex items-center justify-between gap-3">
     <h1 class="text-2xl/7 font-bold text-gray-900">Library prep</h1>
     <span class="inline-flex rounded-md bg-amber-50 px-2 py-1 text-xs font-medium text-amber-800 ring-1 ring-amber-600/20 ring-inset">Mockup</span>
   </div>
   <p class="mt-1 text-sm text-gray-500">From a box of tubes to a running amplicon workflow.</p>
+  {#if resumed && !submitted}
+    <div class="mt-3 flex items-center gap-3 rounded-md bg-blue-50 px-3 py-2 text-sm text-blue-800 ring-1 ring-blue-600/20 ring-inset">
+      <span>Resumed your in-progress prep.</span>
+      <button type="button" class="ml-auto font-medium text-blue-700 underline hover:text-blue-900" onclick={startOver}>Start over</button>
+    </div>
+  {/if}
 </div>
 
 <!-- Steps (Tailwind UI: navigation / progress bars / panels) -->
 <nav aria-label="Progress" class="mb-6">
   <ol role="list" class="divide-y divide-gray-300 rounded-md border border-gray-300 bg-white md:flex md:divide-y-0">
-    {#each STEPS as label, i}
+    {#each steps as label, i}
       <li class="relative md:flex md:flex-1">
         <button
           type="button"
@@ -473,7 +715,7 @@
             <span class="ml-3 whitespace-nowrap text-gray-500">{label}</span>
           {/if}
         </button>
-        {#if i < STEPS.length - 1}
+        {#if i < steps.length - 1}
           <div aria-hidden="true" class="absolute top-0 right-0 hidden h-full w-4 md:block">
             <svg viewBox="0 0 22 80" fill="none" preserveAspectRatio="none" class="size-full text-gray-300"><path d="M0 -2L20 40L0 82" stroke="currentcolor" vector-effect="non-scaling-stroke" stroke-linejoin="round" /></svg>
           </div>
@@ -490,11 +732,16 @@
       <div>
         <label for="protocol" class="block text-sm/6 font-semibold text-gray-900">Prep protocol</label>
         <div class="mt-2 grid grid-cols-1">
-          <select id="protocol" bind:value={protocol} class={select}>
+          <select
+            id="protocol"
+            bind:value={protocol}
+            class={select}
+            onchange={pickProtocol}
+          >
             <option value={null} disabled>Choose a prep protocol…</option>
             {#each protocols as p (p)}
-              <option value={p} disabled={p !== SUPPORTED_PROTOCOL}>
-                {pretty(p)}{p !== SUPPORTED_PROTOCOL ? ' — not in this flow yet' : ''}
+              <option value={p} disabled={!isEnabledProtocol(p)}>
+                {pretty(p)}{isEnabledProtocol(p) ? '' : ' — not in this flow yet'}
               </option>
             {/each}
           </select>
@@ -507,7 +754,7 @@
           <div class="mt-2 grid grid-cols-1">
             <select id="primers" bind:value={target} class={select}>
               <option value={null} disabled>Choose primers…</option>
-              {#each TARGETS as t (t.id)}
+              {#each targets as t (t.id)}
                 <option value={t.id} disabled={!t.enabled}>{t.label}{t.enabled ? '' : ' — not yet'}</option>
               {/each}
             </select>
@@ -516,256 +763,221 @@
         </div>
       {/if}
     </div>
-    <p class="mt-4 text-xs text-gray-500">Long-read (PacBio Revio) 16S? <a href="/library-prep/long-read" class="font-medium text-teal-700 hover:text-teal-600">use the long-read amplicon flow →</a></p>
-  {:else if step === 1}
-    <h2 class="text-sm/6 font-semibold text-gray-900">Scan the box</h2>
-    <p class="mt-1 text-sm text-gray-500">Drop the VisionMate scan of each rack (up to four). Every tube code is checked against Qiita-miint as they land.</p>
-    <!-- Tailwind UI: feedback / empty states / with dashed border -->
-    <div
-      role="region"
-      aria-label="Drop rack scans"
-      class="mt-4 rounded-lg border-2 border-dashed p-8 text-center transition {dragging ? 'border-teal-500 bg-teal-50' : 'border-gray-300'}"
-      ondragover={(e) => (e.preventDefault(), (dragging = true))}
-      ondragleave={() => (dragging = false)}
-      ondrop={(e) => (e.preventDefault(), (dragging = false), addFiles(e.dataTransfer?.files ?? null))}
-    >
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" class="mx-auto size-10 text-gray-400"><path stroke-linecap="round" stroke-linejoin="round" d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5m-13.5-9L12 3m0 0 4.5 4.5M12 3v13.5" /></svg>
-      <p class="mt-2 text-sm font-semibold text-gray-900">
-        {racks.length ? `${racks.length} of 4 racks — drop more, or continue` : 'Drop rack scans here'}
+  {:else if protocol === LONGREAD_PROTOCOL}
+    <!-- Long-read (PacBio) flow body. Each flow owns its step bodies; a third
+         modality adds its own branch here and its entry in FLOWS above. -->
+    {#if step === 1}
+      <h2 class="text-sm/6 font-semibold text-gray-900">The pool</h2>
+      <p class="mt-1 text-sm text-gray-500">
+        The barcode map from the bench: one PacBio barcode per sample, demultiplexed upstream in SMRTlink. Each tube
+        is checked against Qiita-miint as it lands — a tube may repeat as a technical replicate.
       </p>
-      <p class="mt-1 text-xs text-gray-500">
-        <label class="cursor-pointer font-medium text-teal-700 hover:text-teal-600">choose files<input type="file" multiple accept=".tsv,.txt" class="hidden" onchange={(e) => addFiles(e.currentTarget.files)} /></label>
-        · <button type="button" class="font-medium text-teal-700 hover:text-teal-600" onclick={loadDemo}>use the demo box</button>
-        · <button type="button" class="font-medium text-teal-700 hover:text-teal-600" onclick={downloadDemoRacks}>download its scans</button>
-      </p>
-    </div>
-
-    {#if racks.length}
-      <ul role="list" class="mt-4 divide-y divide-gray-100 rounded-md border border-gray-200 text-sm">
-        {#each racks as rack, r}
-          <li class="flex items-start justify-between gap-3 px-4 py-2">
-            <span>
-              <span class="font-medium text-gray-900">{rack.rackId}</span> <span class="text-gray-500">· {rack.fileName} · {rack.tubes.length} tubes</span>
-              {#if rack.problems.length}
-                <span class="mt-1 block text-xs text-red-700">Refused; fix the scan and drop it again:</span>
-                <span class="block text-xs text-red-700">{rack.problems.slice(0, 4).join(' · ')}{rack.problems.length > 4 ? ` · and ${rack.problems.length - 4} more` : ''}</span>
-              {/if}
-            </span>
-            <button type="button" class="text-xs text-gray-400 hover:text-red-600" onclick={() => (racks = racks.filter((_, i) => i !== r))}>Remove</button>
+      {#if !lrScanned}
+        <div class="mt-4 rounded-lg border-2 border-dashed border-gray-300 p-8 text-center">
+          <p class="text-sm font-semibold text-gray-900">Drop the barcode map, or</p>
+          <p class="mt-1 text-xs text-gray-500">
+            <button type="button" class="font-medium text-teal-700 hover:text-teal-600" onclick={() => (lrPool = lr.DEMO_POOL.map((s) => ({ ...s })))}>use the demo pool</button>
+          </p>
+        </div>
+      {:else}
+        <ul role="list" class="mt-4 divide-y divide-gray-100 rounded-md border border-gray-200 text-sm">
+          {#each lrPool as s (s.sample_name)}
+            <li class="flex flex-wrap items-center gap-3 px-4 py-2">
+              <span class="size-2.5 rounded-full" style="background:{lrColorOf(s.study ?? lr.OTHER)}"></span>
+              <span class="font-medium text-gray-900">{s.sample_name}</span>
+              <span class="font-mono text-xs text-gray-500">{s.barcode_id}</span>
+              <span class="font-mono text-xs text-gray-400">tube {s.tube}</span>
+              {#if s.sample_type === 'control'}<span class="rounded bg-gray-100 px-1.5 text-xs text-gray-600">blank</span>{/if}
+              <span class="ml-auto text-xs text-gray-500">{lrTitleOf(s.study ?? lr.OTHER)}</span>
+            </li>
+          {/each}
+        </ul>
+        <p class="mt-3 text-sm text-gray-600">{lrPool.length} samples · {new Set(lrPool.map((s) => s.study)).size} studies.</p>
+      {/if}
+    {:else if step === 2}
+      <h2 class="text-sm/6 font-semibold text-gray-900">Barcodes</h2>
+      <p class="mt-1 text-sm text-gray-500">Each PacBio barcode must demultiplex exactly one sample. No Golay, no plate map — the demux is upstream.</p>
+      <ul role="list" class="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-3">
+        {#each lrPool as s (s.sample_name)}
+          <li class="flex items-center gap-2 rounded-md border border-gray-200 px-3 py-2 text-sm">
+            <span class="font-mono text-xs text-gray-900">{s.barcode_id}</span>
+            <span class="ml-auto truncate text-xs text-gray-500">{s.sample_name}</span>
           </li>
         {/each}
       </ul>
-      <div class="mt-4">
-        {#if refused.length}
-          <p class="text-sm text-red-700">Remove the refused {refused.length === 1 ? 'rack' : 'racks'} or rescan before going on.</p>
-        {:else if checking}
-          <p class="text-sm text-gray-500">Checking {all.length} tube codes…</p>
-        {:else if needFix === 0}
-          <!-- Tailwind UI: feedback / alerts / with description -->
-          <div class="rounded-md bg-green-50 p-4">
-            <h3 class="text-sm font-medium text-green-800">All {all.length} tubes are placed</h3>
-            <p class="mt-2 text-sm text-green-700">{[...studyKeys.map((k) => `${countFor(k)} from ${titleOf(k)}`), `${blanks.length} blanks`].join(' · ')}</p>
-          </div>
-        {:else}
-          <div class="rounded-md bg-yellow-50 p-4">
-            <h3 class="text-sm font-medium text-yellow-800">{needFix} of {all.length} tubes need attention before plating</h3>
-            <ul class="mt-2 list-disc space-y-1 pl-5 text-sm text-yellow-700">
-              {#if unknown.length}<li>{unknown.length} aren't in Qiita-miint</li>{/if}
-              {#if multi.length}<li>{multi.length} belong to more than one study</li>{/if}
-              {#if dupes.length}<li>{dupes.length} appear on two racks</li>{/if}
-            </ul>
-            {#if studyKeys.length}
-              <p class="mt-2 text-sm text-yellow-700">The rest: {[...studyKeys.map((k) => `${countFor(k)} from ${titleOf(k)}`), `${blanks.length} blanks`].join(' · ')}</p>
-            {/if}
-          </div>
-        {/if}
+      {#if lrProblems.length}
+        <ul class="mt-4 space-y-1 text-sm text-red-700">{#each lrProblems as t}<li>{t}</li>{/each}</ul>
+      {:else}
+        <p class="mt-4 text-sm text-gray-600">{lrPool.length} barcodes, each demultiplexing one sample.</p>
+      {/if}
+    {:else if step === 3}
+      <h2 class="text-sm/6 font-semibold text-gray-900">Protocol & run details</h2>
+      <p class="mt-1 text-sm text-gray-500">
+        The only per-run facts the pre-flight needs beyond a normal PacBio run: the primers, the UMI pattern, and the
+        target region. Everything downstream (quality/length cutoffs, clustering, variant support) is processing config,
+        not pre-flight.
+      </p>
+      <div class="mt-4 grid max-w-3xl grid-cols-1 gap-4 sm:grid-cols-2">
+        {@render lrField('Forward primer (27F)', lrDetails.fwd_primer, (v) => (lrDetails.fwd_primer = v), true)}
+        {@render lrField('Reverse primer (1492R)', lrDetails.rev_primer, (v) => (lrDetails.rev_primer = v), true)}
+        {@render lrField("5' construct primer", lrDetails.five_prime_primer, (v) => (lrDetails.five_prime_primer = v), true)}
+        {@render lrField("3' construct primer", lrDetails.three_prime_primer, (v) => (lrDetails.three_prime_primer = v), true)}
+        {@render lrField('UMI pattern', lrDetails.umi_pattern, (v) => (lrDetails.umi_pattern = v), true)}
+        {@render lrField('Target subfragment', lrDetails.target_subfragment, (v) => (lrDetails.target_subfragment = v))}
       </div>
-    {/if}
-  {:else if step === 2}
-    {#if needFix === 0}
-      <div class="rounded-md bg-green-50 p-4">
-        <h3 class="text-sm font-medium text-green-800">Nothing to fix</h3>
-        <p class="mt-2 text-sm text-green-700">Every tube is a sample of one study, or a blank.</p>
+      <h3 class="mt-6 text-sm font-medium text-gray-900">Revio run</h3>
+      <div class="mt-2 grid max-w-3xl grid-cols-1 gap-4 sm:grid-cols-2">
+        {@render lrField('Instrument', lrRun.instrument_model, (v) => (lrRun.instrument_model = v))}
+        {@render lrField('SMRT cell well', lrRun.smrt_cell_well, (v) => (lrRun.smrt_cell_well = v), true)}
+        {@render lrField('Movie context', lrRun.movie_context, (v) => (lrRun.movie_context = v), true)}
+        <label class="block">
+          <span class="block text-sm/6 font-medium text-gray-900">Run date</span>
+          <input type="date" class={field} bind:value={lrRun.run_date} />
+        </label>
       </div>
-    {:else}
-      <div class="flex flex-wrap items-center justify-between gap-3">
-        <h2 class="text-sm/6 font-semibold text-gray-900">Settle what Qiita-miint can't place</h2>
-        <button type="button" class={btn} onclick={downloadProblems}>Download the {needFix} tube codes</button>
-      </div>
-      {@const problemRacks = racks.flatMap((rack, r) => (all.some((x) => x.r === r && problemOf(x.cell)) && !unknownRacks.some((u) => u.r === r) ? [{ rack, r }] : []))}
-      {#if problemRacks.length}
-        <div class="mt-4 flex flex-wrap gap-4">
-          {#each problemRacks as { rack, r } (rack.rackId)}
-            <div>
-              <p class="mb-1 text-xs font-medium text-gray-700">{rack.rackId}</p>
-              <PlateMap wells={wellsOf(r)} />
-            </div>
-          {/each}
+    {:else if step === 4}
+      <h2 class="text-sm/6 font-semibold text-gray-900">Build the pre-flight</h2>
+      <p class="mt-1 text-sm text-gray-500">
+        Authored <span class="font-medium text-gray-700">directly</span> — no pre-prep sheet to launder. The control
+        plane calls kl-run-preflight's typed builders with these fields and stores the pre-flight blob the ingest submits with.
+      </p>
+      <details class="mt-4" open>
+        <summary class="cursor-pointer text-xs text-teal-700">The builder calls the server would make</summary>
+        <pre class="mt-2 max-h-80 overflow-auto rounded bg-gray-50 p-3 text-[11px] leading-4">{lrPreview}</pre>
+      </details>
+      {#if lrBuilt}
+        <div class="mt-4 rounded-md bg-green-50 p-4">
+          <h3 class="text-sm font-medium text-green-800">Pre-flight ready</h3>
+          <p class="mt-2 text-sm text-green-700">kl-run-preflight authored <span class="font-mono text-xs">{lrPreflightName}</span> from {lrPool.length} samples. The sequencing step submits with it.</p>
         </div>
       {/if}
-      <div class="mt-4 space-y-6">
-        {#if unknownRacks.length}
-          <!-- Tailwind UI: lists / stacked lists, in a card -->
-          <section class="rounded-lg border border-gray-200">
-            <div class="border-b border-gray-200 px-4 py-3">
-              <h3 class="text-sm font-medium text-gray-900">
-                {unknownRacks.length === 1 ? '1 rack belongs' : `${unknownRacks.length} racks belong`} to studies not in Qiita-miint
-              </h3>
-              <p class="mt-1 text-sm text-gray-500">
-                Usual on a run shared with another study. Add the study (or its tube codes) to Qiita-miint and scan
-                again, or carry the rack for its sample sheet only.
-              </p>
-            </div>
-            <ul role="list" class="divide-y divide-gray-100 text-sm">
-              {#each unknownRacks as u (u.rack.rackId)}
-                <li class="flex flex-wrap items-center gap-3 px-4 py-2">
-                  <span class="font-medium text-gray-900">{u.rack.rackId}</span>
-                  <span class="text-gray-500">{u.n} tubes</span>
-                  <span class="ml-auto flex flex-wrap items-center gap-2">
-                    <button type="button" class={btn} onclick={() => download(`${u.rack.rackId}-tube-codes.txt`, unknown.filter((x) => x.r === u.r).map((x) => `${x.well}\t${x.tube}`).join('\n'))}>Download the tube codes</button>
-                    <a href="/studies" class={btn}>Open studies →</a>
-                    <button type="button" class="rounded-md bg-teal-600 px-2.5 py-1 text-xs font-semibold text-white shadow-xs hover:bg-teal-500" onclick={() => { sheetOnly = { ...sheetOnly, [u.rack.rackId]: true }; studyFacts[OTHER] ??= { ...(demo?.otherStudy ?? { project_name: '', project_abbreviation: '', center_project_name: '', experiment_design_description: '' }) }; }}>Sample sheet only</button>
-                  </span>
-                </li>
-              {/each}
-            </ul>
-          </section>
-        {/if}
-
-        {#if looseUnknown.length}
-          <section class="rounded-md bg-red-50 p-4">
-            <h3 class="text-sm font-medium text-red-800">{looseUnknown.length} stray tubes not in Qiita-miint</h3>
-            <p class="mt-1 text-sm text-red-700">A mislabelled tube, a sample not yet registered, or a blank.</p>
-            <ul role="list" class="mt-2 divide-y divide-gray-100 rounded-md border border-red-200 bg-white text-sm">
-              {#each looseUnknown as x (x.r + x.well)}
-                <li class="flex flex-wrap items-center gap-3 px-4 py-2">
-                  <span class="font-mono text-xs text-gray-700">{racks[x.r].rackId} {x.well}</span>
-                  <span class="font-mono text-xs text-gray-500">{x.tube}</span>
-                  <span class="ml-auto flex gap-2">
-                    <button type="button" class={btn} onclick={() => decide(x.r, x.well, { blank: true })}>Blank</button>
-                    <button type="button" class={btn} onclick={() => decide(x.r, x.well, { exclude: true })}>Leave out</button>
-                  </span>
-                </li>
-              {/each}
-            </ul>
-          </section>
-        {/if}
-
-        {#if multi.length}
-          <section class="rounded-md bg-red-50 p-4">
-            <h3 class="text-sm font-medium text-red-800">{multi.length} in more than one study</h3>
-            <p class="mt-1 text-sm text-red-700">Which study is this prep for?</p>
-            <ul role="list" class="mt-2 divide-y divide-gray-100 rounded-md border border-red-200 bg-white text-sm">
-              {#each multi as x (x.r + x.well)}
-                {@const c = x.cell as { studies: number[] }}
-                <li class="flex flex-wrap items-center gap-3 px-4 py-2">
-                  <span class="font-mono text-xs text-gray-700">{racks[x.r].rackId} {x.well}</span>
-                  <span class="ml-auto flex gap-2">
-                    {#each c.studies as sid}<button type="button" class={btn} onclick={() => decide(x.r, x.well, { primary: sid })}>{titleOf(String(sid))}</button>{/each}
-                  </span>
-                </li>
-              {/each}
-            </ul>
-          </section>
-        {/if}
-
-        {#if dupes.length}
-          <section class="rounded-md bg-red-50 p-4">
-            <h3 class="text-sm font-medium text-red-800">Tubes scanned twice</h3>
-            <p class="mt-1 text-sm text-red-700">A tube can only be in one well. Keep one, leave the other out.</p>
-            <ul role="list" class="mt-2 divide-y divide-gray-100 rounded-md border border-red-200 bg-white text-sm">
-              {#each dupes as x (x.r + x.well)}
-                <li class="flex flex-wrap items-center gap-3 px-4 py-2">
-                  <span class="font-mono text-xs text-gray-700">{racks[x.r].rackId} {x.well}</span>
-                  <span class="font-mono text-xs text-gray-500">{x.tube}</span>
-                  <span class="text-xs text-gray-500">also at {(x.cell as { other: string }).other}</span>
-                  <span class="ml-auto"><button type="button" class={btn} onclick={() => decide(x.r, x.well, { exclude: true })}>Leave this one out</button></span>
-                </li>
-              {/each}
-            </ul>
-          </section>
+    {:else if step === 5}
+      <h2 class="text-sm/6 font-semibold text-gray-900">Sequence</h2>
+      <p class="mt-1 text-sm text-gray-500">The pool is already demultiplexed (SMRTlink), so ingest loads one BAM per barcode — the existing PacBio path.</p>
+      <div class="mt-4">
+        {#if !lrStarted}
+          <button type="button" class="rounded-md bg-teal-600 px-3 py-2 text-sm font-semibold text-white shadow-xs hover:bg-teal-500" onclick={() => (lrStarted = true)}>Start PacBio ingest</button>
+        {:else}
+          <ol class="space-y-2 text-sm">
+            <li class="flex items-center gap-2"><span class="size-2 rounded-full bg-blue-500"></span>pacbio-ingest — queued with {lrPreflightName}: {lrPool.length} per-barcode BAMs fan out to bam-to-parquet</li>
+            <li class="flex items-center gap-2"><span class="size-2 rounded-full bg-gray-300"></span>rrna-operon — UMI detection, dechimera, clustering (processing, not yet wired into Qiita)</li>
+          </ol>
         {/if}
       </div>
     {/if}
-  {:else if step === 3}
+  {:else if step === 1}
     <div class="flex flex-wrap items-start justify-between gap-3">
       <div>
         <h2 class="text-sm/6 font-semibold text-gray-900">Lay out the plates</h2>
-        <p class="mt-1 text-sm text-gray-500">The four positions of the 384-well plate.</p>
+        <p class="mt-1 text-sm text-gray-500">Drop each rack's VisionMate scan onto its quadrant of the 384-well plate. Tubes are checked against Qiita-miint as they land; settle anything flagged in the list below.</p>
       </div>
-      <!-- Tailwind UI: forms / toggles / with right label -->
       <label class="flex cursor-pointer items-center gap-3 text-sm">
-        <span class="group relative inline-flex w-11 shrink-0 rounded-full bg-gray-200 p-0.5 inset-ring inset-ring-gray-900/5 outline-offset-2 outline-teal-600 transition-colors duration-200 ease-in-out has-checked:bg-teal-600 has-focus-visible:outline-2">
-          <span class="size-5 rounded-full bg-white shadow-xs ring-1 ring-gray-900/5 transition-transform duration-200 ease-in-out group-has-checked:translate-x-5"></span>
-          <input type="checkbox" bind:checked={editBlanks} aria-label="Edit blanks" class="absolute inset-0 size-full appearance-none focus:outline-hidden" />
-        </span>
-        <span class="font-medium text-gray-900">Edit blanks</span>
+        <span class="text-gray-600">Edit blanks</span>
+        <input type="checkbox" class="size-4 accent-teal-600" bind:checked={editBlanks} />
       </label>
     </div>
-    <div class="mt-3 flex flex-wrap items-center justify-between gap-3">
-      {@render legend()}
-      {#if editBlanks}
-        <p class="text-xs text-teal-700">Click a sample to make it a blank, or a changed well to undo.</p>
-      {/if}
-    </div>
-    {#if blanksChanged}
-      <p class="mt-2 text-xs text-amber-700">
-        {blanksChanged} {blanksChanged === 1 ? 'blank' : 'blanks'} changed from the scan ·
-        <button type="button" class="font-medium underline hover:text-amber-900" onclick={() => (blankEdits = {})}>reset</button>
-      </p>
-    {/if}
-    <div class="mt-4 grid grid-cols-1 gap-6 xl:grid-cols-2">
+    {#if editBlanks}<p class="mt-2 text-xs text-teal-700">Click a sample to make it a blank, or a changed well to undo.</p>{/if}
+    {#if blanksChanged}<p class="mt-2 text-xs text-amber-700">{blanksChanged} {blanksChanged === 1 ? 'blank' : 'blanks'} changed from the scan · <button type="button" class="font-medium underline hover:text-amber-900" onclick={() => (blankEdits = {})}>reset</button></p>{/if}
+
+    <!-- The four 96-well racks laid out as the 384-well plate itself: 1-2 top, 3-4
+         bottom. Two plates fill the width; each PlateMap scales to its column. -->
+    <div class="mt-4 grid grid-cols-2 gap-x-6 gap-y-5">
       {#each [0, 1, 2, 3] as i}
-        <div class="rounded-lg border border-gray-200 p-3">
-          <div class="mb-2 flex flex-wrap items-center gap-3 text-sm">
-            <span class="font-semibold text-gray-900">Position {i + 1}</span>
-            <div class="grid w-32 grid-cols-1">
-              <select aria-label="Rack at position {i + 1}" class={select} bind:value={rackAt[i]}>
-                <option value={null}>— empty —</option>
-                {#each racks as rack, r}<option value={r}>{rack.rackId}</option>{/each}
-              </select>
-              {@render chevron()}
-            </div>
-            <label class="ml-auto flex items-center gap-2 text-xs text-gray-600">Primer plate
-              <span class="grid w-20 grid-cols-1">
-                <select class={select} bind:value={primerAt[i]}>
-                  {#each Array.from({ length: 10 }, (_, k) => String(k + 1)) as n}<option>{n}</option>{/each}
-                </select>
-                {@render chevron()}
-              </span>
-            </label>
-          </div>
-          <div class="inline-block rounded-xl {editBlanks ? 'ring-2 ring-teal-500 ring-offset-2' : ''}">
-            <PlateMap wells={wellsOf(rackAt[i])} onpick={editBlanks ? (w) => rackAt[i] !== null && toggleBlank(rackAt[i]!, w) : undefined} />
-          </div>
-          {#if rackAt[i] !== null}
-            {@const r = rackAt[i]!}
-            {@const studies = studiesOfRack(r)}
-            <p class="mt-1 text-xs {blanksOn(r) ? 'text-gray-500' : 'text-amber-700'}">
-              {studies.length ? studies.map(titleOf).join(' + ') : 'no samples'} · {blanksOn(r) ? `${blanksOn(r)} blanks` : 'no blank on this plate — is that right?'}
+        {#if rackAt[i] === null}
+          <div
+            role="region"
+            aria-label="Drop rack for plate {i + 1}"
+            class="flex min-h-60 w-full flex-col items-center justify-center rounded-md border-2 border-dashed p-3 text-center transition {dragQuad === i ? 'border-teal-500 bg-teal-50' : 'border-gray-300'}"
+            ondragover={(e) => (e.preventDefault(), (dragQuad = i))}
+            ondragleave={() => (dragQuad = null)}
+            ondrop={(e) => (e.preventDefault(), (dragQuad = null), dropToQuadrant(i, e.dataTransfer?.files ?? null))}
+          >
+            <span class="text-sm font-semibold text-gray-900">Plate {i + 1}</span>
+            <p class="mt-1 text-xs text-gray-500">drop its rack scan</p>
+            <p class="mt-2 text-xs text-gray-500">
+              <label class="cursor-pointer font-medium text-teal-700 hover:text-teal-600">choose<input type="file" accept=".tsv,.txt" class="hidden" onchange={(e) => dropToQuadrant(i, e.currentTarget.files)} /></label>
+              · <button type="button" class="font-medium text-teal-700 hover:text-teal-600" onclick={() => demoToQuadrant(i)}>demo</button>
             </p>
-            {#if studies.length > 1 && blanksOn(r)}
-              <label class="mt-2 flex flex-wrap items-center gap-2 text-xs {blanksTo[racks[r].rackId] ? 'text-gray-600' : 'text-red-700'}">
-                This plate mixes studies. Its blanks go to
-                <span class="grid min-w-48 grid-cols-1">
-                  <select aria-label="Blanks of {racks[r].rackId} go to" class="{select} {blanksTo[racks[r].rackId] ? '' : 'outline-red-400'}" bind:value={blanksTo[racks[r].rackId]}>
+          </div>
+        {:else}
+          {@const r = rackAt[i]!}
+          <div class="flex flex-col gap-1.5">
+            <div class="flex items-center gap-2 text-xs">
+              <span class="font-semibold whitespace-nowrap text-gray-900">Plate {i + 1}</span>
+              <span class="min-w-0 flex-1 truncate font-mono text-gray-500">{racks[r].rackId}</span>
+              <span class="flex items-center gap-1 whitespace-nowrap text-gray-600">primer
+                <span class="grid w-16 grid-cols-1">
+                  <select aria-label="Primer plate for plate {i + 1}" class={select} bind:value={primerAt[i]}>{#each Array.from({ length: 10 }, (_, k) => String(k + 1)) as n}<option>{n}</option>{/each}</select>
+                  {@render chevron()}
+                </span>
+              </span>
+              <button type="button" aria-label="Clear plate {i + 1}" class="px-1 text-gray-400 hover:text-red-700" onclick={() => clearQuadrant(i)}>✕</button>
+            </div>
+            <div class="rounded-lg {editBlanks ? 'ring-2 ring-teal-500 ring-offset-2' : ''}">
+              <PlateMap fill wells={wellsOf(r)} onpick={editBlanks ? (w) => toggleBlank(r, w) : undefined} />
+            </div>
+          </div>
+        {/if}
+      {/each}
+    </div>
+
+    <!-- One list for everything flagged; entries drop off as they are settled, up to 10 a page. -->
+    {#if attention.length}
+      <div class="mt-5 rounded-md border border-red-200">
+        <div class="flex items-center gap-2 border-b border-red-100 bg-red-50 px-3 py-2 text-sm">
+          <span class="font-medium text-red-800">{attention.length} to settle</span>
+          {#if errPages > 1}
+            <span class="ml-auto flex items-center gap-2 text-xs text-gray-600">
+              <button type="button" class={btn} disabled={errPage === 0} onclick={() => (errPage = Math.max(0, errPage - 1))}>Prev</button>
+              {errPage * ERR_PER_PAGE + 1}–{Math.min(attention.length, (errPage + 1) * ERR_PER_PAGE)} of {attention.length}
+              <button type="button" class={btn} disabled={errPage >= errPages - 1} onclick={() => (errPage = Math.min(errPages - 1, errPage + 1))}>Next</button>
+            </span>
+          {/if}
+        </div>
+        <ul role="list" class="divide-y divide-gray-100 text-sm">
+          {#each errView as a (a.kind + a.r + ('well' in a ? a.well : a.rackId))}
+            <li class="flex flex-wrap items-center gap-2 px-3 py-2">
+              {#if a.kind === 'unknown-rack'}
+                <span class="font-mono text-xs text-gray-700">{a.rackId}</span>
+                <span class="text-red-700">whole rack's study not in Qiita-miint · {a.n} tubes</span>
+                <span class="ml-auto"><button type="button" class={btn} onclick={() => { sheetOnly = { ...sheetOnly, [a.rackId]: true }; studyFacts[OTHER] ??= { ...(demo?.otherStudy ?? { project_name: '', project_abbreviation: '', center_project_name: '', experiment_design_description: '' }) }; }}>Sample sheet only</button></span>
+              {:else if a.kind === 'unknown'}
+                <span class="font-mono text-xs text-gray-700">{racks[a.r].rackId} {a.well}</span>
+                <span class="font-mono text-xs text-gray-500">{a.tube}</span>
+                <span class="text-red-700">not in Qiita-miint</span>
+                <span class="ml-auto flex gap-1"><button type="button" class={btn} onclick={() => decide(a.r, a.well, { blank: true })}>Blank</button><button type="button" class={btn} onclick={() => decide(a.r, a.well, { exclude: true })}>Leave out</button></span>
+              {:else if a.kind === 'multi'}
+                <span class="font-mono text-xs text-gray-700">{racks[a.r].rackId} {a.well}</span>
+                <span class="text-red-700">in {a.studies.length} studies</span>
+                <span class="ml-auto flex gap-1">{#each a.studies as sid}<button type="button" class={btn} onclick={() => decide(a.r, a.well, { primary: sid })}>{titleOf(String(sid))}</button>{/each}</span>
+              {:else if a.kind === 'duplicate'}
+                <span class="font-mono text-xs text-gray-700">{racks[a.r].rackId} {a.well}</span>
+                <span class="text-red-700">also at {a.other}</span>
+                <span class="ml-auto"><button type="button" class={btn} onclick={() => decide(a.r, a.well, { exclude: true })}>Leave this one out</button></span>
+              {:else if a.kind === 'mixed-blank'}
+                <span class="font-mono text-xs text-gray-700">{a.rackId}</span>
+                <span class="text-red-700">mixes studies — blanks go to</span>
+                <span class="ml-auto grid min-w-44 grid-cols-1">
+                  <select aria-label="Blanks of {a.rackId} go to" class="{select} outline-red-400" bind:value={blanksTo[a.rackId]}>
                     <option value={undefined} disabled>choose…</option>
-                    {#each studies as k}<option value={k}>{titleOf(k)}</option>{/each}
+                    {#each a.studies as k}<option value={k}>{titleOf(k)}</option>{/each}
                     <option value={EACH}>each study's sheet</option>
                   </select>
                   {@render chevron()}
                 </span>
-              </label>
-            {/if}
-          {/if}
-        </div>
-      {/each}
-    </div>
-    {#if blanks.length < MIN_BLANKS}
-      <p class="mt-3 text-sm text-amber-700">Only {blanks.length} blanks on this run; at least {MIN_BLANKS} are recommended.</p>
+              {/if}
+            </li>
+          {/each}
+        </ul>
+      </div>
     {/if}
-    {#if layoutProblems.length}<p class="mt-3 text-sm text-red-700">{layoutProblems.join(' · ')}</p>{/if}
-  {:else if step === 4}
+
+    {@const structural = layoutProblems.filter((p) => !p.startsWith('Say which study'))}
+    {#if refused.length}<p class="mt-3 text-sm text-red-700">{refused.length} rack scan{refused.length === 1 ? '' : 's'} refused — remove and rescan.</p>{/if}
+    {#if structural.length}<p class="mt-3 text-sm text-red-700">{structural.join(' · ')}</p>{/if}
+    {#if blanks.length < MIN_BLANKS}<p class="mt-3 text-sm text-amber-700">Only {blanks.length} blanks on this run; at least {MIN_BLANKS} recommended.</p>{/if}
+    {#if racks.length && !attention.length && layoutProblems.length === 0}<p class="mt-3 text-sm text-green-700">All {all.length} tubes placed across {placed.length} quadrant{placed.length === 1 ? '' : 's'}.</p>{/if}
+  {:else if step === 2}
     <h2 class="text-sm/6 font-semibold text-gray-900">Processing details</h2>
     <p class="mt-1 text-sm text-gray-500">Recorded with every sample. Write not_applicable for anything that doesn't apply.</p>
     {#if prefilled && last}
@@ -872,7 +1084,7 @@
         {#each warnings as t}<li class="text-amber-700">{t}</li>{/each}
       </ul>
     {/if}
-  {:else if step === 5}
+  {:else if step === 3}
     <h2 class="text-sm/6 font-semibold text-gray-900">Build the pre-flight</h2>
     <p class="mt-1 text-sm text-gray-500">
       One sample sheet per study, from which kl-run-preflight builds the run's pre-flight: the SQLite file the
@@ -913,7 +1125,7 @@
         </div>
       </div>
     {/if}
-  {:else if step === 6}
+  {:else if step === 4}
     <h2 class="text-sm/6 font-semibold text-gray-900">Sequence</h2>
     <p class="mt-1 text-sm text-gray-500">When the run has finished, pick its folder.</p>
     <fieldset class="mt-4 space-y-2">
@@ -941,11 +1153,11 @@
 
   <div class="mt-8 flex items-center justify-between border-t border-gray-100 pt-4">
     <button type="button" class="rounded-md bg-white px-3 py-2 text-sm font-semibold text-gray-900 shadow-xs ring-1 ring-gray-300 ring-inset hover:bg-gray-50 disabled:invisible" disabled={step === 0} onclick={() => go(step - 1)}>Back</button>
-    {#if step < STEPS.length - 1}
-      {#if step === 5 && !built}
-        <button type="button" class="rounded-md bg-teal-600 px-3 py-2 text-sm font-semibold text-white shadow-xs hover:bg-teal-500 disabled:opacity-40" disabled={barcodeIssues.length > 0} onclick={() => ((built = true), saveLast())}>Build pre-flight</button>
+    {#if step < steps.length - 1}
+      {#if step === flow.build.at && !flow.build.done}
+        <button type="button" class="rounded-md bg-teal-600 px-3 py-2 text-sm font-semibold text-white shadow-xs hover:bg-teal-500 disabled:opacity-40" disabled={flow.build.disabled} onclick={flow.build.run}>Build pre-flight</button>
       {:else}
-        <button type="button" class="rounded-md bg-teal-600 px-3 py-2 text-sm font-semibold text-white shadow-xs hover:bg-teal-500 disabled:opacity-40" disabled={!canLeave[step]} onclick={() => go(nextStep)}>Next: {STEPS[nextStep]}</button>
+        <button type="button" class="rounded-md bg-teal-600 px-3 py-2 text-sm font-semibold text-white shadow-xs hover:bg-teal-500 disabled:opacity-40" disabled={!canLeave[step]} onclick={() => go(nextStep)}>Next: {steps[nextStep]}</button>
       {/if}
     {/if}
   </div>
