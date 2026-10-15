@@ -516,6 +516,7 @@
         </div>
       {/if}
     </div>
+    <p class="mt-4 text-xs text-gray-500">Long-read (PacBio Revio) 16S? <a href="/library-prep/long-read" class="font-medium text-teal-700 hover:text-teal-600">use the long-read amplicon flow →</a></p>
   {:else if step === 1}
     <h2 class="text-sm/6 font-semibold text-gray-900">Scan the box</h2>
     <p class="mt-1 text-sm text-gray-500">Drop the VisionMate scan of each rack (up to four). Every tube code is checked against Qiita-miint as they land.</p>
