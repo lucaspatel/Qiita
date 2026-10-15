@@ -17,6 +17,7 @@
     "@tailwindcss/vite": "^4.3.3",
     "@types/leaflet": "^1.9.22",
     "@types/node": "^22.20.2",
+    "@types/sql.js": "^1.4.11",
     "clsx": "^2.1.1",
     "openapi-typescript": "^7.4.0",
     "smol-toml": "^1.9.0",
@@ -29,9 +30,11 @@
   },
   "dependencies": {
     "@vincjo/datatables": "^2.8.1",
+    "@xyflow/svelte": "^1.7.0",
     "apache-arrow": "^21.2.0",
     "leaflet": "^1.9.4",
     "openapi-fetch": "^0.13.0",
+    "sql.js": "^1.15.0",
     "svelteplot": "^0.14.2"
   }
 }
