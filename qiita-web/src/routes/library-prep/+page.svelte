@@ -10,6 +10,7 @@
   import { api, type PrepProtocol } from '$lib/api';
   import { scopedKey } from '$lib/environment';
   import PlateMap, { type Well } from '$lib/ui/PlateMap.svelte';
+  import Modal from '$lib/ui/Modal.svelte';
   import {
     MIN_BLANKS,
     RUN_FOLDERS,
@@ -32,10 +33,19 @@
     PLATE_COLUMNS,
     STUDY_COLUMNS,
     buildSheet,
+    emptySheet,
     type Plate,
     type RunFacts,
     type StudyFacts
   } from '$lib/libraryPrep/sampleSheet';
+  import {
+    deleteDraft,
+    listDrafts,
+    loadDraft,
+    newDraftId,
+    saveDraft,
+    type DraftMeta
+  } from '$lib/libraryPrep/drafts';
   import * as lr from '$lib/libraryPrep/longRead';
   import type {
     PoolSample as LrSample,
@@ -492,8 +502,10 @@
       return {
         key,
         wells,
-        fileName: `${run.run_date.replaceAll('-', '') || 'YYYYMMDD'}_IL515fBC_806_${f?.project_name ?? key}_Plates_${plateNos}.txt`,
-        text: f ? buildSheet(wells, f, run) : ''
+        fileName: `${run.run_date.replaceAll('-', '') || 'YYYYMMDD'}_IL515fBC_806_${f?.project_name || key}_Plates_${plateNos}.txt`,
+        // Always build the sheet — a mid-prep checkpoint leaves unentered facts blank
+        // rather than dropping the study.
+        text: buildSheet(wells, f ?? {}, run)
       };
     })
   );
@@ -506,6 +518,14 @@
   const preflightName = $derived(
     `${run.run_date.replaceAll('-', '') || 'YYYYMMDD'}_IL515fBC_806_${studyKeys.map((k) => studyFacts[k]?.project_abbreviation ?? k).join('_')}.preflight.db`
   );
+  // The checkpoint files: each study's sheet, or a header-only sheet before anything
+  // is scanned — so there is always something to download that mirrors the format.
+  const checkpointFiles = $derived.by(() => {
+    const files = sheets.map((s) => ({ name: s.fileName, text: s.text }));
+    if (files.length) return files;
+    const stamp = run.run_date.replaceAll('-', '') || 'YYYYMMDD';
+    return [{ name: `${stamp}_IL515fBC_806_prep.txt`, text: emptySheet() }];
+  });
 
   // --- 7. sequence ---
   let runFolder = $state<string | null>(null);
@@ -540,6 +560,10 @@
     canLeave: boolean[];
     next: (s: number) => number;
     build: { at: number; done: boolean; disabled: boolean; run: () => void };
+    // A backup of the work so far as the pre-prep file(s) the amplicon notebook
+    // (kl-metapool's generate_qiita_prep_file) would write — one per study, as
+    // much as the current state can fill. Empty when there is nothing to write.
+    checkpoint: { name: string; text: string }[];
   };
   const FLOWS: Record<string, Flow> = $derived({
     [SUPPORTED_PROTOCOL]: {
@@ -555,7 +579,8 @@
           built = true;
           saveLast();
         }
-      }
+      },
+      checkpoint: checkpointFiles
     },
     [LONGREAD_PROTOCOL]: {
       steps: LONG_STEPS,
@@ -567,10 +592,15 @@
         done: lrBuilt,
         disabled: lrProblems.length > 0,
         run: () => (lrBuilt = true)
-      }
+      },
+      // The long-read flow authors straight into a pre-flight, not a notebook
+      // pre-prep, so there is no checkpoint file to write.
+      checkpoint: []
     }
   });
   const flow = $derived(FLOWS[protocol ?? SUPPORTED_PROTOCOL]);
+  // Save the pre-prep file(s) as they stand right now — a backup at any step.
+  const downloadCheckpoint = () => flow.checkpoint.forEach((f) => download(f.name, f.text));
   const steps = $derived(flow.steps);
   const targets = $derived(flow.targets);
   const canLeave = $derived(flow.canLeave);
@@ -588,15 +618,23 @@
   const isoDate = (d: string) => d.replace(/^(\d{4})(\d{2})(\d{2})$/, '$1-$2-$3');
   const input = 'block w-full rounded-md bg-white px-2 py-1 text-sm text-gray-900 outline-1 -outline-offset-1 focus:outline-2 focus:-outline-offset-2 focus:outline-teal-600';
 
-  // --- draft cache: resume an in-progress prep across a refresh -----------------
-  // The whole wizard is scratch until it is submitted, so it lives in localStorage
-  // (scoped like every other key). Autosaved on any change, rehydrated on load, and
-  // cleared once the prep is submitted (its truth then lives on the server — the
-  // run/pool are content-addressed, so even a stale resumed draft re-submits to the
-  // same entities). `demo` holds Maps and is reconstructed via demoBox(), not stored.
-  const DRAFT_KEY = scopedKey('qiita-web:library-prep:draft');
+  // --- draft cache: many in-progress preps, resumable from the main page --------
+  // Each prep is its own localStorage entry; the main page (step 0) lists them all.
+  // A prep is scratch until submitted — then its draft is deleted (the server's
+  // run/pool become the truth, content-addressed so a resumed draft converges).
+  // `demo` holds Maps and is reconstructed via demoBox(), not stored.
   const hasProgress = $derived(step > 0 || racks.length > 0 || lrPool.length > 0);
   const submitted = $derived(started || lrStarted);
+  let currentId = $state<string | null>(null);
+  let drafts = $state<DraftMeta[]>([]);
+  const refreshDrafts = () => (drafts = listDrafts());
+  const relTime = (ms: number) => {
+    const s = Math.round((Date.now() - ms) / 1000);
+    if (s < 60) return 'just now';
+    if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+    if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+    return `${Math.floor(s / 86400)}d ago`;
+  };
 
   function snapshot() {
     return {
@@ -606,56 +644,82 @@
     };
   }
 
-  let resumed = $state(false);
-  // Rehydrate once at load, before any autosave can overwrite it. Every field is
-  // assigned from the saved draft (a full snapshot), so no current state is read.
-  try {
-    const d = JSON.parse(localStorage.getItem(DRAFT_KEY) ?? 'null');
-    if (d && typeof d === 'object' && (d.step > 0 || d.racks?.length || d.lrPool?.length)) {
-      protocol = d.protocol;
-      target = d.target;
-      step = d.step;
-      reached = d.reached;
-      racks = d.racks;
-      decisions = d.decisions;
-      sheetOnly = d.sheetOnly;
-      blankEdits = d.blankEdits;
-      editBlanks = d.editBlanks;
-      plateFacts = d.plateFacts;
-      studyFacts = d.studyFacts;
-      run = d.run;
-      built = d.built;
-      started = d.started;
-      lrPool = d.lrPool;
-      lrDetails = d.lrDetails;
-      lrRun = d.lrRun;
-      lrBuilt = d.lrBuilt;
-      lrStarted = d.lrStarted;
-      if (d.demoLoaded) demo = demoBox(); // reconstruct the mock Qiita-miint (Maps don't serialize)
-      resumed = true;
-    }
-  } catch {
-    // Storage unavailable or malformed: start fresh.
-  }
-
-  $effect(() => {
-    const draft = snapshot(); // reads every field, so this runs on any change
-    try {
-      if (submitted) localStorage.removeItem(DRAFT_KEY); // submitted → server is the truth
-      else if (hasProgress) localStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
-    } catch {
-      // Storage unavailable: the prep just won't survive a refresh.
-    }
+  // A short, human summary for the list: the protocol plus where it's at.
+  const draftLabel = $derived.by(() => {
+    const p = protocol ? pretty(protocol) : 'Prep';
+    if (protocol === LONGREAD_PROTOCOL) return `${p} · ${lrPool.length} samples`;
+    const plates = rackAt.filter((r) => r !== null).length;
+    return `${p} · ${plates} ${plates === 1 ? 'plate' : 'plates'}`;
   });
 
-  function startOver() {
-    try {
-      localStorage.removeItem(DRAFT_KEY);
-    } catch {
-      // ignore
-    }
-    location.reload();
+  function applySnapshot(d: Record<string, unknown>) {
+    protocol = d.protocol as string | null;
+    target = d.target as string | null;
+    step = d.step as number;
+    reached = d.reached as number;
+    racks = d.racks as typeof racks;
+    decisions = d.decisions as typeof decisions;
+    sheetOnly = d.sheetOnly as typeof sheetOnly;
+    blankEdits = d.blankEdits as typeof blankEdits;
+    editBlanks = d.editBlanks as boolean;
+    plateFacts = d.plateFacts as typeof plateFacts;
+    studyFacts = d.studyFacts as typeof studyFacts;
+    run = d.run as typeof run;
+    built = d.built as boolean;
+    started = d.started as boolean;
+    lrPool = d.lrPool as typeof lrPool;
+    lrDetails = d.lrDetails as typeof lrDetails;
+    lrRun = d.lrRun as typeof lrRun;
+    lrBuilt = d.lrBuilt as boolean;
+    lrStarted = d.lrStarted as boolean;
+    if (d.demoLoaded) demo = demoBox(); // reconstruct the mock Qiita-miint (Maps don't serialize)
   }
+
+  function resumeDraft(id: string) {
+    const d = loadDraft(id);
+    if (!d) {
+      refreshDrafts();
+      return;
+    }
+    applySnapshot(d as Record<string, unknown>);
+    currentId = id;
+  }
+
+  // Deleting a draft goes through a confirmation modal.
+  let pendingDiscard = $state<DraftMeta | null>(null);
+  let discardOpen = $state(false);
+  const askDiscard = (meta: DraftMeta) => ((pendingDiscard = meta), (discardOpen = true));
+  function confirmDiscard() {
+    if (!pendingDiscard) return;
+    const id = pendingDiscard.id;
+    deleteDraft(id);
+    if (id === currentId) currentId = null;
+    discardOpen = false;
+    pendingDiscard = null;
+    refreshDrafts();
+  }
+
+  // Autosave the current prep under its id (minting one on first progress), and
+  // delete it once submitted. Only runs in the browser.
+  $effect(() => {
+    const snap = snapshot(); // reads every field → runs on any change
+    if (submitted) {
+      if (currentId) {
+        deleteDraft(currentId);
+        refreshDrafts();
+      }
+      return;
+    }
+    if (!hasProgress) return;
+    currentId ??= newDraftId();
+    saveDraft({ id: currentId, protocol: protocol ?? '', label: draftLabel, step, updatedAt: Date.now() }, snap);
+    refreshDrafts();
+  });
+
+  // Populate the list on load (nothing is auto-resumed; the user picks).
+  $effect(() => {
+    refreshDrafts();
+  });
 </script>
 
 {#snippet chevron()}
@@ -682,11 +746,8 @@
     <span class="inline-flex rounded-md bg-amber-50 px-2 py-1 text-xs font-medium text-amber-800 ring-1 ring-amber-600/20 ring-inset">Mockup</span>
   </div>
   <p class="mt-1 text-sm text-gray-500">From a box of tubes to a running amplicon workflow.</p>
-  {#if resumed && !submitted}
-    <div class="mt-3 flex items-center gap-3 rounded-md bg-blue-50 px-3 py-2 text-sm text-blue-800 ring-1 ring-blue-600/20 ring-inset">
-      <span>Resumed your in-progress prep.</span>
-      <button type="button" class="ml-auto font-medium text-blue-700 underline hover:text-blue-900" onclick={startOver}>Start over</button>
-    </div>
+  {#if currentId && !submitted}
+    <p class="mt-2 text-xs text-gray-500">Editing a saved prep · <button type="button" class="font-medium text-blue-700 underline hover:text-blue-900" onclick={() => askDiscard(drafts.find((d) => d.id === currentId) ?? { id: currentId!, protocol: protocol ?? '', label: draftLabel, step, updatedAt: Date.now() })}>discard</button></p>
   {/if}
 </div>
 
@@ -763,6 +824,25 @@
         </div>
       {/if}
     </div>
+
+    {#if drafts.filter((d) => d.id !== currentId).length}
+      <div class="mt-8 max-w-2xl">
+        <h2 class="text-sm font-semibold text-gray-900">In-progress preps</h2>
+        <p class="mt-1 text-xs text-gray-500">Saved in this browser. Resume where you left off, or discard.</p>
+        <ul role="list" class="mt-3 divide-y divide-gray-100 rounded-md border border-gray-200 text-sm">
+          {#each drafts.filter((d) => d.id !== currentId) as d (d.id)}
+            <li class="flex flex-wrap items-center gap-3 px-4 py-2.5">
+              <span class="font-medium text-gray-900">{d.label}</span>
+              <span class="text-xs text-gray-500">step {d.step + 1} · {relTime(d.updatedAt)}</span>
+              <span class="ml-auto flex gap-2">
+                <button type="button" class="rounded-md bg-teal-600 px-2.5 py-1 text-xs font-semibold text-white hover:bg-teal-500" onclick={() => resumeDraft(d.id)}>Resume</button>
+                <button type="button" class="rounded-md bg-white px-2.5 py-1 text-xs font-semibold text-gray-700 ring-1 ring-gray-300 ring-inset hover:bg-gray-50" onclick={() => askDiscard(d)}>Discard</button>
+              </span>
+            </li>
+          {/each}
+        </ul>
+      </div>
+    {/if}
   {:else if protocol === LONGREAD_PROTOCOL}
     <!-- Long-read (PacBio) flow body. Each flow owns its step bodies; a third
          modality adds its own branch here and its entry in FLOWS above. -->
@@ -1153,12 +1233,29 @@
 
   <div class="mt-8 flex items-center justify-between border-t border-gray-100 pt-4">
     <button type="button" class="rounded-md bg-white px-3 py-2 text-sm font-semibold text-gray-900 shadow-xs ring-1 ring-gray-300 ring-inset hover:bg-gray-50 disabled:invisible" disabled={step === 0} onclick={() => go(step - 1)}>Back</button>
-    {#if step < steps.length - 1}
-      {#if step === flow.build.at && !flow.build.done}
-        <button type="button" class="rounded-md bg-teal-600 px-3 py-2 text-sm font-semibold text-white shadow-xs hover:bg-teal-500 disabled:opacity-40" disabled={flow.build.disabled} onclick={flow.build.run}>Build pre-flight</button>
-      {:else}
-        <button type="button" class="rounded-md bg-teal-600 px-3 py-2 text-sm font-semibold text-white shadow-xs hover:bg-teal-500 disabled:opacity-40" disabled={!canLeave[step]} onclick={() => go(nextStep)}>Next: {steps[nextStep]}</button>
+    <div class="flex items-center gap-2">
+      {#if flow.checkpoint.length > 0}
+        <button type="button" class="rounded-md bg-white px-3 py-2 text-sm font-semibold text-gray-700 shadow-xs ring-1 ring-gray-300 ring-inset hover:bg-gray-50" onclick={downloadCheckpoint} title="Download the pre-prep file(s) as they stand now — a backup, one per study">Download checkpoint</button>
       {/if}
-    {/if}
+      {#if step < steps.length - 1}
+        {#if step === flow.build.at && !flow.build.done}
+          <button type="button" class="rounded-md bg-teal-600 px-3 py-2 text-sm font-semibold text-white shadow-xs hover:bg-teal-500 disabled:opacity-40" disabled={flow.build.disabled} onclick={flow.build.run}>Build pre-flight</button>
+        {:else}
+          <button type="button" class="rounded-md bg-teal-600 px-3 py-2 text-sm font-semibold text-white shadow-xs hover:bg-teal-500 disabled:opacity-40" disabled={!canLeave[step]} onclick={() => go(nextStep)}>Next: {steps[nextStep]}</button>
+        {/if}
+      {/if}
+    </div>
   </div>
 </div>
+
+<Modal bind:open={discardOpen} title="Discard this prep?">
+  {#if pendingDiscard}
+    <div class="p-4">
+      <p class="text-sm text-gray-700">Discard <span class="font-medium">{pendingDiscard.label}</span>? This removes the saved prep from this browser and can't be undone.</p>
+      <div class="mt-4 flex justify-end gap-2">
+        <button type="button" class="rounded-md bg-white px-3 py-1.5 text-sm font-semibold text-gray-900 ring-1 ring-gray-300 ring-inset hover:bg-gray-50" onclick={() => (discardOpen = false)}>Cancel</button>
+        <button type="button" class="rounded-md bg-red-600 px-3 py-1.5 text-sm font-semibold text-white hover:bg-red-500" onclick={confirmDiscard}>Discard</button>
+      </div>
+    </div>
+  {/if}
+</Modal>

@@ -63,9 +63,20 @@ export type StudyFacts = Record<StudyColumn, string>;
 
 export type RunFacts = { run_date: string; instrument_model: string; platemap_generation_date: string };
 
+/** Every column blank — the base each row fills in, so a row is always complete
+ *  even when the study, plate or run facts have not been entered yet (a checkpoint
+ *  taken mid-prep leaves those cells empty rather than dropping the row). */
+const BLANK_ROW = Object.fromEntries(SHEET_COLUMNS.map((c) => [c, ''])) as SheetRow;
+
+/** The pre-prep header alone — a valid, empty checkpoint before anything is scanned. */
+export function emptySheet(): string {
+  return SHEET_COLUMNS.join('\t');
+}
+
 /** The sheet for one study: its wells plate by plate (by position) in row order,
  *  every column filled from the protocol, the study, the plate, the well and the
- *  run. Tube codes lose their leading zeroes, as the notebook writes them. */
+ *  run. Study and run facts may be partial (a mid-prep checkpoint) — missing cells
+ *  are left blank. Tube codes lose their leading zeroes, as the notebook writes them. */
 export function buildSheet(
   wells: {
     position: string;
@@ -77,14 +88,15 @@ export function buildSheet(
     barcode: string;
     plate: Plate;
   }[],
-  study: StudyFacts,
-  run: RunFacts
+  study: Partial<StudyFacts>,
+  run: Partial<RunFacts>
 ): string {
   const order = (w: { position: string; well96: string }) =>
     Number(w.position) * 1000 + WELLS_96.indexOf(w.well96);
   const rows = [...wells]
     .sort((a, b) => order(a) - order(b))
     .map((w): SheetRow => ({
+      ...BLANK_ROW,
       ...PROTOCOL_16S,
       ...w.plate,
       ...study,
@@ -94,11 +106,11 @@ export function buildSheet(
       barcode: w.barcode,
       well_id_384: w.well384,
       well_id_96: w.well96,
-      well_description: `${w.plate.sample_plate}.${w.name}.${w.well384}`,
+      well_description: `${w.plate.sample_plate ?? ''}.${w.name}.${w.well384}`,
       TubeCode: w.tube.replace(/^0+/, ''),
       control_description: w.control,
       run_prefix: '',
       runid: ''
     }));
-  return [SHEET_COLUMNS.join('\t'), ...rows.map((r) => SHEET_COLUMNS.map((c) => r[c]).join('\t'))].join('\n');
+  return [emptySheet(), ...rows.map((r) => SHEET_COLUMNS.map((c) => r[c]).join('\t'))].join('\n');
 }
