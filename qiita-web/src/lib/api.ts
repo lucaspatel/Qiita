@@ -47,6 +47,34 @@ export type ApiResult<T> = Ok<T> | Err;
 // fetch has no default timeout; cap every request so a dead backend fails fast.
 const REQUEST_TIMEOUT_MS = 10_000;
 
+/** One readable line from an error body's `detail`. The server sends a plain
+ *  string, FastAPI's list of request-validation errors, or a structured refusal
+ *  ({reason, errors?, ...context}); `String()` on the last two gives
+ *  "[object Object]". */
+export function errorDetail(body: unknown, fallback: string): string {
+  const detail = body && typeof body === 'object' && 'detail' in body ? (body as { detail: unknown }).detail : undefined;
+  if (detail === undefined || detail === null) return fallback;
+  if (typeof detail === 'string') return detail;
+  const scalar = (v: unknown) => (typeof v === 'string' ? v : JSON.stringify(v));
+  // one validation error: FastAPI's {loc, msg} or a context-schema {path, message}
+  const item = (e: unknown): string => {
+    if (!e || typeof e !== 'object') return scalar(e);
+    const o = e as Record<string, unknown>;
+    const where = Array.isArray(o.loc) ? o.loc.join('.') : typeof o.path === 'string' ? o.path : '';
+    const what = o.msg ?? o.message ?? o.reason;
+    return what === undefined ? JSON.stringify(e) : where ? `${where}: ${scalar(what)}` : scalar(what);
+  };
+  if (Array.isArray(detail)) return detail.map(item).join('; ');
+  if (typeof detail !== 'object') return scalar(detail);
+  const { reason, errors, ...context } = detail as Record<string, unknown>;
+  const parts: string[] = [];
+  if (reason !== undefined) parts.push(scalar(reason));
+  if (Array.isArray(errors) && errors.length) parts.push(errors.map(item).join('; '));
+  const rest = Object.entries(context).map(([k, v]) => `${k}: ${scalar(v)}`);
+  if (rest.length) parts.push(rest.join(', '));
+  return parts.length ? parts.join(' — ') : JSON.stringify(detail);
+}
+
 function networkErr(e: unknown): Err {
   const timedOut = e instanceof DOMException && e.name === 'TimeoutError';
   return {
@@ -76,9 +104,7 @@ async function send<T>(method: string, path: string, body?: unknown): Promise<Ap
   if (res.status === 204) return { ok: true, status: 204, data: undefined as T };
   const b: unknown = await res.json().catch(() => ({}));
   if (res.ok) return { ok: true, status: res.status, data: b as T };
-  const detail =
-    b && typeof b === 'object' && 'detail' in b ? String((b as { detail: unknown }).detail) : res.statusText;
-  return { ok: false, status: res.status, detail };
+  return { ok: false, status: res.status, detail: errorDetail(b, res.statusText) };
 }
 
 async function get<T>(path: string): Promise<ApiResult<T>> {
@@ -93,11 +119,7 @@ async function get<T>(path: string): Promise<ApiResult<T>> {
   }
   const body: unknown = await res.json().catch(() => ({}));
   if (res.ok) return { ok: true, status: res.status, data: body as T };
-  const detail =
-    body && typeof body === 'object' && 'detail' in body
-      ? String((body as { detail: unknown }).detail)
-      : res.statusText;
-  return { ok: false, status: res.status, detail };
+  return { ok: false, status: res.status, detail: errorDetail(body, res.statusText) };
 }
 
 /** A POST whose response body is binary (an Arrow IPC stream), not JSON. */
@@ -118,9 +140,7 @@ async function postArrow(path: string, body: unknown, timeoutMs = 60_000): Promi
   }
   if (res.ok) return { ok: true, status: res.status, data: await res.arrayBuffer() };
   const b: unknown = await res.json().catch(() => ({}));
-  const detail =
-    b && typeof b === 'object' && 'detail' in b ? String((b as { detail: unknown }).detail) : res.statusText;
-  return { ok: false, status: res.status, detail };
+  return { ok: false, status: res.status, detail: errorDetail(b, res.statusText) };
 }
 
 /** Which runs (amplicon runs or taxonomic profiles, all of one method), over which
@@ -239,11 +259,7 @@ export async function cliExchange(otCode: string): Promise<ApiResult<{ token: st
   }
   const body: unknown = await res.json().catch(() => ({}));
   if (res.ok) return { ok: true, status: res.status, data: body as { token: string } };
-  const detail =
-    body && typeof body === 'object' && 'detail' in body
-      ? String((body as { detail: unknown }).detail)
-      : res.statusText;
-  return { ok: false, status: res.status, detail };
+  return { ok: false, status: res.status, detail: errorDetail(body, res.statusText) };
 }
 
 export type UserProfile = {
