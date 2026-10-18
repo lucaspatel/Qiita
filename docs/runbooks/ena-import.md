@@ -262,7 +262,10 @@ display-name twins. `geo_loc_name`'s `country:region:locality` value contributes
 its country/sea part; `lat_lon`'s combined `"<lat> <N|S> <lon> <E|W>"` value splits
 into the separate latitude/longitude fields (negated for S/W), or is left as raw local
 metadata if it doesn't parse (including an INSDC missing-value marker like
-`"missing"`, which real DDBJ submissions do use for `lat_lon`). The three
+`"missing"`, which real DDBJ submissions do use for `lat_lon`). The split checks
+shape only: a latitude past ±90 or a longitude past ±180 (or a non-finite value),
+from `lat_lon` or either coordinate tag, is a metadata parse error on every biosample
+write, so the run fails to register with that error as its `failure_reason`. The three
 environmental-context tags (`env_broad_scale`/`env_local_scale`/`env_medium`, and
 their GSC-MIxS display-name twins) stay unmapped in either vocabulary — see
 "No ENVO harmonization or free-text host matching" below.
