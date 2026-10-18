@@ -40,8 +40,9 @@ class HarmonizationResult:
     """One biosample's harmonization outcome.
 
     `mapped_count`: attributes written as globally-linked metadata.
-    `retained_unmapped`: raw ENA tags written as study-local metadata (not
-    dropped).
+    `retained_unmapped`: the study-local fields written: raw ENA tags (not dropped),
+    and `<field> (as submitted)` for a mapped value its global field could not hold.
+    Such a field still counts in `mapped_count`; its global slot holds `not provided`.
     `warnings`: taxon fields written as `not provided`, or ENA data that disagrees.
     """
 
@@ -230,10 +231,12 @@ def retain_unparseable_as_submitted(
         try:
             parse_text_for_data_type(display_name, data_type, value)
         except MetadataParseError as exc:
+            local_name = f"{display_name}{AS_SUBMITTED_SUFFIX}"
             kept[display_name] = MISSING_REASON_NOT_PROVIDED
-            local[f"{display_name}{AS_SUBMITTED_SUFFIX}"] = value
+            local[local_name] = value
             warnings.append(
-                f"{sample_accession}: {display_name!r} value {value!r} is not a valid"
-                f" {data_type}: {exc.reason}; kept as {display_name}{AS_SUBMITTED_SUFFIX!r}"
+                f"{sample_accession}: {display_name!r} value {value!r} cannot be stored as"
+                f" {data_type} ({exc.reason}); stored {MISSING_REASON_NOT_PROVIDED!r} and"
+                f" kept the submitted text as {local_name!r}"
             )
     return kept, local, warnings

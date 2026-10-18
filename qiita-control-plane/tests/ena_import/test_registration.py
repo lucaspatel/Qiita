@@ -15,7 +15,11 @@ from pathlib import Path
 
 import pytest
 import pytest_asyncio
-from qiita_common.models import LEGACY_IDX_RESERVED_CEILING, FieldDataType
+from qiita_common.models import (
+    LEGACY_IDX_RESERVED_CEILING,
+    MISSING_REASON_NOT_PROVIDED,
+    FieldDataType,
+)
 from qiita_common.models.ena import (
     EnaRunRecord,
     EnaSampleAttributes,
@@ -430,7 +434,8 @@ async def test_unparseable_mapped_value_is_kept_study_local_and_the_run_register
         sample_accession,
         **{
             "geographic location (latitude)": "39N",
-            "geographic location (longitude)": "not-a-number",
+            # a latitude-axis hemisphere is not signed onto a longitude
+            "geographic location (longitude)": "117N",
         },
     )
 
@@ -443,7 +448,7 @@ async def test_unparseable_mapped_value_is_kept_study_local_and_the_run_register
         outcome.harmonization.retained_unmapped
     )
     assert any(
-        "'geographic location (longitude)' value 'not-a-number'" in w
+        "'geographic location (longitude)' value '117N'" in w
         for w in outcome.harmonization.warnings
     )
 
@@ -462,7 +467,7 @@ async def test_unparseable_mapped_value_is_kept_study_local_and_the_run_register
     assert by_display_name["geographic location (latitude)"]["value_numeric"] == Decimal("39")
     longitude = by_display_name["geographic location (longitude)"]
     assert longitude["value_numeric"] is None
-    assert longitude["missing_reason"] == "not provided"
+    assert longitude["missing_reason"] == MISSING_REASON_NOT_PROVIDED
 
     submitted = await reg["pool"].fetchval(
         "SELECT bm.value_text FROM qiita.biosample_metadata bm"
@@ -471,7 +476,7 @@ async def test_unparseable_mapped_value_is_kept_study_local_and_the_run_register
         " AND bsf.display_name = 'geographic location (longitude) (as submitted)'",
         biosample_idx,
     )
-    assert submitted == "not-a-number"
+    assert submitted == "117N"
 
 
 async def test_underscore_mixs_tags_harmonize_to_correct_global_fields(reg):

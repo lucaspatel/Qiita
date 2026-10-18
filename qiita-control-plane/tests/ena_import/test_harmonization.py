@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
-from qiita_common.models import FieldDataType
+from qiita_common.models import MISSING_REASON_NOT_PROVIDED, FieldDataType
 from qiita_common.models.ena import EnaRunRecord
 
 from qiita_control_plane import ena_import
@@ -287,16 +287,20 @@ def test_retain_unparseable_keeps_a_bad_value_study_local():
     )
 
     assert metadata == {
-        "collection date": "not provided",
-        "geographic location (latitude)": "not provided",
+        "collection date": MISSING_REASON_NOT_PROVIDED,
+        "geographic location (latitude)": MISSING_REASON_NOT_PROVIDED,
     }
     assert local == {
         "env_medium": "soil",
         "collection date (as submitted)": "2014-05",
         "geographic location (latitude) (as submitted)": "39 deg",
     }
+    assert warnings[1] == (
+        "SAMEA1: 'geographic location (latitude)' value '39 deg' cannot be stored as"
+        " numeric (not a valid decimal number); stored 'not provided' and kept the"
+        " submitted text as 'geographic location (latitude) (as submitted)'"
+    )
     assert len(warnings) == 2
-    assert warnings[0].startswith("SAMEA1: 'collection date' value '2014-05' is not a valid")
 
 
 def test_retain_unparseable_leaves_valid_values_and_missing_reasons():

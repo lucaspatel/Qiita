@@ -8,8 +8,8 @@
   the run failed to register, so a study whose samples all shared one such value failed
   outright.
 - **An ENA import item's failure reason names each run failure once (#TBD).** When every
-  run fails, the reason groups runs by cause (`882 runs (ERR1293058, ERR1293066,
-  ERR1293070, …): could not parse …`) instead of repeating the same sentence per run.
+  run fails, the reason groups runs by cause (`882 runs (ERR1293056, ERR1293057,
+  ERR1293058, …): <reason>`) instead of repeating the same sentence per run.
   Each run's own reason is still on its `ena_runs` entry.
 - **An ENA import item that fails on an exception with no message says what it was
   (#TBD).** The failure reason was empty; it is now the exception's type, such as

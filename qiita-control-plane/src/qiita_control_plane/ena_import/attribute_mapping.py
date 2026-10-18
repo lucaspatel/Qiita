@@ -89,9 +89,12 @@ _LAT_LON_RE = re.compile(
 )
 
 
-# One coordinate with its hemisphere after it: "39N", "39 N", "12.5°W". A signed number
-# with a hemisphere ("-39S") is ambiguous and does not match.
-_HEMISPHERE_COORDINATE_RE = re.compile(r"^(?P<value>\d+(?:\.\d+)?)\s*°?\s*(?P<dir>[NSEWnsew])$")
+# One coordinate with its hemisphere after it: "39N", "39 N", "12.5°W" (or "º", the
+# ordinal indicator keyboards often give for a degree sign). A signed number with a
+# hemisphere ("-39S") is ambiguous and does not match.
+_HEMISPHERE_COORDINATE_RE = re.compile(
+    r"^(?P<value>[0-9]+(?:\.[0-9]+)?)\s*[°º]?\s*(?P<dir>[NSEWnsew])$"
+)
 
 
 def _coordinate(display_name: str, negative: str) -> _TagHandler:

@@ -60,7 +60,7 @@ from qiita_common.models.ena import (
 from qiita_control_plane.host_by_sample_taxon import implied_hosts
 from qiita_control_plane.repositories import require_transaction
 from qiita_control_plane.repositories._sample_helpers import (
-    fetch_global_fields_by_keys,
+    fetch_global_fields,
     fetch_metadata_checklist_idx_by_name,
     fetch_missing_value_reason_idxs_by_names,
     fetch_terminology_term_idxs_by_term_ids,
@@ -330,11 +330,16 @@ async def register_ena_study(
         library_field_idxs: dict[str, int] = {}
         implied_host_by_taxon: dict[str, str | None] = {}
         loaded_term_ids: frozenset[str] = frozenset()
+        field_types: dict[str, FieldDataType] = {}
+        missing_reasons: frozenset[str] = frozenset()
         if any(acc not in already_present for acc in platform_by_accession):
             library_field_idxs = await _ensure_library_fields(
                 conn, study_idx=study_idx, created_by_idx=caller_idx
             )
             implied_host_by_taxon, loaded_term_ids = await _taxon_lookups(conn, ena_runs)
+            field_types, missing_reasons = await _metadata_type_lookups(
+                conn, attrs_by_sample_accession
+            )
 
         # One transaction spans pool resolution and every run insert so the
         # sequencing_run lock `_resolve_platform_pools` takes is held until the
@@ -380,6 +385,8 @@ async def register_ena_study(
                     library_field_idxs=library_field_idxs,
                     implied_host_by_taxon=implied_host_by_taxon,
                     loaded_term_ids=loaded_term_ids,
+                    field_types=field_types,
+                    missing_reasons=missing_reasons,
                 )
 
     # Return per-run outcomes in the caller's input order.
@@ -447,6 +454,26 @@ async def _resolve_platform_pools(
         for idx in pool_idxs
     ]
     return pools, target_pool_idx
+
+
+async def _metadata_type_lookups(
+    conn: asyncpg.Connection, attrs_by_sample_accession: dict[str, EnaSampleAttributes]
+) -> tuple[dict[str, FieldDataType], frozenset[str]]:
+    """Each biosample global field's type, and which of these samples' attribute values
+    are missing-value reasons: what `retain_unparseable_as_submitted` checks a run's
+    mapped metadata against, read once per study."""
+    fields = await fetch_global_fields(conn, spec=BIOSAMPLE_METADATA_SPEC)
+    values = {
+        value.strip()
+        for attrs in attrs_by_sample_accession.values()
+        for values in attrs.attributes.values()
+        for value in values
+    }
+    reasons = await fetch_missing_value_reason_idxs_by_names(conn, values)
+    return (
+        {row["display_name"]: FieldDataType(row["data_type"]) for row in fields},
+        frozenset(reasons),
+    )
 
 
 async def _taxon_lookups(
@@ -525,27 +552,22 @@ async def _ensure_library_fields(
     return field_idxs
 
 
-async def _retain_unparseable(
-    conn: asyncpg.Connection,
+def _retain_unparseable(
     metadata: dict[str, str],
     local_metadata: dict[str, str],
     harmonization: HarmonizationResult,
     *,
     ena_run: EnaRunRecord,
+    field_types: dict[str, FieldDataType],
+    missing_reasons: frozenset[str],
 ) -> tuple[dict[str, str], dict[str, str], HarmonizationResult]:
-    """`retain_unparseable_as_submitted` over this run's mapped metadata, with the
-    global fields' types and the missing-value reasons read from the database."""
-    fields = await fetch_global_fields_by_keys(
-        conn, spec=BIOSAMPLE_METADATA_SPEC, keys=metadata.keys()
-    )
-    reasons = await fetch_missing_value_reason_idxs_by_names(
-        conn, {value.strip() for value in metadata.values()}
-    )
+    """`retain_unparseable_as_submitted` over this run's mapped metadata, its
+    warnings and `(as submitted)` fields folded into the harmonization result."""
     kept, local, warnings = retain_unparseable_as_submitted(
         metadata,
         local_metadata,
-        data_types={name: row.data_type for name, row in fields.items()},
-        missing_reasons=reasons.keys(),
+        data_types=field_types,
+        missing_reasons=missing_reasons,
         sample_accession=ena_run.sample_accession,
     )
     if not warnings:
@@ -575,6 +597,8 @@ async def _register_one_ena_run(
     library_field_idxs: dict[str, int],
     implied_host_by_taxon: dict[str, str | None],
     loaded_term_ids: frozenset[str],
+    field_types: dict[str, FieldDataType],
+    missing_reasons: frozenset[str],
 ) -> EnaRunRegistrationOutcome:
     """Register one ENA run in its own savepoint within the registration
     transaction (per-run atomicity: a partial failure rolls back only this
@@ -591,8 +615,13 @@ async def _register_one_ena_run(
                 implied_hosts=implied_host_by_taxon,
                 loaded_term_ids=loaded_term_ids,
             )
-            metadata, local_metadata, harmonization = await _retain_unparseable(
-                conn, metadata, local_metadata, harmonization, ena_run=ena_run
+            metadata, local_metadata, harmonization = _retain_unparseable(
+                metadata,
+                local_metadata,
+                harmonization,
+                ena_run=ena_run,
+                field_types=field_types,
+                missing_reasons=missing_reasons,
             )
             biosample_idx, biosample_created = await resolve_or_import_biosample_by_ena_accession(
                 conn,
