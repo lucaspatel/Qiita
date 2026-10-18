@@ -559,6 +559,8 @@ export type EnaRunOutcome = {
   // held_not_downloaded | failed
   status: string;
   failure_reason: string | null;
+  /** Harmonization gaps on the biosample this run created, each `<sample>: <message>`. */
+  metadata_warnings: string[];
 };
 
 export type EnaImportItem = {

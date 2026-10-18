@@ -6,7 +6,10 @@
     BATCH_STATE_CLASS,
     RUN_STATUS_CLASS,
     badgeClass,
-    isTerminal
+    isTerminal,
+    groupRuns,
+    groupWarnings,
+    statusCounts
   } from '$lib/ena';
   import Modal from './Modal.svelte';
   import DropZone from './DropZone.svelte';
@@ -28,12 +31,23 @@
   );
   const allTerminal = $derived(!!batch && batch.items.every((i) => isTerminal(i.state)));
 
+  // A failure reason longer than this is clamped to two lines behind "show all".
+  const LONG_REASON = 160;
+  // Run accessions listed per group before "+N more".
+  const ACCESSIONS_SHOWN = 6;
+  // Keys of the reasons and accession lists the viewer has expanded.
+  let expanded = $state<Record<string, boolean>>({});
+  const toggle = (key: string) => (expanded[key] = !expanded[key]);
+  const label = (status: string) => status.replace(/_/g, ' ');
+  const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
   function reset() {
     mode = 'compose';
     text = '';
     fileName = '';
     batch = null;
     errMsg = '';
+    expanded = {};
   }
 
   // Reset to a fresh compose each time the modal opens.
@@ -193,7 +207,7 @@
                   <td class="px-3 py-2 font-mono whitespace-nowrap text-gray-800"
                     >{it.ena_study_accession}</td
                   >
-                  <td class="px-3 py-2">
+                  <td class="min-w-52 px-3 py-2">
                     <span
                       class="inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium capitalize ring-1 ring-inset {badgeClass(
                         BATCH_STATE_CLASS,
@@ -201,7 +215,23 @@
                       )}">{it.state}</span
                     >
                     {#if it.failure_reason}
-                      <p class="mt-1 max-w-xs text-xs text-red-700">{it.failure_reason}</p>
+                      {@const key = `reason:${it.ena_study_accession}`}
+                      <p
+                        class="mt-1 max-w-xs text-xs break-words text-red-700 {expanded[key]
+                          ? 'max-h-60 overflow-y-auto'
+                          : 'line-clamp-2'}"
+                      >
+                        {it.failure_reason}
+                      </p>
+                      {#if it.failure_reason.length > LONG_REASON}
+                        <button
+                          type="button"
+                          class="text-xs text-teal-700 hover:underline"
+                          onclick={() => toggle(key)}>{expanded[key] ? 'show less' : 'show all'}</button
+                        >
+                      {/if}
+                    {:else if it.state === 'failed'}
+                      <p class="mt-1 max-w-xs text-xs text-red-700">No reason recorded.</p>
                     {/if}
                   </td>
                   <td class="px-3 py-2 whitespace-nowrap">
@@ -221,25 +251,84 @@
                           >{/if}{/each}
                     {:else}<span class="text-gray-400">—</span>{/if}
                   </td>
-                  <td class="px-3 py-2">
+                  <td class="min-w-64 px-3 py-2">
                     {#if it.ena_runs.length}
+                      {@const warnings = groupWarnings(it.ena_runs)}
+                      {@const warned = it.ena_runs.filter((r) => r.metadata_warnings?.length).length}
                       <details>
-                        <summary class="cursor-pointer text-xs text-gray-600"
-                          >{it.ena_runs.length} run{it.ena_runs.length === 1 ? '' : 's'}</summary
-                        >
-                        <ul class="mt-1 space-y-0.5">
-                          {#each it.ena_runs as run}
-                            <li class="flex items-center gap-2 text-xs">
-                              <span class="font-mono text-gray-700">{run.run_accession}</span>
+                        <summary class="cursor-pointer text-xs text-gray-600">
+                          {plural(it.ena_runs.length, 'run')}
+                          {#each statusCounts(it.ena_runs) as [status, n] (status)}
+                            <span
+                              class="ml-1 inline-flex items-center rounded px-1.5 py-0.5 font-medium ring-1 ring-inset {badgeClass(
+                                RUN_STATUS_CLASS,
+                                status
+                              )}">{n} {label(status)}</span
+                            >
+                          {/each}
+                          {#if warned}
+                            <span
+                              class="ml-1 inline-flex items-center rounded bg-amber-50 px-1.5 py-0.5 font-medium text-amber-800 ring-1 ring-amber-600/20 ring-inset"
+                              >{warned} with warnings</span
+                            >
+                          {/if}
+                        </summary>
+                        <ul class="mt-2 space-y-2">
+                          {#each groupRuns(it.ena_runs) as group (group.status + (group.reason ?? ''))}
+                            {@const key = `runs:${it.ena_study_accession}:${group.status}:${group.reason ?? ''}`}
+                            {@const shown = expanded[key]
+                              ? group.accessions
+                              : group.accessions.slice(0, ACCESSIONS_SHOWN)}
+                            <li class="text-xs">
                               <span
                                 class="inline-flex items-center rounded px-1.5 py-0.5 font-medium ring-1 ring-inset {badgeClass(
                                   RUN_STATUS_CLASS,
-                                  run.status
-                                )}">{run.status.replace(/_/g, ' ')}</span
+                                  group.status
+                                )}">{label(group.status)}</span
                               >
+                              <span class="ml-1 text-gray-600">{plural(group.accessions.length, 'run')}</span>
+                              {#if group.reason}
+                                <p class="mt-0.5 break-words text-gray-700">{group.reason}</p>
+                              {/if}
+                              <p
+                                class="mt-0.5 font-mono break-words text-gray-500 {expanded[key]
+                                  ? 'max-h-40 overflow-y-auto'
+                                  : ''}"
+                              >
+                                {shown.join(', ')}{#if group.accessions.length > ACCESSIONS_SHOWN}
+                                  <button
+                                    type="button"
+                                    class="ml-1 font-sans text-teal-700 hover:underline"
+                                    onclick={() => toggle(key)}
+                                    >{expanded[key]
+                                      ? 'show fewer'
+                                      : `+${group.accessions.length - ACCESSIONS_SHOWN} more`}</button
+                                  >
+                                {/if}
+                              </p>
                             </li>
                           {/each}
                         </ul>
+                        {#if warnings.length}
+                          <p class="mt-3 text-xs font-medium text-amber-800">Metadata warnings</p>
+                          <ul class="mt-1 space-y-1.5">
+                            {#each warnings as warning (warning.message)}
+                              <li class="text-xs">
+                                <p class="break-words text-gray-700">{warning.message}</p>
+                                {#if warning.samples.length}
+                                  <p class="text-gray-500">
+                                    {plural(warning.samples.length, 'sample')}: <span class="font-mono"
+                                      >{warning.samples.slice(0, ACCESSIONS_SHOWN).join(', ')}{warning
+                                        .samples.length > ACCESSIONS_SHOWN
+                                        ? ', …'
+                                        : ''}</span
+                                    >
+                                  </p>
+                                {/if}
+                              </li>
+                            {/each}
+                          </ul>
+                        {/if}
                       </details>
                     {:else}<span class="text-gray-400">—</span>{/if}
                   </td>

@@ -1,3 +1,5 @@
+import type { EnaRunOutcome } from './api';
+
 // Client-side INSDC accession handling for the ENA-import workflow.
 //
 // A TS mirror of qiita-common/src/qiita_common/ena_accession.py so the UI rejects
@@ -102,4 +104,60 @@ export function badgeClass(map: Record<string, string>, key: string): string {
 /** Terminal batch-item states — what a watch loop treats as "stop polling". */
 export function isTerminal(state: string): boolean {
   return state === 'done' || state === 'failed';
+}
+
+// Statuses shown first: the ones that need a look.
+const STATUS_ORDER = [
+  'failed',
+  'flagged_unavailable',
+  'held_not_downloaded',
+  'excluded',
+  'skipped_already_present',
+  'registered'
+];
+const statusRank = (s: string) => {
+  const i = STATUS_ORDER.indexOf(s);
+  return i === -1 ? STATUS_ORDER.length : i;
+};
+
+/** Runs sharing a status and a failure reason: one line, not one per run. */
+export type RunGroup = { status: string; reason: string | null; accessions: string[] };
+
+/** A batch item's runs grouped by (status, reason), problems first, then largest. */
+export function groupRuns(runs: EnaRunOutcome[]): RunGroup[] {
+  const groups = new Map<string, RunGroup>();
+  for (const run of runs) {
+    const key = `${run.status}\u0000${run.failure_reason ?? ''}`;
+    const group = groups.get(key) ?? { status: run.status, reason: run.failure_reason, accessions: [] };
+    group.accessions.push(run.run_accession);
+    groups.set(key, group);
+  }
+  return [...groups.values()].sort(
+    (a, b) => statusRank(a.status) - statusRank(b.status) || b.accessions.length - a.accessions.length
+  );
+}
+
+/** How many runs have each status, problems first. */
+export function statusCounts(runs: EnaRunOutcome[]): [string, number][] {
+  const counts = new Map<string, number>();
+  for (const run of runs) counts.set(run.status, (counts.get(run.status) ?? 0) + 1);
+  return [...counts.entries()].sort((a, b) => statusRank(a[0]) - statusRank(b[0]));
+}
+
+/** One metadata warning text and the samples it was raised for. */
+export type WarningGroup = { message: string; samples: string[] };
+
+/** Group runs' metadata warnings by message. Each warning starts `<sample>: `; that
+ *  prefix is what differs between otherwise identical warnings, so it is split off. */
+export function groupWarnings(runs: EnaRunOutcome[]): WarningGroup[] {
+  const groups = new Map<string, WarningGroup>();
+  for (const run of runs)
+    for (const warning of run.metadata_warnings ?? []) {
+      const m = /^(\S+): (.*)$/s.exec(warning);
+      const [sample, message] = m ? [m[1], m[2]] : ['', warning];
+      const group = groups.get(message) ?? { message, samples: [] };
+      if (sample && !group.samples.includes(sample)) group.samples.push(sample);
+      groups.set(message, group);
+    }
+  return [...groups.values()].sort((a, b) => b.samples.length - a.samples.length);
 }
