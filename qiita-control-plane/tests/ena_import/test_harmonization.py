@@ -1,13 +1,18 @@
-"""Tests for `ena_import.harmonization.build_biosample_metadata`."""
+"""Tests for `ena_import.harmonization`: `build_biosample_metadata` and
+`retain_unparseable_as_submitted`."""
 
 import json
 from pathlib import Path
 
 import pytest
+from qiita_common.models import FieldDataType
 from qiita_common.models.ena import EnaRunRecord
 
 from qiita_control_plane import ena_import
-from qiita_control_plane.ena_import.harmonization import build_biosample_metadata
+from qiita_control_plane.ena_import.harmonization import (
+    build_biosample_metadata,
+    retain_unparseable_as_submitted,
+)
 from qiita_control_plane.host_by_sample_taxon import implied_hosts
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -263,3 +268,53 @@ def test_ena_import_source_has_no_bare_taxon_id_literals():
         if '"host taxon id"' in p.read_text() or '"taxon id"' in p.read_text()
     ]
     assert not offenders
+
+
+_TYPES = {
+    "collection date": FieldDataType.DATE,
+    "geographic location (latitude)": FieldDataType.NUMERIC,
+    "taxon id": FieldDataType.TERMINOLOGY,
+}
+
+
+def test_retain_unparseable_keeps_a_bad_value_study_local():
+    metadata, local, warnings = retain_unparseable_as_submitted(
+        {"collection date": "2014-05", "geographic location (latitude)": "39 deg"},
+        {"env_medium": "soil"},
+        data_types=_TYPES,
+        missing_reasons={"not collected", "not provided"},
+        sample_accession="SAMEA1",
+    )
+
+    assert metadata == {
+        "collection date": "not provided",
+        "geographic location (latitude)": "not provided",
+    }
+    assert local == {
+        "env_medium": "soil",
+        "collection date (as submitted)": "2014-05",
+        "geographic location (latitude) (as submitted)": "39 deg",
+    }
+    assert len(warnings) == 2
+    assert warnings[0].startswith("SAMEA1: 'collection date' value '2014-05' is not a valid")
+
+
+def test_retain_unparseable_leaves_valid_values_and_missing_reasons():
+    metadata = {
+        "collection date": "2014-05-03",
+        "geographic location (latitude)": " not collected ",
+        "taxon id": "anything",  # TERMINOLOGY: resolved by the import, not here
+        "depth": "deep",  # no data type known: left for the import to report
+    }
+
+    kept, local, warnings = retain_unparseable_as_submitted(
+        metadata,
+        {},
+        data_types=_TYPES,
+        missing_reasons={"not collected"},
+        sample_accession="SAMEA1",
+    )
+
+    assert kept == metadata
+    assert local == {}
+    assert warnings == []

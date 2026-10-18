@@ -240,12 +240,18 @@ Qiita uses. `GET /api/v1/ena-import-batch/{idx}` returns an `ena_runs` array per
 one entry per ENA run carrying its `status` (`registered` / `skipped_already_present` /
 `excluded` / `failed` / `flagged_unavailable` / `held_not_downloaded` — the last two
 from a re-import's ENA availability re-check, see above) and a `failure_reason` on
-every status but `registered` and `skipped_already_present`. A
-harmonization error (an unparseable value, or a cross-study metadata slot collision)
-fails the run, surfacing as that run's `status: failed` + `failure_reason`, isolated
-per-run exactly like an unmappable platform or a suppressed run (see *Non-public
-studies and runs* above). A checklist-required field ENA did not supply is not itself
-an error — the checklist binding, not enforcement, is what harmonization records.
+every status but `registered` and `skipped_already_present`. A mapped value its
+global field's type cannot hold (a latitude of `39 deg`) does not fail the run: the
+global field stores `not provided`, the submitted text is kept study-local as
+`<field> (as submitted)`, and the run's harmonization warnings name it. A latitude or
+longitude with its hemisphere after it (`39N`, `12.5 W`) is not such a value; it is
+signed and stored as a number. A cross-study metadata slot collision still fails the
+run, surfacing as that run's `status: failed` + `failure_reason`, isolated per-run
+exactly like an unmappable platform or a suppressed run (see *Non-public studies and
+runs* above). When every run fails, the item's `failure_reason` groups the runs by
+cause, naming each cause once with how many runs hit it. A checklist-required field
+ENA did not supply is not itself an error — the checklist binding, not enforcement, is
+what harmonization records.
 
 **A sample with zero ENA attributes is a legitimate, common result, not an import
 failure.** Real ENA/DDBJ samples sometimes carry no `<SAMPLE_ATTRIBUTE>` elements at

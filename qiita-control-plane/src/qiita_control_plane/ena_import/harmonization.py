@@ -20,10 +20,15 @@ from qiita_common.models import (
     BIOSAMPLE_DISPLAY_TAXON_ID,
     MISSING_REASON_NOT_APPLICABLE,
     MISSING_REASON_NOT_PROVIDED,
+    FieldDataType,
 )
 from qiita_common.models.ena import EnaRunRecord
 
 from qiita_control_plane.host_by_sample_taxon import NON_HOST_TAXA
+from qiita_control_plane.repositories._sample_helpers import (
+    MetadataParseError,
+    parse_text_for_data_type,
+)
 
 from .attribute_mapping import map_ena_attributes
 
@@ -187,3 +192,48 @@ def build_biosample_metadata(
             warnings=host_warnings + taxon_warnings + attribute_warnings,
         ),
     )
+
+
+# The study-local field a mapped value its global field cannot hold is kept under: a
+# local field may not share a global's name within one study.
+AS_SUBMITTED_SUFFIX = " (as submitted)"
+
+
+def retain_unparseable_as_submitted(
+    metadata: Mapping[str, str],
+    local_metadata: Mapping[str, str],
+    *,
+    data_types: Mapping[str, FieldDataType],
+    missing_reasons: Collection[str],
+    sample_accession: str,
+) -> tuple[dict[str, str], dict[str, str], list[str]]:
+    """Keep a mapped value its global field's type cannot hold (`"39 deg"` for a
+    coordinate, `"deep"` for a depth) instead of letting it fail the whole run.
+
+    The global field gets `not provided`, which is what such a value tells us, and the
+    submitted text is kept study-local under `<field> (as submitted)`, with a warning.
+    A missing-value reason the import recognizes (`missing_reasons`) is left as is, and
+    so is a field absent from `data_types` or a TERMINOLOGY field, whose values the
+    import resolves itself. Returns `(metadata, local_metadata, warnings)`.
+    """
+    kept = dict(metadata)
+    local = dict(local_metadata)
+    warnings: list[str] = []
+    for display_name, value in metadata.items():
+        data_type = data_types.get(display_name)
+        if (
+            data_type is None
+            or data_type is FieldDataType.TERMINOLOGY
+            or value.strip() in missing_reasons
+        ):
+            continue
+        try:
+            parse_text_for_data_type(display_name, data_type, value)
+        except MetadataParseError as exc:
+            kept[display_name] = MISSING_REASON_NOT_PROVIDED
+            local[f"{display_name}{AS_SUBMITTED_SUFFIX}"] = value
+            warnings.append(
+                f"{sample_accession}: {display_name!r} value {value!r} is not a valid"
+                f" {data_type}: {exc.reason}; kept as {display_name}{AS_SUBMITTED_SUFFIX!r}"
+            )
+    return kept, local, warnings

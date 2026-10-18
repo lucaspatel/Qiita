@@ -38,7 +38,7 @@ in the download workflow and the batch driver.
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from operator import itemgetter
 
@@ -60,7 +60,9 @@ from qiita_common.models.ena import (
 from qiita_control_plane.host_by_sample_taxon import implied_hosts
 from qiita_control_plane.repositories import require_transaction
 from qiita_control_plane.repositories._sample_helpers import (
+    fetch_global_fields_by_keys,
     fetch_metadata_checklist_idx_by_name,
+    fetch_missing_value_reason_idxs_by_names,
     fetch_terminology_term_idxs_by_term_ids,
     insert_entity_to_study,
     resolve_local_study_field,
@@ -87,7 +89,11 @@ from qiita_control_plane.repositories.sequencing_run import (
 )
 from qiita_control_plane.repositories.terminology import fetch_terminology_idx_by_name
 
-from .harmonization import HarmonizationResult, build_biosample_metadata
+from .harmonization import (
+    HarmonizationResult,
+    build_biosample_metadata,
+    retain_unparseable_as_submitted,
+)
 from .platform_mapping import UnmappableEnaPlatformError, map_ena_platform
 from .protocol_mapping import map_ena_run_to_prep_protocol_name
 from .submit import DOWNLOAD_ENA_STUDY_ACTION_ID, DOWNLOAD_ENA_STUDY_ACTION_VERSION
@@ -519,6 +525,42 @@ async def _ensure_library_fields(
     return field_idxs
 
 
+async def _retain_unparseable(
+    conn: asyncpg.Connection,
+    metadata: dict[str, str],
+    local_metadata: dict[str, str],
+    harmonization: HarmonizationResult,
+    *,
+    ena_run: EnaRunRecord,
+) -> tuple[dict[str, str], dict[str, str], HarmonizationResult]:
+    """`retain_unparseable_as_submitted` over this run's mapped metadata, with the
+    global fields' types and the missing-value reasons read from the database."""
+    fields = await fetch_global_fields_by_keys(
+        conn, spec=BIOSAMPLE_METADATA_SPEC, keys=metadata.keys()
+    )
+    reasons = await fetch_missing_value_reason_idxs_by_names(
+        conn, {value.strip() for value in metadata.values()}
+    )
+    kept, local, warnings = retain_unparseable_as_submitted(
+        metadata,
+        local_metadata,
+        data_types={name: row.data_type for name, row in fields.items()},
+        missing_reasons=reasons.keys(),
+        sample_accession=ena_run.sample_accession,
+    )
+    if not warnings:
+        return metadata, local_metadata, harmonization
+    return (
+        kept,
+        local,
+        replace(
+            harmonization,
+            retained_unmapped=sorted(local),
+            warnings=harmonization.warnings + warnings,
+        ),
+    )
+
+
 async def _register_one_ena_run(
     conn: asyncpg.Connection,
     *,
@@ -548,6 +590,9 @@ async def _register_one_ena_run(
                 ena_run=ena_run,
                 implied_hosts=implied_host_by_taxon,
                 loaded_term_ids=loaded_term_ids,
+            )
+            metadata, local_metadata, harmonization = await _retain_unparseable(
+                conn, metadata, local_metadata, harmonization, ena_run=ena_run
             )
             biosample_idx, biosample_created = await resolve_or_import_biosample_by_ena_accession(
                 conn,
