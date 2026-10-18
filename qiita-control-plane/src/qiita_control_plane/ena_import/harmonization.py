@@ -20,10 +20,15 @@ from qiita_common.models import (
     BIOSAMPLE_DISPLAY_TAXON_ID,
     MISSING_REASON_NOT_APPLICABLE,
     MISSING_REASON_NOT_PROVIDED,
+    FieldDataType,
 )
 from qiita_common.models.ena import EnaRunRecord
 
 from qiita_control_plane.host_by_sample_taxon import NON_HOST_TAXA
+from qiita_control_plane.repositories._sample_helpers import (
+    MetadataParseError,
+    parse_text_for_data_type,
+)
 
 from .attribute_mapping import map_ena_attributes
 
@@ -35,9 +40,11 @@ class HarmonizationResult:
     """One biosample's harmonization outcome.
 
     `mapped_count`: attributes written as globally-linked metadata.
-    `retained_unmapped`: raw ENA tags written as study-local metadata (not
-    dropped).
-    `warnings`: taxon fields written as `not provided`, or ENA data that disagrees.
+    `retained_unmapped`: the study-local fields written: raw ENA tags (not dropped),
+    and `<field> (as submitted)` for a mapped value its global field could not hold.
+    Such a field still counts in `mapped_count`; its global slot holds `not provided`.
+    `warnings`: taxon fields written as `not provided`, mapped values kept
+    `(as submitted)`, or ENA data that disagrees.
     """
 
     mapped_count: int
@@ -187,3 +194,54 @@ def build_biosample_metadata(
             warnings=host_warnings + taxon_warnings + attribute_warnings,
         ),
     )
+
+
+# The study-local field a mapped value its global field cannot hold is kept under: a
+# local field may not share a global's name within one study.
+AS_SUBMITTED_SUFFIX = " (as submitted)"
+
+
+def retain_unparseable_as_submitted(
+    metadata: Mapping[str, str],
+    local_metadata: Mapping[str, str],
+    *,
+    data_types: Mapping[str, FieldDataType],
+    missing_reasons: Collection[str],
+    sample_accession: str,
+) -> tuple[dict[str, str], dict[str, str], list[str]]:
+    """Keep a mapped value its global field's type cannot hold (`"39 deg"` for a
+    coordinate, `"deep"` for a depth) instead of letting it fail the whole run.
+
+    The global field gets `not provided` and the submitted text is kept study-local
+    under `<field> (as submitted)`, with a warning. A missing-value reason the import
+    recognizes (`missing_reasons`) is left as is, and so is a field absent from
+    `data_types` or a TERMINOLOGY field, whose values the import resolves itself. A
+    value whose `(as submitted)` name is already a raw ENA tag is left as is too, so
+    the import fails the run on it rather than one value overwriting the other.
+    Returns `(metadata, local_metadata, warnings)`.
+    """
+    kept = dict(metadata)
+    local = dict(local_metadata)
+    warnings: list[str] = []
+    for display_name, value in metadata.items():
+        data_type = data_types.get(display_name)
+        if (
+            data_type is None
+            or data_type is FieldDataType.TERMINOLOGY
+            or value.strip() in missing_reasons
+        ):
+            continue
+        try:
+            parse_text_for_data_type(display_name, data_type, value)
+        except MetadataParseError as exc:
+            local_name = f"{display_name}{AS_SUBMITTED_SUFFIX}"
+            if local_name in local:
+                continue
+            kept[display_name] = MISSING_REASON_NOT_PROVIDED
+            local[local_name] = value
+            warnings.append(
+                f"{sample_accession}: {display_name!r} value {value!r} cannot be stored as"
+                f" {data_type} ({exc.reason}); stored {MISSING_REASON_NOT_PROVIDED!r} and"
+                f" kept the submitted text as {local_name!r}"
+            )
+    return kept, local, warnings
