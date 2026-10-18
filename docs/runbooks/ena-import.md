@@ -240,12 +240,18 @@ Qiita uses. `GET /api/v1/ena-import-batch/{idx}` returns an `ena_runs` array per
 one entry per ENA run carrying its `status` (`registered` / `skipped_already_present` /
 `excluded` / `failed` / `flagged_unavailable` / `held_not_downloaded` — the last two
 from a re-import's ENA availability re-check, see above) and a `failure_reason` on
-every status but `registered` and `skipped_already_present`. A
-harmonization error (an unparseable value, or a cross-study metadata slot collision)
-fails the run, surfacing as that run's `status: failed` + `failure_reason`, isolated
-per-run exactly like an unmappable platform or a suppressed run (see *Non-public
-studies and runs* above). A checklist-required field ENA did not supply is not itself
-an error — the checklist binding, not enforcement, is what harmonization records.
+every status but `registered` and `skipped_already_present`. A mapped value its
+global field's type cannot hold (a latitude of `39 deg`) does not fail the run: the
+global field stores `not provided`, the submitted text is kept study-local as
+`<field> (as submitted)`, and the run's harmonization warnings name it. A latitude or
+longitude with its hemisphere after it (`39N`, `12.5 W`) is not such a value; it is
+signed and stored as a number. A cross-study metadata slot collision still fails the
+run, surfacing as that run's `status: failed` + `failure_reason`, isolated per-run
+exactly like an unmappable platform or a suppressed run (see *Non-public studies and
+runs* above). When every run fails, the item's `failure_reason` groups the runs by
+cause, naming each cause once with how many runs hit it. A checklist-required field
+ENA did not supply is not itself an error — the checklist binding, not enforcement, is
+what harmonization records.
 
 **A sample with zero ENA attributes is a legitimate, common result, not an import
 failure.** Real ENA/DDBJ samples sometimes carry no `<SAMPLE_ATTRIBUTE>` elements at
@@ -350,16 +356,20 @@ see miint's [`insdc_ena` docs](https://the-miint.github.io/duckdb-miint/insdc_en
 and a mismatch fails the step. miint cannot tell a transfer truncated on a gzip member
 boundary from bytes that really disagree with the digest, so the step is retried up to
 the ticket's retry limit; when the retries run out the ticket ends FAILED with
-failure_type `permanent` and both digests in the reason. A run miint skipped (a failed
-open or a mid-download failure, including a corrupt body that surfaces mid-stream) is
-retried the same way, so a permanent open failure such as a 404 costs the full retry
-limit before it fails.
+failure_type `permanent` and both digests in the reason. A run that broke mid-download
+(including a corrupt body that surfaces mid-stream) and an HTTP 5xx, 408 or 429 from ENA
+or its file server are retried the same way, as is ENA's "Not all results may have been
+written" answer with a miint build that includes duckdb-miint#310. A run whose file
+cannot be opened depends on the miint build: before duckdb-miint#312 miint skips it with
+a warning, which is retried like the rest, so a 404 costs the full retry limit; from
+duckdb-miint#312 on, a 404 fails at once.
 
 Where verification does not apply (an SFF run, a file that is not gzip-compressed, no
 `fastq_md5` from ENA) the run still registers. A run that comes back empty with no
 warning fails permanently.
 
-When the retries run out the ticket is FAILED `permanent` and emailed with its reason.
+When the retries run out, or at once for a failure a retry cannot clear (a 404 from
+duckdb-miint#312 on), the ticket is FAILED `permanent` and emailed with its reason.
 Read the reason first. A dropped transfer or an ENA outage: redrive the ticket
 (`POST /work-ticket/{idx}/run`) once ENA is healthy; runs already stored are skipped, and
 a redrive resets `retry_count`, so it buys the full budget again. A bad digest or a 404:
