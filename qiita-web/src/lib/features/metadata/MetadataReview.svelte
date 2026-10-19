@@ -15,7 +15,7 @@
     type Issue,
     type IssueGroup,
     type Review
-  } from '$lib/metadataReview';
+  } from '$lib/features/metadata/review';
 
   let {
     headers = $bindable(),

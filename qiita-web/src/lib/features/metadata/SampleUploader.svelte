@@ -6,8 +6,8 @@
   import DropZone from '$lib/ui/DropZone.svelte';
   import { metameq } from '$lib/pyodide/pyodide.svelte';
   import type { MetameqValidationResult } from '$lib/pyodide/types';
-  import MetadataReview from '$lib/ui/MetadataReview.svelte';
-  import type { Review } from '$lib/metadataReview';
+  import MetadataReview from '$lib/features/metadata/MetadataReview.svelte';
+  import type { Review } from '$lib/features/metadata/review';
 
   let { studyIdx, onUploaded }: { studyIdx: number; onUploaded?: () => void } = $props();
 

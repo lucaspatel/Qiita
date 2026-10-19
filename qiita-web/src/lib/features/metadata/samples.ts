@@ -1,7 +1,7 @@
 // Reading biosample metadata for display: one cell's text, the column set, and
 // the geographic point a sample contributes to the map. Used by SampleGrid and
 // the study page.
-import type { Biosample, MetaField } from './api';
+import type { Biosample, MetaField } from '$lib/api';
 
 /** `global`: a field every study shares; `local`: one of this study's own. */
 export type Column = { key: string; label: string; scope: 'global' | 'local' };
@@ -86,6 +86,41 @@ export function sampleLabelHeader(samples: Biosample[]): string {
           : 'export_entity_id'
     )
   );
+}
+
+// --- the pinned identity column: which handle names each row ------------------
+// The biosample read exposes three stable handles (accessions + the Qiita ID); a
+// `sample_name` is the study's own metadata field, not a read-level field, so it is
+// resolved from metadata. The owner's original submitted name is PII (admin-export
+// only) and is deliberately not an option here.
+export type IdentitySource = 'biosample_accession' | 'ena_sample_accession' | 'export_entity_id' | 'sample_name';
+
+export const IDENTITY_LABEL: Record<IdentitySource, string> = {
+  biosample_accession: 'BioSample accession',
+  ena_sample_accession: 'ENA accession',
+  export_entity_id: 'Qiita ID (QB)',
+  sample_name: 'Sample name'
+};
+
+/** A sample's chosen identity handle, '' when it has none of that kind. */
+export function sampleIdentity(s: Biosample, source: IdentitySource): string {
+  switch (source) {
+    case 'biosample_accession':
+      return s.biosample_accession ?? '';
+    case 'ena_sample_accession':
+      return s.ena_sample_accession ?? '';
+    case 'export_entity_id':
+      return s.export_entity_id;
+    case 'sample_name':
+      return cellText(s, 'sample_name') || cellText(s, 'local:sample_name');
+  }
+}
+
+/** Identity sources that resolve for at least one of these samples — so the toggle
+ *  offers only handles the data actually carries (Qiita ID is always present). */
+export function availableIdentities(samples: Biosample[]): IdentitySource[] {
+  const all: IdentitySource[] = ['biosample_accession', 'ena_sample_accession', 'export_entity_id', 'sample_name'];
+  return all.filter((src) => src === 'export_entity_id' || samples.some((s) => sampleIdentity(s, src)));
 }
 
 function num(v: unknown): number | null {
