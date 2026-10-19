@@ -52,16 +52,18 @@ export const STUDIES: Record<string, { title: string; color: string }> = {
 };
 export const OTHER = 'other';
 
-/** The single primer set supported short-term: full-length 16S (27F / 1492R),
- *  with the UMI-bearing construct primers. Values are illustrative. */
-export const PROTOCOL_FULL_16S: Protocol = {
-  fwd_primer: 'AGAGTTTGATCMTGGCTCAG', // 27F
-  rev_primer: 'TACGGYTACCTTGTTACGACTT', // 1492R
-  five_prime_primer: 'GCAGTCGAACATGTAGCTGACTCAGGTCAC',
-  three_prime_primer: 'TGGATCACTTGTGCAAGCATCACATCGTAG',
-  umi_pattern: 'NNNYRNNNYRNNN',
-  target_gene: '16S rRNA',
-  target_subfragment: 'full-length (V1-V9)'
+/** The Karst et al 2021 rRNA-operon prep: the ~5 Kbp 16S–ITS–23S amplicon tagged
+ *  with per-molecule UMIs, amplified on the universal-tail adapters. Locus primers
+ *  are 16S 8F (fwd) and 23S 2490R (rev); the construct primers are the 24-bp
+ *  universal tails flanking the 18-bp UMIs. Values are the lab's. */
+export const PROTOCOL_KARST_5KB: Protocol = {
+  fwd_primer: 'AGRGTTYGATYMTGGCTCAG', // lu_16S_8F locus
+  rev_primer: 'CGACATCGAGGTGCCAAAC', // lu_23S_2490R locus
+  five_prime_primer: 'CAAGCAGAAGACGGCATACGAGAT', // fwd universal tail / PCR2 primer
+  three_prime_primer: 'AATGATACGGCGACCACCGAGATC', // rev universal tail / PCR2 primer
+  umi_pattern: 'NNNYRNNNYRNNNYRNNN',
+  target_gene: '16S-ITS-23S rRNA operon',
+  target_subfragment: 'full-length (16S–23S, ~5 Kbp)'
 };
 
 /** A small demo pool: 8 samples across two studies + one blank, each with a

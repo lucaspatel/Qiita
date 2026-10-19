@@ -108,7 +108,13 @@
   }
 </script>
 
-<PageHeading title="Workflows" subtitle="Submit a workflow — its run appears under Jobs." />
+<PageHeading title="Workflows" subtitle="Submit a workflow — its run appears under Jobs.">
+  {#snippet actions()}
+    <a href="/references" class="text-sm font-medium text-teal-700 hover:underline">References</a>
+    <span class="text-gray-300" aria-hidden="true">·</span>
+    <a href="/prep-protocols" class="text-sm font-medium text-teal-700 hover:underline">Prep protocols</a>
+  {/snippet}
+</PageHeading>
 
 {#if !auth.isSet}
   <Card><p class="py-8 text-center text-gray-500">Log in to submit workflows.</p></Card>

@@ -13,7 +13,7 @@
   import Card from './Card.svelte';
   import DataTable from './DataTable.svelte';
   import { untrack } from 'svelte';
-  import { labelHeader } from '$lib/samples';
+  import { labelHeader } from '$lib/features/metadata/samples';
   import ValueScatter from './ValueScatter.svelte';
   import PcoaPlot from './PcoaPlot.svelte';
   import Spinner from './Spinner.svelte';
@@ -24,7 +24,7 @@
   import { dropEmptySamples, loadFeatureTable, type FeatureTable } from '$lib/featureTable';
   import ColorPanel from './ColorPanel.svelte';
   import { colorBy, fieldValue, natural, shapeBy } from '$lib/colorBy';
-  import { metadataFields } from '$lib/samples';
+  import { metadataFields } from '$lib/features/metadata/samples';
   import type { MetaField } from '$lib/api';
   import { studyMetadata } from '$lib/studyMetadata.svelte';
   import { loadPlotPrefs, savePlotPrefs } from '$lib/plotPrefs';

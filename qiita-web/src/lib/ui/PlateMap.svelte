@@ -5,7 +5,7 @@
 <script lang="ts">
   // A 96- or 384-well plate drawn as a grid of wells. Each filled well has a fill
   // colour, an optional ring (a problem) and a tooltip; clicking one calls `onpick`.
-  import { COLS_384, COLS_96, ROWS_384, ROWS_96 } from '$lib/libraryPrep/mock';
+  import { COLS_384, COLS_96, ROWS_384, ROWS_96 } from '$lib/plate';
 
   let {
     format = 96,
