@@ -6,12 +6,12 @@
   import PageHeading from '$lib/ui/PageHeading.svelte';
   import Card from '$lib/ui/Card.svelte';
   import Modal from '$lib/ui/Modal.svelte';
-  import SampleUploader from '$lib/ui/SampleUploader.svelte';
-  import SampleGrid from '$lib/ui/SampleGrid.svelte';
+  import SampleUploader from '$lib/features/metadata/SampleUploader.svelte';
+  import SampleGrid from '$lib/features/metadata/SampleGrid.svelte';
   import StudyPools from '$lib/ui/StudyPools.svelte';
   import Tabs from '$lib/ui/Tabs.svelte';
   import Spinner from '$lib/ui/Spinner.svelte';
-  import { metadataColumns } from '$lib/samples';
+  import { metadataColumns } from '$lib/features/metadata/samples';
   import { studyMetadata } from '$lib/studyMetadata.svelte';
   import { settings } from '$lib/settings.svelte';
   import { humanizeLabel, fmtDate } from '$lib/utils';
@@ -209,10 +209,20 @@
             {/if}
           {:else if tab === 'details'}
             <dl class="grid grid-cols-1 gap-x-6 gap-y-2 sm:grid-cols-2">
-              {#if poolsSummary}
+              {#if pools.length}
                 <div class="flex gap-2 text-sm">
                   <dt class="w-44 shrink-0 font-medium text-gray-500">Sequenced pools</dt>
-                  <dd class="min-w-0 break-words text-gray-900">{poolsSummary}</dd>
+                  <dd class="min-w-0 break-words text-gray-900">
+                    <p class="text-gray-500">{poolsSummary}</p>
+                    <ul class="mt-1 space-y-0.5">
+                      {#each pools as p (p.sequenced_pool_idx)}
+                        <li>
+                          <a class="font-medium text-teal-700 hover:text-teal-800 hover:underline" href="/sequencing/pool/{p.sequencing_run_idx}/{p.sequenced_pool_idx}">pool #{p.sequenced_pool_idx}</a>
+                          <span class="text-gray-500"> · {p.instrument_model || 'unknown platform'} · {p.sample_count} samples</span>
+                        </li>
+                      {/each}
+                    </ul>
+                  </dd>
                 </div>
               {/if}
               {#each detailFields as k (k)}{@render fieldRow(k, record.data[k])}{/each}
