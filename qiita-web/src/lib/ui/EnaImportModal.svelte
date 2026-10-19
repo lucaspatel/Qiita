@@ -14,7 +14,8 @@
   import Modal from './Modal.svelte';
   import DropZone from './DropZone.svelte';
 
-  let { open = $bindable(false) }: { open?: boolean } = $props();
+  // `initial` seeds the compose box (e.g. a paper's accessions from the papers feed).
+  let { open = $bindable(false), initial = '' }: { open?: boolean; initial?: string } = $props();
 
   let mode = $state<'compose' | 'status'>('compose');
   let text = $state('');
@@ -53,7 +54,10 @@
   // Reset to a fresh compose each time the modal opens.
   let wasOpen = false;
   $effect(() => {
-    if (open && !wasOpen) reset();
+    if (open && !wasOpen) {
+      reset();
+      text = initial; // seed from the caller (papers feed), empty otherwise
+    }
     wasOpen = open;
   });
 

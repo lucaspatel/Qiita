@@ -376,6 +376,9 @@ export type StudySummary = {
   caller_tier: Tier;
   access_via: 'owner' | 'grant' | 'public' | 'role';
   updated_at: string;
+  /** When the caller's own access grant was made; null without one. Absent from a
+   *  server that predates it. */
+  granted_at?: string | null;
 };
 
 export type StudySummaryList = { studies: StudySummary[]; next_after_study_idx: number | null };
@@ -454,6 +457,27 @@ export type StudySequencedPoolList = {
   sequenced_pool: StudySequencedPool[];
   count: number;
   truncated: boolean;
+};
+
+export type PoolDemuxState = 'completed' | 'in_flight' | 'no_data' | 'failed' | 'not_submitted';
+/** A pool's end-to-end processing rollup (GET …/completion): the demux state and the
+ *  per-sample buckets (which sum to sample_count). `complete`/`fully_processed` are
+ *  server-computed. */
+export type PoolCompletion = {
+  sequenced_pool_idx: number;
+  sequencing_run_idx: number;
+  reference_idx: number | null;
+  demux_state: PoolDemuxState;
+  sample_count: number;
+  samples_completed: number;
+  samples_invalidated: number;
+  samples_in_flight: number;
+  samples_no_data: number;
+  samples_failed: number;
+  samples_cancelled: number;
+  samples_not_submitted: number;
+  complete: boolean;
+  fully_processed: boolean;
 };
 
 // --- long-read lineage inputs (GET /processing, /mask-definition, /assembly/.../membership) ---
@@ -577,6 +601,38 @@ export type EnaImportBatch = {
   items: EnaImportItem[];
 };
 
+// --- admin (system_admin) --------------------------------------------------
+/** The three system roles, low → high. */
+export type SystemRole = 'user' | 'wet_lab_admin' | 'system_admin';
+export const SYSTEM_ROLES: SystemRole[] = ['user', 'wet_lab_admin', 'system_admin'];
+
+export type PrincipalLookup = {
+  principal_idx: number;
+  system_role: SystemRole;
+  disabled: boolean;
+  retired: boolean;
+};
+export type RevokeAllTokensResult = { revoked_token_idxs: number[]; already_revoked_count: number };
+
+/** A fan-out cohort: the thing many tickets hang off (a reference shard build, a
+ *  read-mask block set, an alignment block set). `key` is that idx. */
+export type FanoutCohortKind = 'shard' | 'read_mask_block' | 'align_block';
+export type FanoutCohort = {
+  kind: FanoutCohortKind;
+  key: number;
+  label: string;
+  total: number;
+  held: number;
+  running: number;
+  failed: number;
+  fail_stopped: boolean;
+  /** The cap the next pump applies. */
+  max_inflight: number;
+  /** Operator-set cap, or null when using the deployment default. */
+  override: number | null;
+};
+export type FanoutPumpResult = { released: number[]; status: FanoutCohort };
+
 export const api = {
   whoami: () => get<Whoami>('/auth/whoami'),
   /** The control plane's self-reported deployment name; unauthenticated. */
@@ -676,6 +732,10 @@ export const api = {
   /** The prep_samples in a pool. Needs tier >= viewer. */
   poolSamples: (run: number, pool: number) =>
     get<IdxList>(`/sequencing-run/${run}/sequenced-pool/${pool}/sequenced-sample/list-idxs`),
+  /** A pool's processing rollup (demux state + per-sample buckets). Run creator or
+   *  wet_lab_admin+; needs prep_sample:read. */
+  poolCompletion: (run: number, pool: number) =>
+    get<PoolCompletion>(`/sequencing-run/${run}/sequenced-pool/${pool}/completion`),
   /** Processing runs over a prep_sample (long-read-assembly). */
   processing: (prepSampleIdx: number) =>
     get<ProcessingList>(`/processing?prep_sample_idx=${prepSampleIdx}`),
@@ -713,7 +773,29 @@ export const api = {
     send<EnaImportBatch>('POST', '/ena-import-batch', { accessions }),
   /** Read a batch's current per-item state. There is no list endpoint — poll this
    *  (Refresh) by the idx submit handed back. */
-  enaImportStatus: (idx: number) => get<EnaImportBatch>(`/ena-import-batch/${idx}`)
+  enaImportStatus: (idx: number) => get<EnaImportBatch>(`/ena-import-batch/${idx}`),
+
+  // --- admin (system_admin; server enforces the role/scope) ----------------
+  /** Resolve an email → principal (idx, role, disabled/retired). 404 if unknown. */
+  lookupPrincipalByEmail: (email: string) =>
+    send<PrincipalLookup>('POST', '/admin/principal/lookup-by-email', { email }),
+  /** Change a principal's system role (204). `reason` is recorded in the audit event. */
+  setPrincipalSystemRole: (principalIdx: number, system_role: SystemRole, reason?: string) =>
+    send<void>('PATCH', `/admin/principal/${principalIdx}/system-role`, {
+      system_role,
+      reason: reason?.trim() || null
+    }),
+  /** Revoke every token a principal holds. */
+  revokeAllPrincipalTokens: (principalIdx: number) =>
+    send<RevokeAllTokensResult>('POST', `/admin/principal/${principalIdx}/revoke-all-tokens`),
+  /** Dispatch-throttle cohorts: every one with held/in-flight work or an override. */
+  fanoutCohorts: () => get<{ cohorts: FanoutCohort[] }>('/work-ticket/fanout'),
+  /** Set (int) or clear (null) a cohort's in-flight cap, then pump. */
+  setFanoutOverride: (kind: FanoutCohortKind, key: number, max_inflight: number | null) =>
+    send<FanoutPumpResult>('PATCH', `/work-ticket/fanout/${kind}/${key}`, { max_inflight }),
+  /** Re-trigger a cohort's pump without changing its cap. */
+  pumpFanout: (kind: FanoutCohortKind, key: number) =>
+    send<FanoutPumpResult>('POST', `/work-ticket/fanout/${kind}/${key}/pump`)
 };
 
 /** Bundled amplicon-run submit (run id + base64 preflight + knobs). */
