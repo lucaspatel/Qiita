@@ -4,7 +4,8 @@ import { dirname, join } from 'node:path';
 import tailwindcss from '@tailwindcss/vite';
 import { sveltekit } from '@sveltejs/kit/vite';
 import { parse } from 'smol-toml';
-import { defineConfig, type Plugin, type ProxyOptions } from 'vite';
+import type { Plugin, ProxyOptions } from 'vite';
+import { defineConfig } from 'vitest/config';
 
 // Dev-server environments. The browser can't call a control plane directly
 // (no CORS), so each environment gets a same-origin proxy prefix,
@@ -126,6 +127,9 @@ export default defineConfig(({ command }) => {
       __QIITA_DEV_ENVS__: JSON.stringify(dev.envs),
       __QIITA_DEV_DEFAULT_ENV__: JSON.stringify(dev.current)
     },
-    server: { proxy }
+    server: { proxy },
+    // Unit tests: pure logic only, in node, colocated as *.test.ts. Browser workflows
+    // are Playwright's (tests/e2e, `npm run test:e2e`).
+    test: { include: ['src/**/*.test.ts'], environment: 'node' }
   };
 });
