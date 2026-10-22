@@ -103,11 +103,8 @@ class SampleEntityKind(StrEnum):
     PREP_SAMPLE = "prep_sample"
 
 
-# The decimal-degree bound on each biosample coordinate global, keyed by its
-# internal_name: a value past it, or a non-finite one, names no place on Earth,
-# so it is a parse error rather than a number stored for every reader to
-# range-check. Keyed on the resolved global, not the caller's key, so a value
-# keyed by internal_name or written through a study-local alias is bounded too.
+# Decimal-degree bound per coordinate global, keyed by internal_name; a value
+# past it (or non-finite) names no place, so it is a parse error, not a number.
 BIOSAMPLE_COORDINATE_DEGREE_BOUNDS: dict[str, Decimal] = {
     BIOSAMPLE_FIELD_GEOGRAPHIC_LOCATION_LATITUDE: Decimal(90),
     BIOSAMPLE_FIELD_GEOGRAPHIC_LOCATION_LONGITUDE: Decimal(180),

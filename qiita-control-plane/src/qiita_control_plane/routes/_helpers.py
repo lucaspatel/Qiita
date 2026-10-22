@@ -592,9 +592,8 @@ async def resolve_study_entity_by_unique_field(
         )
 
     # Parse against the field's type so the value handed to the query below is
-    # in the form the column stores. The API admits unique_in_study only on
-    # UNIQUE_IN_STUDY_DATA_TYPES, not the wider set the schema's CHECK allows;
-    # widening it to a type whose parse can fail means mapping that failure here.
+    # in the form the column stores. A unique_in_study field is text, which
+    # parses to itself, so this cannot fail.
     parsed_value = parse_text_for_data_type(display_name, field_row.data_type, value)
 
     entity_idx = await fetch_entity_idx_by_unique_field_value(
