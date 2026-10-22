@@ -246,9 +246,10 @@ fails the run, surfacing as that run's `status: failed` + `failure_reason`, isol
 per-run exactly like an unmappable platform or a suppressed run (see *Non-public
 studies and runs* above). A checklist-required field ENA did not supply is not itself
 an error — the checklist binding, not enforcement, is what harmonization records. A
-coordinate past its bound — latitude beyond ±90, or longitude beyond ±180, e.g. a study
-submitted on a 0–360 longitude convention — is one such unparseable value, so every run
-of that study fails until the coordinates are corrected at ENA.
+coordinate past its bound — latitude beyond ±90, or longitude beyond ±180 — is one such
+unparseable value: every run referencing that sample fails until the coordinate is
+corrected at ENA, so a study submitted on a 0–360 longitude convention, where every
+sample is off, fails every run.
 
 **A sample with zero ENA attributes is a legitimate, common result, not an import
 failure.** Real ENA/DDBJ samples sometimes carry no `<SAMPLE_ATTRIBUTE>` elements at
