@@ -158,10 +158,8 @@ def build_amplicon_dummy_sample_sheet(reads: tuple[IlluminaRead, ...], sample_id
     read as the 12-cycle Golay index (any tail masked), any other index read
     masked. See AMPLICON_PLACEHOLDER_INDEX for why the sheet names an index.
 
-    Where this degenerate sheet belongs -- here, or in kl-run-preflight beside the real
-    bcl-convert sheets -- is unsettled: it uses no preflight content, so it fits oddly in
-    either, and the demux-kind decision arguably belongs to the processing code. A
-    follow-up tracks resolving it; touch this with that in mind.
+    Uses no preflight content: the sheet encodes only the decision to defer the demux to
+    golay_demux, not any run description.
     """
     template = [r for r in reads if not r.is_indexed]
     index = [r for r in reads if r.is_indexed]
