@@ -27,6 +27,8 @@ from qiita_common.models.ena import EnaRunRecord
 from qiita_control_plane.host_by_sample_taxon import NON_HOST_TAXA
 from qiita_control_plane.repositories._sample_helpers import (
     MetadataParseError,
+    SampleEntityKind,
+    coordinate_degree_bound,
     parse_text_for_data_type,
 )
 
@@ -206,19 +208,26 @@ def retain_unparseable_as_submitted(
     local_metadata: Mapping[str, str],
     *,
     data_types: Mapping[str, FieldDataType],
+    internal_names: Mapping[str, str | None],
     missing_reasons: Collection[str],
     sample_accession: str,
 ) -> tuple[dict[str, str], dict[str, str], list[str]]:
     """Keep a mapped value its global field's type cannot hold (`"39 deg"` for a
-    coordinate, `"deep"` for a depth) instead of letting it fail the whole run.
+    coordinate, a longitude of `"200"` past its degree bound, `"deep"` for a depth)
+    instead of letting it fail the whole run.
 
     The global field gets `not provided` and the submitted text is kept study-local
-    under `<field> (as submitted)`, with a warning. A missing-value reason the import
-    recognizes (`missing_reasons`) is left as is, and so is a field absent from
-    `data_types` or a TERMINOLOGY field, whose values the import resolves itself. A
-    value whose `(as submitted)` name is already a raw ENA tag is left as is too, so
-    the import fails the run on it rather than one value overwriting the other.
-    Returns `(metadata, local_metadata, warnings)`.
+    under `<field> (as submitted)`, with a warning. `internal_names` carries each
+    field's global internal_name, so a coordinate is range-checked (past ±90/±180 is
+    unparseable), not just type-checked. A missing-value reason the import recognizes
+    (`missing_reasons`) is left as is, and so is a field absent from `data_types` or a
+    TERMINOLOGY field, whose values the import resolves itself.
+
+    A blank value has no submitted text worth keeping, so it stores `not provided`
+    alone, with no `(as submitted)` field. When the `(as submitted)` name is already a
+    raw ENA tag, keeping both would overwrite one, so this raises a `MetadataParseError`
+    naming the taken field (the caller folds it into a `failed` outcome). Returns
+    `(metadata, local_metadata, warnings)`.
     """
     kept = dict(metadata)
     local = dict(local_metadata)
@@ -231,12 +240,28 @@ def retain_unparseable_as_submitted(
             or value.strip() in missing_reasons
         ):
             continue
+        degree_bound = coordinate_degree_bound(
+            SampleEntityKind.BIOSAMPLE, internal_names.get(display_name)
+        )
         try:
-            parse_text_for_data_type(display_name, data_type, value)
+            parse_text_for_data_type(display_name, data_type, value, degree_bound=degree_bound)
         except MetadataParseError as exc:
+            if not value.strip():
+                kept[display_name] = MISSING_REASON_NOT_PROVIDED
+                warnings.append(
+                    f"{sample_accession}: {display_name!r} is blank;"
+                    f" stored {MISSING_REASON_NOT_PROVIDED!r}"
+                )
+                continue
             local_name = f"{display_name}{AS_SUBMITTED_SUFFIX}"
             if local_name in local:
-                continue
+                raise MetadataParseError(
+                    field_key=display_name,
+                    data_type=data_type,
+                    text_value=value,
+                    reason=f"{exc.reason}; cannot keep the submitted text as"
+                    f" {local_name!r}, already a submitted attribute",
+                ) from exc
             kept[display_name] = MISSING_REASON_NOT_PROVIDED
             local[local_name] = value
             warnings.append(

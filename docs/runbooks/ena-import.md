@@ -324,6 +324,15 @@ fails, the item's `failure_reason` groups the runs by cause, naming each cause o
 with how many runs hit it. A checklist-required field ENA did not supply is not itself
 an error — the checklist binding, not enforcement, is what harmonization records.
 
+**A stored `not provided` is not rewritten by a re-import.** A biosample first
+registered with the fallback (a value its global field could not hold, or a field ENA
+did not supply) keeps that `not provided`: resolve-by-accession returns the existing
+biosample unchanged, so a later re-import of the same accession — or a second study
+linking the same biosample — sees the original value, and the submitted text stays in
+the first study's `<field> (as submitted)`. To correct a value after the fact, fix it
+at ENA and PATCH the biosample's metadata directly (`PATCH /biosample/{idx}` /
+`…/by-unique-field/metadata`); re-importing the accession alone does not update it.
+
 **A sample with zero ENA attributes is a legitimate, common result, not an import
 failure.** Real ENA/DDBJ samples sometimes carry no `<SAMPLE_ATTRIBUTE>` elements at
 all (confirmed live against DDBJ study `PRJDB40364`'s sample `SAMD01818724`). Such a

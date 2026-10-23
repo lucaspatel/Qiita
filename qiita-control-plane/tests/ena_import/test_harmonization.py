@@ -6,6 +6,10 @@ from pathlib import Path
 
 import pytest
 from qiita_common.models import MISSING_REASON_NOT_PROVIDED, FieldDataType
+from qiita_common.models.biosample import (
+    BIOSAMPLE_FIELD_GEOGRAPHIC_LOCATION_LATITUDE,
+    BIOSAMPLE_FIELD_GEOGRAPHIC_LOCATION_LONGITUDE,
+)
 from qiita_common.models.ena import EnaRunRecord
 
 from qiita_control_plane import ena_import
@@ -14,6 +18,7 @@ from qiita_control_plane.ena_import.harmonization import (
     retain_unparseable_as_submitted,
 )
 from qiita_control_plane.host_by_sample_taxon import implied_hosts
+from qiita_control_plane.repositories._sample_helpers import MetadataParseError
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -273,7 +278,17 @@ def test_ena_import_source_has_no_bare_taxon_id_literals():
 _TYPES = {
     "depth": FieldDataType.NUMERIC,
     "geographic location (latitude)": FieldDataType.NUMERIC,
+    "geographic location (longitude)": FieldDataType.NUMERIC,
     "taxon id": FieldDataType.TERMINOLOGY,
+}
+
+# display_name -> global internal_name, so a coordinate is range-checked (past its
+# degree bound), not just type-checked. Non-coordinate fields carry a benign name.
+_INTERNAL_NAMES = {
+    "depth": "depth",
+    "geographic location (latitude)": BIOSAMPLE_FIELD_GEOGRAPHIC_LOCATION_LATITUDE,
+    "geographic location (longitude)": BIOSAMPLE_FIELD_GEOGRAPHIC_LOCATION_LONGITUDE,
+    "taxon id": "taxon_id",
 }
 
 
@@ -282,6 +297,7 @@ def test_retain_unparseable_keeps_a_bad_value_study_local():
         {"depth": "deep", "geographic location (latitude)": "39 deg"},
         {"env_medium": "soil"},
         data_types=_TYPES,
+        internal_names=_INTERNAL_NAMES,
         missing_reasons={"not collected", "not provided"},
         sample_accession="SAMEA1",
     )
@@ -315,6 +331,7 @@ def test_retain_unparseable_leaves_valid_values_and_missing_reasons():
         metadata,
         {},
         data_types=_TYPES,
+        internal_names=_INTERNAL_NAMES,
         missing_reasons={"not collected"},
         sample_accession="SAMEA1",
     )
@@ -324,18 +341,59 @@ def test_retain_unparseable_leaves_valid_values_and_missing_reasons():
     assert warnings == []
 
 
-def test_retain_unparseable_leaves_a_value_whose_as_submitted_name_is_taken():
-    # a raw tag already holds the name: the import fails the run instead of overwriting it
-    local_metadata = {"depth (as submitted)": "raw tag"}
+def test_retain_unparseable_raises_naming_the_taken_as_submitted_field():
+    # a raw tag already holds the `(as submitted)` name: keeping both would overwrite
+    # one, so the run fails and the reason names the taken field.
+    with pytest.raises(MetadataParseError) as excinfo:
+        retain_unparseable_as_submitted(
+            {"depth": "deep"},
+            {"depth (as submitted)": "raw tag"},
+            data_types=_TYPES,
+            internal_names=_INTERNAL_NAMES,
+            missing_reasons=set(),
+            sample_accession="SAMEA1",
+        )
 
+    message = str(excinfo.value)
+    assert "cannot keep the submitted text as 'depth (as submitted)'" in message
+    assert "already a submitted attribute" in message
+
+
+def test_retain_unparseable_stores_a_blank_value_without_an_as_submitted_field():
+    # A blank value has no submitted text worth keeping: `not provided`, no local field.
     kept, local, warnings = retain_unparseable_as_submitted(
-        {"depth": "deep"},
-        local_metadata,
+        {"depth": "   "},
+        {},
         data_types=_TYPES,
+        internal_names=_INTERNAL_NAMES,
         missing_reasons=set(),
         sample_accession="SAMEA1",
     )
 
-    assert kept == {"depth": "deep"}
-    assert local == local_metadata
-    assert warnings == []
+    assert kept == {"depth": MISSING_REASON_NOT_PROVIDED}
+    assert local == {}
+    assert warnings == ["SAMEA1: 'depth' is blank; stored 'not provided'"]
+
+
+def test_retain_unparseable_keeps_an_out_of_range_coordinate_as_submitted():
+    # A longitude past +/-180 is unparseable (range, not just type): #717 keeps it as
+    # submitted rather than failing the run, the flip of #718's bare-bound behaviour.
+    kept, local, warnings = retain_unparseable_as_submitted(
+        {"geographic location (longitude)": "200", "geographic location (latitude)": "95"},
+        {},
+        data_types=_TYPES,
+        internal_names=_INTERNAL_NAMES,
+        missing_reasons=set(),
+        sample_accession="SAMEA1",
+    )
+
+    assert kept == {
+        "geographic location (longitude)": MISSING_REASON_NOT_PROVIDED,
+        "geographic location (latitude)": MISSING_REASON_NOT_PROVIDED,
+    }
+    assert local == {
+        "geographic location (longitude) (as submitted)": "200",
+        "geographic location (latitude) (as submitted)": "95",
+    }
+    assert any("not a coordinate between -180 and 180 degrees" in w for w in warnings)
+    assert any("not a coordinate between -90 and 90 degrees" in w for w in warnings)

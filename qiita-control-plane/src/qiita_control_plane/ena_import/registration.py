@@ -335,13 +335,14 @@ async def register_ena_study(
         implied_host_by_taxon: dict[str, str | None] = {}
         loaded_term_ids: frozenset[str] = frozenset()
         field_types: dict[str, FieldDataType] = {}
+        internal_names: dict[str, str] = {}
         missing_reasons: frozenset[str] = frozenset()
         if any(acc not in already_present for acc in platform_by_accession):
             library_field_idxs = await _ensure_library_fields(
                 conn, study_idx=study_idx, created_by_idx=caller_idx
             )
             implied_host_by_taxon, loaded_term_ids = await _taxon_lookups(conn, ena_runs)
-            field_types, missing_reasons = await _metadata_type_lookups(conn)
+            field_types, internal_names, missing_reasons = await _metadata_type_lookups(conn)
 
         # One transaction spans pool resolution and every run insert so the
         # sequencing_run lock `_resolve_platform_pools` takes is held until the
@@ -388,6 +389,7 @@ async def register_ena_study(
                     implied_host_by_taxon=implied_host_by_taxon,
                     loaded_term_ids=loaded_term_ids,
                     field_types=field_types,
+                    internal_names=internal_names,
                     missing_reasons=missing_reasons,
                 )
 
@@ -466,13 +468,15 @@ def exception_reason(exc: BaseException) -> str:
 
 async def _metadata_type_lookups(
     conn: asyncpg.Connection,
-) -> tuple[dict[str, FieldDataType], frozenset[str]]:
-    """Each biosample global field's type, and the whole missing-value reason
-    vocabulary: what `retain_unparseable_as_submitted` checks a run's mapped metadata
-    against, read once per study."""
+) -> tuple[dict[str, FieldDataType], dict[str, str], frozenset[str]]:
+    """Each biosample global field's type and its internal_name, and the whole
+    missing-value reason vocabulary: what `retain_unparseable_as_submitted` checks a
+    run's mapped metadata against (the internal_name lets it bound a coordinate), read
+    once per study."""
     fields = await fetch_global_fields(conn, spec=BIOSAMPLE_METADATA_SPEC)
     return (
         {row["display_name"]: FieldDataType(row["data_type"]) for row in fields},
+        {row["display_name"]: row["internal_name"] for row in fields},
         await fetch_missing_value_reason_names(conn),
     )
 
@@ -560,6 +564,7 @@ def _retain_unparseable(
     *,
     ena_run: EnaRunRecord,
     field_types: dict[str, FieldDataType],
+    internal_names: dict[str, str],
     missing_reasons: frozenset[str],
 ) -> tuple[dict[str, str], dict[str, str], HarmonizationResult]:
     """`retain_unparseable_as_submitted` over this run's mapped metadata, its
@@ -568,6 +573,7 @@ def _retain_unparseable(
         metadata,
         local_metadata,
         data_types=field_types,
+        internal_names=internal_names,
         missing_reasons=missing_reasons,
         sample_accession=ena_run.sample_accession,
     )
@@ -599,16 +605,15 @@ async def _register_one_ena_run(
     implied_host_by_taxon: dict[str, str | None],
     loaded_term_ids: frozenset[str],
     field_types: dict[str, FieldDataType],
+    internal_names: dict[str, str],
     missing_reasons: frozenset[str],
 ) -> EnaRunRegistrationOutcome:
-    """Register one ENA run in its own savepoint within the registration
-    transaction (per-run atomicity: a partial failure rolls back only this
-    run). It never raises: every failure mode (platform/protocol-mapping,
-    harmonization, composer/DB) is folded into a `failed` outcome. A
-    harmonization gap is not a failure mode, and neither is a mapped value its
-    global field cannot hold, unless `retain_unparseable_as_submitted` leaves it
-    in place -- only such a value or a collision inside the biosample import
-    raises, caught here like any other."""
+    """Register one ENA run in its own savepoint within the registration transaction
+    (per-run atomicity: a partial failure rolls back only this run). Never raises:
+    every failure becomes a `failed` outcome -- platform/protocol-mapping,
+    harmonization, a value no global field can hold that
+    `retain_unparseable_as_submitted` cannot keep, or a collision inside the biosample
+    import."""
     try:
         async with conn.transaction():
             sample_attrs = attrs_by_sample_accession.get(ena_run.sample_accession)
@@ -624,6 +629,7 @@ async def _register_one_ena_run(
                 harmonization,
                 ena_run=ena_run,
                 field_types=field_types,
+                internal_names=internal_names,
                 missing_reasons=missing_reasons,
             )
             biosample_idx, biosample_created = await resolve_or_import_biosample_by_ena_accession(

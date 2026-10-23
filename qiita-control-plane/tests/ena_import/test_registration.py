@@ -358,9 +358,9 @@ async def test_harmonized_attributes_land_on_global_fields_and_checklist(reg):
     }
 
 
-async def test_out_of_range_longitude_fails_the_run_with_the_range_reason(reg):
-    # A longitude past +/-180 names no place, so the run fails rather than storing a
-    # number every reader would have to range-check -- with the bound in the reason.
+async def test_out_of_range_longitude_is_kept_as_submitted(reg):
+    # A longitude past +/-180 is unparseable (range, not just type), so the run keeps it
+    # as submitted rather than failing -- #717's flip of #718's bare-bound behaviour.
     study_accession = unique_ena_accession("PRJNA")
     sample_accession = unique_accession("SAMN")
     run = _run(
@@ -379,15 +379,31 @@ async def test_out_of_range_longitude_fails_the_run_with_the_range_reason(reg):
     )
 
     outcome = result.ena_runs[0]
-    assert outcome.status == EnaRunRegistrationStatus.FAILED
-    assert outcome.failure_reason is not None
-    assert "-180 and 180 degrees" in outcome.failure_reason
+    assert outcome.status == EnaRunRegistrationStatus.REGISTERED, outcome.failure_reason
+    assert outcome.harmonization is not None
+    assert any("-180 and 180 degrees" in w for w in outcome.harmonization.warnings)
 
-    # The failed run leaves no biosample behind -- its per-run transaction rolled back.
-    biosample_count = await reg["pool"].fetchval(
-        "SELECT count(*) FROM qiita.biosample WHERE ena_sample_accession = $1", sample_accession
+    biosample_idx = await reg["pool"].fetchval(
+        "SELECT idx FROM qiita.biosample WHERE ena_sample_accession = $1", sample_accession
     )
-    assert biosample_count == 0
+    assert biosample_idx is not None
+
+    # The global longitude field stores `not provided`; the submitted text is kept local.
+    lon_missing_reason = await reg["pool"].fetchval(
+        "SELECT bm.value_missing_reason_idx FROM qiita.biosample_metadata bm"
+        " JOIN qiita.biosample_global_field gf ON gf.idx = bm.global_field_idx"
+        " WHERE bm.biosample_idx = $1 AND gf.display_name = 'geographic location (longitude)'",
+        biosample_idx,
+    )
+    assert lon_missing_reason is not None
+    lon_submitted = await reg["pool"].fetchval(
+        "SELECT bm.value_text FROM qiita.biosample_metadata bm"
+        " JOIN qiita.biosample_study_field bsf ON bsf.idx = bm.biosample_study_field_idx"
+        " WHERE bm.biosample_idx = $1"
+        " AND bsf.display_name = 'geographic location (longitude) (as submitted)'",
+        biosample_idx,
+    )
+    assert lon_submitted == "200"
 
 
 async def test_shared_biosample_harmonizes_once_across_two_studies(reg):
