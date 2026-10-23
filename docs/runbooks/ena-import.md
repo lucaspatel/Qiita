@@ -330,8 +330,10 @@ did not supply) keeps that `not provided`: resolve-by-accession returns the exis
 biosample unchanged, so a later re-import of the same accession — or a second study
 linking the same biosample — sees the original value, and the submitted text stays in
 the first study's `<field> (as submitted)`. To correct a value after the fact, fix it
-at ENA and PATCH the biosample's metadata directly (`PATCH /biosample/{idx}` /
-`…/by-unique-field/metadata`); re-importing the accession alone does not update it.
+at ENA and PATCH the biosample's metadata directly
+(`PATCH /study/{study_idx}/biosample/{biosample_idx}/metadata`, or its
+`…/biosample/by-unique-field/metadata` twin); re-importing the accession alone does not
+update it.
 
 **A sample with zero ENA attributes is a legitimate, common result, not an import
 failure.** Real ENA/DDBJ samples sometimes carry no `<SAMPLE_ATTRIBUTE>` elements at

@@ -376,8 +376,8 @@ def test_retain_unparseable_stores_a_blank_value_without_an_as_submitted_field()
 
 
 def test_retain_unparseable_keeps_an_out_of_range_coordinate_as_submitted():
-    # A longitude past +/-180 is unparseable (range, not just type): #717 keeps it as
-    # submitted rather than failing the run, the flip of #718's bare-bound behaviour.
+    # A longitude past +/-180 is unparseable (range, not just type), so it is kept as
+    # submitted rather than failing the run.
     kept, local, warnings = retain_unparseable_as_submitted(
         {"geographic location (longitude)": "200", "geographic location (latitude)": "95"},
         {},

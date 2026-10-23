@@ -360,7 +360,7 @@ async def test_harmonized_attributes_land_on_global_fields_and_checklist(reg):
 
 async def test_out_of_range_longitude_is_kept_as_submitted(reg):
     # A longitude past +/-180 is unparseable (range, not just type), so the run keeps it
-    # as submitted rather than failing -- #717's flip of #718's bare-bound behaviour.
+    # as submitted rather than failing.
     study_accession = unique_ena_accession("PRJNA")
     sample_accession = unique_accession("SAMN")
     run = _run(
